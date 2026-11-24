@@ -1,12 +1,3 @@
-# sludge_tls.dll: owns an implicit TLS slot for the manually mapped title (see tls/sludge_tls.h).
-add_library(sludge_tls SHARED
-    tls/sludge_tls.cpp
-    tls/sludge_tls.h
-)
-target_compile_definitions(sludge_tls PRIVATE SLUDGE_TLS_BUILD)
-target_include_directories(sludge_tls PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(sludge_tls PRIVATE sludge_options)
-
 add_executable(sludgemu WIN32
     main.cpp
 
@@ -15,14 +6,19 @@ add_executable(sludgemu WIN32
     common/log.cpp
     common/str.h
     common/str.cpp
+    common/thread_slot.h
 
     core/title.h
     core/title.cpp
+    core/memory.h
+    core/memory.cpp
 
     loader/pe_image.h
     loader/pe_image.cpp
     loader/loader.h
     loader/loader.cpp
+    loader/tls_reserve.h
+    loader/tls_reserve.cpp
     loader/stubs.h
     loader/stubs.cpp
     loader/crash.h
@@ -33,13 +29,25 @@ add_executable(sludgemu WIN32
     hle/xbox_modules.cpp
     hle/kernel/overrides.h
     hle/kernel/module_overrides.cpp
+    hle/kernel/memory_overrides.cpp
+    hle/kernel/cpu_overrides.cpp
+    hle/xmem/xmem.h
+    hle/xmem/xmem.cpp
+    hle/xmem/xmem_defs.h
+    hle/d3d12/d3d12_xs.cpp
 
     platform/window.h
     platform/window.cpp
 )
 target_include_directories(sludgemu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(sludgemu PRIVATE sludge_options sludge_tls shell32 user32)
+target_link_libraries(sludgemu PRIVATE sludge_options shell32 user32)
+
+# sludgemu.exe's implicit TLS slot (index 0) belongs to the title exe (see loader/tls_reserve.h),
+# so nothing else may use implicit TLS: no thread_local in our code, and no thread-safe static
+# initialization (the CRT implements it with a thread_local epoch counter).
+target_compile_options(sludgemu PRIVATE /Zc:threadSafeInit-)
 
 # Keep our own image far away from where titles want to live (0x140000000 and up), so the title
 # can be mapped at its preferred base and addresses match the disassembler.
-target_link_options(sludgemu PRIVATE /BASE:0x7FF600000000 /DYNAMICBASE /HIGHENTROPYVA /LARGEADDRESSAWARE)
+target_link_options(sludgemu PRIVATE /BASE:0x7FF600000000 /DYNAMICBASE /HIGHENTROPYVA /LARGEADDRESSAWARE
+    /INCREMENTAL:NO) # incremental linking pads section contributions, including the TLS reserve

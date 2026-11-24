@@ -37,6 +37,8 @@ sludgemu.exe [options] <package directory | title exe> [-- title arguments]
 | `--console` | open a console window with the live log |
 | `--log-level=LEVEL` | `trace`, `debug`, `info` (default), `warn`, `error` |
 | `--break-on-stub` | break into an attached debugger when an unimplemented import is called |
+| `--dump-threads-after=N` | log a backtrace of every thread every N seconds (for diagnosing hangs) |
+| `--watch-write=SPEC` | hardware watchpoint: log every write (value + backtrace) to an 8-byte location, `module.dll+0xRVA` or `0xADDRESS` |
 
 The title runs in its own window, the way a native game does. **F11** or **Alt+Enter** toggles
 borderless fullscreen. The log is written to `sludgemu.log` next to `sludgemu.exe`, and a
@@ -46,11 +48,10 @@ minidump to `sludgemu_crash.dmp` on a crash.
 
 | Path | Contents |
 |---|---|
-| `src/loader` | PE mapping, import binding, TLS, logging stubs, crash reporting |
+| `src/loader` | PE mapping, import binding, TLS, logging stubs, crash reporting and diagnostics |
 | `src/hle` | implementations of console system DLLs, plus host-function overrides |
 | `src/platform` | desktop integration (window management, ...) |
-| `src/core` | title metadata |
-| `src/tls` | `sludge_tls.dll`, which gives the manually mapped title working implicit TLS |
+| `src/core` | title metadata, console memory model |
 | `docs/` | design notes |
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how it fits together.

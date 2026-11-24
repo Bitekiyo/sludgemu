@@ -90,11 +90,15 @@ static FARPROC WINAPI hk_GetProcAddress(HMODULE h, LPCSTR name) {
         ref.kind = MODULE_TITLE;
         str_copy(dll, sizeof(dll), ref.image->name);
     } else {
+        // No GetModuleFileNameW here: it takes the loader lock, and titles call GetProcAddress
+        // while holding their own locks (deadlocks against thread-attach TLS callbacks).
         ref.kind = MODULE_HOST;
         ref.host = h;
-        wchar_t wpath[MAX_PATH];
-        if (GetModuleFileNameW(h, wpath, MAX_PATH))
-            str_to_narrow(dll, sizeof(dll), path_file_name_w(wpath));
+        const char* known = g_loader.host_module_name(h);
+        if (known)
+            str_copy(dll, sizeof(dll), known);
+        else
+            snprintf(dll, sizeof(dll), "host module %p", (void*)h);
     }
 
     // HLE modules always hand out something callable, so missing functions show up as stub

@@ -5,15 +5,19 @@
 //   --console          open a console window with the live log
 //   --log-level=LEVEL  trace | debug | info | warn | error   (default: info)
 //   --break-on-stub    break into the debugger when an unimplemented import is called
+//   --dump-threads-after=N   log every thread's backtrace every N seconds (hang diagnosis)
+//   --watch-write=SPEC       log every write to an 8-byte location ("module.dll+0xRVA" or "0xADDR")
 
 #include <windows.h>
 #include <shellapi.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #include "common/log.h"
 #include "common/str.h"
 #include "core/title.h"
 #include "hle/hle.h"
+#include "hle/xmem/xmem.h"
 #include "loader/crash.h"
 #include "loader/loader.h"
 #include "loader/stubs.h"
@@ -22,6 +26,8 @@
 struct Options {
     bool console;
     bool break_on_stub;
+    u32 dump_threads_after;
+    char watch_write[128];
     LogLevel log_level;
     const wchar_t* title_path;
     wchar_t title_args[4096];
@@ -51,6 +57,10 @@ static bool parse_options(int argc, wchar_t** argv, Options* opt) {
             opt->console = true;
         } else if (wcscmp(a, L"--break-on-stub") == 0) {
             opt->break_on_stub = true;
+        } else if (wcsncmp(a, L"--dump-threads-after=", 21) == 0) {
+            opt->dump_threads_after = (u32)_wtoi(a + 21);
+        } else if (wcsncmp(a, L"--watch-write=", 14) == 0) {
+            str_to_narrow(opt->watch_write, sizeof(opt->watch_write), a + 14);
         } else if (wcsncmp(a, L"--log-level=", 12) == 0) {
             const wchar_t* l = a + 12;
             if (str_ieq_w(l, L"trace"))
@@ -129,8 +139,16 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
     SetCurrentDirectoryW(title.dir);
     crash_install(dump_path);
     stubs_init(opt.break_on_stub);
+    xmem_init();
     hle_init();
     window_init(title.display_name);
+
+    // Before the title is mapped, so this helper thread never runs title thread-attach code.
+    crash_start_thread_dump_timer(opt.dump_threads_after);
+    // Loader-entry watches are armed before loading, to also catch writes during import binding.
+    bool watch_early = strncmp(opt.watch_write, "ldrentry:", 9) == 0;
+    if (watch_early)
+        crash_arm_write_watch(opt.watch_write);
 
     g_loader.init(title.dir);
     if (!g_loader.load_main(title.exe_path)) {
@@ -139,6 +157,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
     }
     g_loader.set_command_line(opt.title_args);
     LocalFree(argv);
+    if (opt.watch_write[0] && !watch_early)
+        crash_arm_write_watch(opt.watch_write);
 
     g_loader.run_main();
 }

@@ -4,8 +4,6 @@
 
 #include "hle/hle.h"
 
-HLE_EMPTY_MODULE(g_hle_module_xmem, "xmem.dll");             // title memory / physical pages
-HLE_EMPTY_MODULE(g_hle_module_d3d12_xs, "d3d12_xs.dll");     // Scarlett D3D12 runtime
 HLE_EMPTY_MODULE(g_hle_module_xg_xs, "xg_xs.dll");           // texture layout / tiling
 HLE_EMPTY_MODULE(g_hle_module_chad, "chad.dll");             // audio DSP
 HLE_EMPTY_MODULE(g_hle_module_xcrdapi, "xcrdapi.dll");       // DirectStorage (console)

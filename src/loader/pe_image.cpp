@@ -20,6 +20,70 @@ static bool read_at(HANDLE file, u64 offset, void* dst, u32 bytes) {
     return true;
 }
 
+// RVA -> pointer into a raw file buffer (nullptr if outside every section's raw data).
+static u8* file_rva_ptr(u8* data, u64 file_size, IMAGE_NT_HEADERS64* nt, u32 rva) {
+    IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt);
+    for (u16 i = 0; i < nt->FileHeader.NumberOfSections; i++) {
+        if (rva >= sec[i].VirtualAddress && rva < sec[i].VirtualAddress + sec[i].SizeOfRawData) {
+            u64 off = (u64)sec[i].PointerToRawData + (rva - sec[i].VirtualAddress);
+            return off < file_size ? data + off : nullptr;
+        }
+    }
+    return nullptr;
+}
+
+bool pe_file_import_names(const wchar_t* path, char (*names)[64], u32 max, u32* count) {
+    *count = 0;
+    HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (file == INVALID_HANDLE_VALUE)
+        return false;
+    LARGE_INTEGER size;
+    u8* data = nullptr;
+    bool ok = false;
+    if (GetFileSizeEx(file, &size) && size.QuadPart > 0 && size.QuadPart < (LONGLONG)MiB(512)) {
+        data = (u8*)VirtualAlloc(nullptr, (usize)size.QuadPart, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        ok = data && read_at(file, 0, data, (u32)size.QuadPart);
+    }
+    CloseHandle(file);
+    if (!ok) {
+        if (data)
+            VirtualFree(data, 0, MEM_RELEASE);
+        return false;
+    }
+
+    ok = false;
+    u64 file_size = (u64)size.QuadPart;
+    do {
+        IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)data;
+        if (file_size < sizeof(*dos) || dos->e_magic != IMAGE_DOS_SIGNATURE ||
+            (u64)dos->e_lfanew + sizeof(IMAGE_NT_HEADERS64) > file_size)
+            break;
+        IMAGE_NT_HEADERS64* nt = (IMAGE_NT_HEADERS64*)(data + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+            break;
+        const IMAGE_DATA_DIRECTORY& d = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+        if (!d.Size) {
+            ok = true;
+            break;
+        }
+        IMAGE_IMPORT_DESCRIPTOR* desc = (IMAGE_IMPORT_DESCRIPTOR*)file_rva_ptr(data, file_size, nt, d.VirtualAddress);
+        if (!desc)
+            break;
+        ok = true;
+        for (; (u8*)(desc + 1) <= data + file_size && desc->Name; desc++) {
+            const char* name = (const char*)file_rva_ptr(data, file_size, nt, desc->Name);
+            if (!name || *count >= max) {
+                ok = false;
+                break;
+            }
+            str_copy(names[*count], 64, name);
+            (*count)++;
+        }
+    } while (0);
+    VirtualFree(data, 0, MEM_RELEASE);
+    return ok;
+}
+
 bool PeImage::map_from_file(const wchar_t* file_path) {
     str_copy_w(path, ARRAY_COUNT(path), file_path);
     str_to_narrow(name, sizeof(name), path_file_name_w(file_path));

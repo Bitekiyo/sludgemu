@@ -25,7 +25,9 @@ struct ModuleRef {
 //
 // Import resolution order for a DLL name:
 //   1. HLE module claiming the name (xmem.dll, d3d12_xs.dll, ...)
-//   2. title-local DLL from the package directory (mapped recursively)
+//   2. title-local DLL from the package directory. If it imports nothing console-specific it is
+//      loaded by the native loader (which then handles its TLS, unwind data and loader
+//      bookkeeping); otherwise it is mapped by us and its imports resolved recursively.
 //   3. host DLL (System32 / API sets); individual functions may be replaced by host overrides
 // Anything unresolved becomes a logging stub.
 class Loader {
@@ -49,6 +51,10 @@ public:
     PeImage* find_by_handle(HMODULE handle);
     PeImage* find_containing(const void* addr); // lock-free; safe from exception handlers
 
+    // Name of a host module we opened (nullptr if unknown). Never takes the loader lock, so it is
+    // safe on paths the title calls while holding its own locks.
+    const char* host_module_name(HMODULE handle);
+
     PeImage* main_image() const { return m_main; }
     const wchar_t* title_dir() const { return m_title_dir; }
 
@@ -60,13 +66,23 @@ public:
 private:
     PeImage* load_image(const wchar_t* path, bool is_main);
     bool bind_imports(PeImage* image);
-    bool setup_main_tls(PeImage* image);
+    bool setup_image_tls(PeImage* image);
     void init_thread_tls();
     void call_tls_callbacks(PeImage* image, DWORD reason);
     void notify_thread(DWORD reason);
     bool title_local_path(const char* dll_name, wchar_t* out, usize cap) const;
 
     static void thread_callback(u32 reason);
+
+    void remember_host_module(HMODULE handle, const char* name);
+
+    struct HostModuleName {
+        HMODULE handle;
+        char name[64];
+    };
+    static const u32 k_max_host_modules = 512;
+    HostModuleName m_host_modules[k_max_host_modules];
+    volatile u32 m_host_module_count = 0;
 
     static const u32 k_max_images = 64;
     PeImage m_images[k_max_images];
@@ -75,10 +91,13 @@ private:
     wchar_t m_title_dir[MAX_PATH] = {};
     CRITICAL_SECTION m_lock;
 
+    bool can_load_natively(const wchar_t* path) const;
+
+    // Implicit TLS of the title exe, in sludgemu.exe's reserved slot 0 (see loader/tls_reserve.h).
+    PeImage* m_tls_image = nullptr;
     const u8* m_tls_template = nullptr;
     u32 m_tls_template_size = 0;
     u32 m_tls_zero_fill = 0;
-    bool m_tls_ready = false;
 
     wchar_t* m_cmdline_w = nullptr;
     char* m_cmdline_a = nullptr;
