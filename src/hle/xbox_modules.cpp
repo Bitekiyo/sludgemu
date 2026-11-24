@@ -9,7 +9,6 @@ HLE_EMPTY_MODULE(g_hle_module_chad, "chad.dll");             // audio DSP
 HLE_EMPTY_MODULE(g_hle_module_xcrdapi, "xcrdapi.dll");       // DirectStorage (console)
 HLE_EMPTY_MODULE(g_hle_module_xapu, "xapu.dll");             // audio processing unit
 HLE_EMPTY_MODULE(g_hle_module_acphal, "acphal.dll");         // audio control processor HAL
-HLE_EMPTY_MODULE(g_hle_module_gameinput, "gameinput.dll");   // GameInput (console flavour)
 
 // Bundled with titles, but they drive console-only GPU features, so we replace them.
 HLE_EMPTY_MODULE(g_hle_module_xboxbvhbuilder, "xboxbvhbuilder.dll");

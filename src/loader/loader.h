@@ -92,6 +92,7 @@ private:
     CRITICAL_SECTION m_lock;
 
     bool can_load_natively(const wchar_t* path) const;
+    u32 apply_host_overrides(HMODULE module);
 
     // Implicit TLS of the title exe, in sludgemu.exe's reserved slot 0 (see loader/tls_reserve.h).
     PeImage* m_tls_image = nullptr;

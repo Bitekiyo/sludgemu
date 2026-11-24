@@ -21,9 +21,10 @@ static ThreadSlot g_title_thread; // nonzero on threads the title created
 // The title package ships Xbox builds of the VC++ runtime. The host's builds are ABI compatible
 // and actually work on desktop, so these always come from System32.
 static const char* const k_host_runtime_dlls[] = {
-    "vcruntime140.dll",   "vcruntime140_1.dll",         "msvcp140.dll",     "msvcp140_1.dll",
-    "msvcp140_2.dll",     "msvcp140_atomic_wait.dll",   "msvcp140_codecvt_ids.dll",
-    "concrt140.dll",      "vcomp140.dll",               "vccorlib140.dll",  "ucrtbase.dll",
+    "vcruntime140.dll",         "vcruntime140_1.dll", "msvcp140.dll",
+    "msvcp140_1.dll",           "msvcp140_2.dll",     "msvcp140_atomic_wait.dll",
+    "msvcp140_codecvt_ids.dll", "concrt140.dll",      "vcomp140.dll",
+    "vccorlib140.dll",          "ucrtbase.dll",
 };
 
 static bool is_host_runtime_dll(const char* name) {
@@ -37,8 +38,8 @@ void Loader::init(const wchar_t* title_dir) {
     InitializeCriticalSection(&m_lock);
     str_copy_w(m_title_dir, MAX_PATH, title_dir);
     g_title_thread.init();
-    g_nt_query_information_thread =
-        (NtQueryInformationThreadFn)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread");
+    g_nt_query_information_thread = (NtQueryInformationThreadFn)GetProcAddress(GetModuleHandleW(L"ntdll.dll"),
+                                                                               "NtQueryInformationThread");
     if (!tls_reserve_init(&Loader::thread_callback))
         FATAL("TLS slot 0 is not available for the title (see log)");
 }
@@ -47,7 +48,8 @@ void Loader::set_command_line(const wchar_t* args) {
     SLUDGE_ASSERT(m_main);
     usize cap = wcslen(m_main->path) + (args ? wcslen(args) : 0) + 8;
     m_cmdline_w = (wchar_t*)HeapAlloc(GetProcessHeap(), 0, cap * sizeof(wchar_t));
-    _snwprintf(m_cmdline_w, cap, L"\"%s\"%s%s", m_main->path, (args && *args) ? L" " : L"", args ? args : L"");
+    _snwprintf(m_cmdline_w, cap, L"\"%s\"%s%s", m_main->path, (args && *args) ? L" " : L"",
+               args ? args : L"");
     m_cmdline_w[cap - 1] = 0;
 
     int acap = WideCharToMultiByte(CP_ACP, 0, m_cmdline_w, -1, nullptr, 0, nullptr, nullptr);
@@ -154,8 +156,12 @@ ModuleRef Loader::open_module(const char* dll_name) {
         ref.host = LoadLibraryExW(native_path, nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
         if (ref.host) {
             ref.kind = MODULE_HOST;
+            if (!host_module_name(ref.host)) {
+                u32 patched = apply_host_overrides(ref.host);
+                LOG_I("loader", "%s: no console imports, loaded natively at %p (%u imports overridden)", name,
+                      (void*)ref.host, patched);
+            }
             remember_host_module(ref.host, name);
-            LOG_I("loader", "%s: no console imports, loaded natively at %p", name, (void*)ref.host);
             return ref;
         }
         LOG_E("loader", "%s: native load failed (%lu)", name, GetLastError());
@@ -215,7 +221,8 @@ bool Loader::bind_imports(PeImage* image) {
             if (IMAGE_SNAP_BY_ORDINAL64(lookup->u1.Ordinal))
                 ordinal = (u16)IMAGE_ORDINAL64(lookup->u1.Ordinal);
             else
-                fn_name = (const char*)image->at_rva<IMAGE_IMPORT_BY_NAME>((u32)lookup->u1.AddressOfData)->Name;
+                fn_name =
+                    (const char*)image->at_rva<IMAGE_IMPORT_BY_NAME>((u32)lookup->u1.AddressOfData)->Name;
 
             void* fn = resolve(module, dll, fn_name, ordinal, false);
             if (!fn) {
@@ -229,12 +236,48 @@ bool Loader::bind_imports(PeImage* image) {
             LOG_I("loader", "%s: %-48s -> %-7s %3u imports, %u stubbed", image->name, dll,
                   k_kind_names[module.kind], count, stubbed);
         else
-            LOG_D("loader", "%s: %-48s -> %-7s %3u imports", image->name, dll, k_kind_names[module.kind], count);
+            LOG_D("loader", "%s: %-48s -> %-7s %3u imports", image->name, dll, k_kind_names[module.kind],
+                  count);
         total += count;
         total_stubbed += stubbed;
     }
     LOG_I("loader", "%s: bound %u imports, %u stubbed", image->name, total, total_stubbed);
     return true;
+}
+
+// Title code must see the console environment whichever loader mapped it, so a natively loaded
+// title DLL gets the same host-function overrides as hand-mapped images: its IAT entries for
+// overridden functions are redirected after the native loader has bound them. (Its DllMain has
+// run by then; the overrides that matter, such as LoadLibrary for runtime DLLs, are used later.)
+u32 Loader::apply_host_overrides(HMODULE module) {
+    u8* base = (u8*)module;
+    IMAGE_NT_HEADERS64* nt = (IMAGE_NT_HEADERS64*)(base + ((IMAGE_DOS_HEADER*)base)->e_lfanew);
+    const IMAGE_DATA_DIRECTORY& d = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!d.Size)
+        return 0;
+    u32 patched = 0;
+    for (IMAGE_IMPORT_DESCRIPTOR* desc = (IMAGE_IMPORT_DESCRIPTOR*)(base + d.VirtualAddress); desc->Name;
+         desc++) {
+        if (!desc->OriginalFirstThunk)
+            continue; // no name table to tell what was imported
+        IMAGE_THUNK_DATA64* lookup = (IMAGE_THUNK_DATA64*)(base + desc->OriginalFirstThunk);
+        IMAGE_THUNK_DATA64* iat = (IMAGE_THUNK_DATA64*)(base + desc->FirstThunk);
+        for (; lookup->u1.AddressOfData; lookup++, iat++) {
+            if (IMAGE_SNAP_BY_ORDINAL64(lookup->u1.Ordinal))
+                continue;
+            const char* fn_name =
+                (const char*)((IMAGE_IMPORT_BY_NAME*)(base + lookup->u1.AddressOfData))->Name;
+            void* fn = hle_find_host_override(fn_name);
+            if (!fn)
+                continue;
+            DWORD old_protect;
+            VirtualProtect(&iat->u1.Function, sizeof(u64), PAGE_READWRITE, &old_protect);
+            iat->u1.Function = (u64)fn;
+            VirtualProtect(&iat->u1.Function, sizeof(u64), old_protect, &old_protect);
+            patched++;
+        }
+    }
+    return patched;
 }
 
 // The title exe's implicit TLS lives in slot 0, which sludgemu.exe reserves for it (see
@@ -265,8 +308,8 @@ bool Loader::setup_image_tls(PeImage* image) {
     m_tls_zero_fill = zero_fill;
     m_tls_image = image; // publish for thread attach
     init_thread_tls();   // the calling thread already exists
-    LOG_I("loader", "%s: TLS template 0x%x bytes (+0x%x zero fill) in slot %u", image->name, tmpl_size, zero_fill,
-          tls_reserve_index());
+    LOG_I("loader", "%s: TLS template 0x%x bytes (+0x%x zero fill) in slot %u", image->name, tmpl_size,
+          zero_fill, tls_reserve_index());
     return true;
 }
 
@@ -312,8 +355,8 @@ static void* current_thread_start_address() {
     void* start = nullptr;
     const ULONG k_thread_query_set_win32_start_address = 9;
     if (g_nt_query_information_thread)
-        g_nt_query_information_thread(GetCurrentThread(), k_thread_query_set_win32_start_address, &start, sizeof(start),
-                                      nullptr);
+        g_nt_query_information_thread(GetCurrentThread(), k_thread_query_set_win32_start_address, &start,
+                                      sizeof(start), nullptr);
     return start;
 }
 
@@ -355,7 +398,9 @@ void Loader::notify_thread(DWORD reason) {
         call_tls_callbacks(m_main, reason);
 }
 
-void Loader::thread_callback(u32 reason) { g_loader.notify_thread(reason); }
+void Loader::thread_callback(u32 reason) {
+    g_loader.notify_thread(reason);
+}
 
 PeImage* Loader::load_image(const wchar_t* path, bool is_main) {
     if (m_count >= k_max_images) {

@@ -13,7 +13,6 @@ extern const HleModule g_hle_module_chad;
 extern const HleModule g_hle_module_xcrdapi;
 extern const HleModule g_hle_module_xapu;
 extern const HleModule g_hle_module_acphal;
-extern const HleModule g_hle_module_gameinput;
 extern const HleModule g_hle_module_xboxbvhbuilder;
 extern const HleModule g_hle_module_ffx_loader;
 extern const HleModule g_hle_module_xgameruntime;
@@ -31,9 +30,8 @@ static const OverrideTable k_override_tables[] = {
 };
 
 static const HleModule* const k_modules[] = {
-    &g_hle_module_xmem,      &g_hle_module_d3d12_xs,  &g_hle_module_xg_xs,
-    &g_hle_module_chad,      &g_hle_module_xcrdapi,   &g_hle_module_xapu,
-    &g_hle_module_acphal,    &g_hle_module_gameinput, &g_hle_module_xboxbvhbuilder,
+    &g_hle_module_xmem,       &g_hle_module_d3d12_xs,     &g_hle_module_xg_xs,  &g_hle_module_chad,
+    &g_hle_module_xcrdapi,    &g_hle_module_xapu,         &g_hle_module_acphal, &g_hle_module_xboxbvhbuilder,
     &g_hle_module_ffx_loader, &g_hle_module_xgameruntime,
 };
 

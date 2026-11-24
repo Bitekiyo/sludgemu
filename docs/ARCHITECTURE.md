@@ -21,7 +21,9 @@ over import resolution and over the address space:
       `d3d12_xs.dll`, ...). Exports we haven't written resolve to logging stubs.
    2. **Title-local DLL**: a DLL shipped in the package. If it imports nothing console-specific
       (no HLE module, no other title DLL) it goes through the **native loader**, which handles
-      its TLS, unwind data and loader bookkeeping. Otherwise it is mapped by hand, recursively.
+      its TLS, unwind data and loader bookkeeping; afterwards its IAT gets the same host
+      overrides as hand-mapped images, so all title code sees the console environment.
+      Otherwise it is mapped by hand, recursively.
       The VC++ runtime DLLs are the exception: they always come from the host.
    3. **Host DLL**: loaded from System32 / API sets. Individual functions can be replaced by
       *host overrides*, e.g. `LoadLibraryExW`, `GetProcAddress` and `GetModuleHandleW` (which
@@ -76,7 +78,7 @@ layer.
 | Ray tracing | console BVH builder | DXR acceleration structures |
 | Audio | DSP/APU/SHAPE hardware | software implementation feeding XAudio2/WASAPI |
 | Storage | console DirectStorage with hardware decompression | software decompression + file I/O |
-| Input | GameInput (console) | desktop GameInput / XInput / keyboard+mouse |
+| Input | GameInput | the host's GameInput (same API on console and desktop) |
 
 ## Debugging conventions
 
