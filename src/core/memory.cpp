@@ -6,14 +6,15 @@
 
 // Placeholder-page states stored in MemRange::page_pfn alongside real PFNs.
 #define PAGE_STATE_UNSPLIT 0xFFFFFFFFu // still part of a larger placeholder
-#define PAGE_STATE_SPLIT 0xFFFFFFFEu   // its own 64 KiB placeholder, nothing mapped
+#define PAGE_STATE_SPLIT   0xFFFFFFFEu // its own 64 KiB placeholder, nothing mapped
 
 #define MAX_RANGES 8192
+#define MAX_CHUNKS 256
 
 // Win32 functions from newer API sets, resolved at runtime.
 typedef PVOID(WINAPI* VirtualAlloc2Fn)(HANDLE, PVOID, SIZE_T, ULONG, ULONG, MEM_EXTENDED_PARAMETER*, ULONG);
-typedef PVOID(WINAPI* MapViewOfFile3Fn)(HANDLE, HANDLE, PVOID, ULONG64, SIZE_T, ULONG, ULONG, MEM_EXTENDED_PARAMETER*,
-                                        ULONG);
+typedef PVOID(WINAPI* MapViewOfFile3Fn)(HANDLE, HANDLE, PVOID, ULONG64, SIZE_T, ULONG, ULONG,
+                                        MEM_EXTENDED_PARAMETER*, ULONG);
 typedef BOOL(WINAPI* UnmapViewOfFile2Fn)(HANDLE, PVOID, ULONG);
 
 struct MemoryState {
@@ -21,8 +22,12 @@ struct MemoryState {
     MapViewOfFile3Fn map_view3;
     UnmapViewOfFile2Fn unmap_view2;
 
-    HANDLE section;
-    u8* linear;       // whole physical section mapped once
+    // Physical memory is a set of committed sections ("chunks") created as pages get allocated, so
+    // the commit charge follows actual use. Committed sections can also be opened as D3D12 heaps,
+    // which makes every page GPU-visible in place.
+    HANDLE chunks[MAX_CHUNKS];
+    u32 chunk_count; // chunks covering all of physical memory (created or not)
+    u8* linear;      // every chunk is mapped here, at pfn * MEM_PAGE_SIZE
     u64 total_pages;
     u64 used_pages;
     u64* used_bitmap;  // 1 = allocated
@@ -40,9 +45,15 @@ struct MemoryState {
 
 static MemoryState g_mem;
 
-static inline bool bit_get(const u64* bm, u64 i) { return (bm[i >> 6] >> (i & 63)) & 1; }
-static inline void bit_set(u64* bm, u64 i) { bm[i >> 6] |= 1ull << (i & 63); }
-static inline void bit_clear(u64* bm, u64 i) { bm[i >> 6] &= ~(1ull << (i & 63)); }
+static inline bool bit_get(const u64* bm, u64 i) {
+    return (bm[i >> 6] >> (i & 63)) & 1;
+}
+static inline void bit_set(u64* bm, u64 i) {
+    bm[i >> 6] |= 1ull << (i & 63);
+}
+static inline void bit_clear(u64* bm, u64 i) {
+    bm[i >> 6] &= ~(1ull << (i & 63));
+}
 
 bool mem_init(u64 physical_bytes) {
     InitializeSRWLock(&g_mem.phys_lock);
@@ -57,17 +68,19 @@ bool mem_init(u64 physical_bytes) {
         return false;
     }
 
-    physical_bytes = ALIGN_UP(physical_bytes, MEM_PAGE_SIZE);
+    physical_bytes = ALIGN_UP(physical_bytes, MEM_CHUNK_SIZE);
     g_mem.total_pages = physical_bytes >> MEM_PAGE_SHIFT;
-    g_mem.section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_RESERVE,
-                                       (DWORD)(physical_bytes >> 32), (DWORD)physical_bytes, nullptr);
-    if (!g_mem.section) {
-        LOG_E("memory", "cannot create physical memory section (%lu)", GetLastError());
+    g_mem.chunk_count = (u32)(physical_bytes / MEM_CHUNK_SIZE);
+    if (g_mem.chunk_count > MAX_CHUNKS) {
+        LOG_E("memory", "physical memory size %llu MiB exceeds %u chunks", physical_bytes >> 20, MAX_CHUNKS);
         return false;
     }
-    g_mem.linear = (u8*)MapViewOfFile(g_mem.section, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, physical_bytes);
+    // The linear view starts as one placeholder; chunks are mapped into it as they are created.
+    g_mem.linear =
+        (u8*)g_mem.virtual_alloc2(GetCurrentProcess(), nullptr, physical_bytes,
+                                  MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0);
     if (!g_mem.linear) {
-        LOG_E("memory", "cannot map physical memory section (%lu)", GetLastError());
+        LOG_E("memory", "cannot reserve the physical memory view (%lu)", GetLastError());
         return false;
     }
     u64 words = (g_mem.total_pages + 63) / 64;
@@ -85,9 +98,40 @@ bool mem_init(u64 physical_bytes) {
 // ---------------------------------------------------------------------------------------------
 // Physical pages
 
-u64 mem_physical_total_pages() { return g_mem.total_pages; }
-u64 mem_physical_used_pages() { return g_mem.used_pages; }
-u8* mem_physical_ptr(u64 pfn) { return g_mem.linear + (pfn << MEM_PAGE_SHIFT); }
+u64 mem_physical_total_pages() {
+    return g_mem.total_pages;
+}
+u64 mem_physical_used_pages() {
+    return g_mem.used_pages;
+}
+u8* mem_physical_ptr(u64 pfn) {
+    return g_mem.linear + (pfn << MEM_PAGE_SHIFT);
+}
+
+u32 mem_physical_chunk_count() {
+    return g_mem.chunk_count;
+}
+void* mem_physical_chunk(u32 index) {
+    return index < g_mem.chunk_count ? g_mem.chunks[index] : nullptr;
+}
+
+// Creates the section for a chunk and maps it into its slot of the linear view. Called with
+// phys_lock held.
+static void create_chunk(u32 index) {
+    HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_COMMIT,
+                                        (DWORD)(MEM_CHUNK_SIZE >> 32), (DWORD)MEM_CHUNK_SIZE, nullptr);
+    if (!section)
+        FATAL("cannot commit %llu MiB of physical memory (%lu)", MEM_CHUNK_SIZE >> 20, GetLastError());
+    u8* slot = g_mem.linear + (u64)index * MEM_CHUNK_SIZE;
+    if (!VirtualFree(slot, MEM_CHUNK_SIZE, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) &&
+        GetLastError() != ERROR_INVALID_PARAMETER)
+        FATAL("cannot split the physical memory view (%lu)", GetLastError());
+    if (!g_mem.map_view3(section, GetCurrentProcess(), slot, 0, MEM_CHUNK_SIZE, MEM_REPLACE_PLACEHOLDER,
+                         PAGE_READWRITE, nullptr, 0))
+        FATAL("cannot map physical memory chunk %u (%lu)", index, GetLastError());
+    g_mem.chunks[index] = section;
+    LOG_D("memory", "physical chunk %u committed (%llu MiB)", index, MEM_CHUNK_SIZE >> 20);
+}
 
 bool mem_physical_alloc(u64 count, u64* pfns) {
     AcquireSRWLockExclusive(&g_mem.phys_lock);
@@ -111,21 +155,15 @@ bool mem_physical_alloc(u64 count, u64* pfns) {
     g_mem.search_hint = i;
     g_mem.used_pages += count;
 
-    // Commit through the linear view, coalescing consecutive frames; zero recycled frames.
-    for (u64 k = 0; k < count;) {
-        u64 run = 1;
-        while (k + run < count && pfns[k + run] == pfns[k] + run)
-            run++;
-        u8* p = mem_physical_ptr(pfns[k]);
-        if (!VirtualAlloc(p, run << MEM_PAGE_SHIFT, MEM_COMMIT, PAGE_READWRITE))
-            FATAL("cannot commit physical memory (%lu)", GetLastError());
-        for (u64 j = 0; j < run; j++) {
-            if (bit_get(g_mem.dirty_bitmap, pfns[k + j])) {
-                memset(mem_physical_ptr(pfns[k + j]), 0, MEM_PAGE_SIZE);
-                bit_clear(g_mem.dirty_bitmap, pfns[k + j]);
-            }
+    // Make sure the frames' chunks exist; recycled frames are zeroed (new chunks come zeroed).
+    for (u64 k = 0; k < count; k++) {
+        u32 chunk = (u32)(pfns[k] / MEM_CHUNK_PAGES);
+        if (!g_mem.chunks[chunk])
+            create_chunk(chunk);
+        if (bit_get(g_mem.dirty_bitmap, pfns[k])) {
+            memset(mem_physical_ptr(pfns[k]), 0, MEM_PAGE_SIZE);
+            bit_clear(g_mem.dirty_bitmap, pfns[k]);
         }
-        k += run;
     }
     ReleaseSRWLockExclusive(&g_mem.phys_lock);
     return true;
@@ -142,6 +180,8 @@ void mem_physical_free(u64 count, const u64* pfns) {
         bit_clear(g_mem.used_bitmap, pfn);
         bit_set(g_mem.dirty_bitmap, pfn);
         g_mem.used_pages--;
+        // Hand the RAM back; the frame is zeroed when it's allocated again.
+        DiscardVirtualMemory(mem_physical_ptr(pfn), MEM_PAGE_SIZE);
     }
     ReleaseSRWLockExclusive(&g_mem.phys_lock);
 }
@@ -165,7 +205,9 @@ const MemRange* mem_find_range(const void* addr) {
     return r;
 }
 
-bool mem_is_tracked(const void* addr) { return mem_find_range(addr) != nullptr; }
+bool mem_is_tracked(const void* addr) {
+    return mem_find_range(addr) != nullptr;
+}
 
 static MemRange* add_range(u8* base, u64 size, u32 flags, u32 protect, u64 xflags) {
     AcquireSRWLockExclusive(&g_mem.range_lock);
@@ -192,15 +234,16 @@ static void fill_address_requirements(const MemAddressLimits& limits, MEM_ADDRES
     req->Alignment = limits.alignment > MEM_PAGE_SIZE ? limits.alignment : 0;
 }
 
-void* mem_reserve_placeholder(u64 size, const MemAddressLimits& limits, u32 range_flags, u32 protect, u64 xflags) {
+void* mem_reserve_placeholder(u64 size, const MemAddressLimits& limits, u32 range_flags, u32 protect,
+                              u64 xflags) {
     size = ALIGN_UP(size, MEM_PAGE_SIZE);
     MEM_ADDRESS_REQUIREMENTS req;
     fill_address_requirements(limits, &req);
     MEM_EXTENDED_PARAMETER param = {};
     param.Type = MemExtendedParameterAddressRequirements;
     param.Pointer = &req;
-    u8* base = (u8*)g_mem.virtual_alloc2(GetCurrentProcess(), nullptr, size, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
-                                         PAGE_NOACCESS, &param, 1);
+    u8* base = (u8*)g_mem.virtual_alloc2(GetCurrentProcess(), nullptr, size,
+                                         MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, &param, 1);
     if (!base) {
         LOG_E("memory", "placeholder reservation of %llu MiB failed (%lu)", size >> 20, GetLastError());
         return nullptr;
@@ -265,7 +308,8 @@ static bool map_page(MemRange* r, u64 page, u32 pfn) {
     u32 prot = r->protect;
     if ((prot & 0xFF) == PAGE_NOACCESS || !(prot & 0xFF))
         prot = PAGE_READWRITE;
-    void* v = g_mem.map_view3(g_mem.section, proc, va, (u64)pfn << MEM_PAGE_SHIFT, MEM_PAGE_SIZE,
+    void* v = g_mem.map_view3(g_mem.chunks[pfn / MEM_CHUNK_PAGES], proc, va,
+                              (pfn % MEM_CHUNK_PAGES) << MEM_PAGE_SHIFT, MEM_PAGE_SIZE,
                               MEM_REPLACE_PLACEHOLDER, prot, nullptr, 0);
     if (v != va) {
         LOG_E("memory", "mapping pfn 0x%x at %p failed (%lu)", pfn, va, GetLastError());
@@ -296,7 +340,8 @@ bool mem_map_physical(void* va, u64 count, const u64* pfns) {
     return true;
 }
 
-void* mem_alloc_physical_backed(u64 size, const MemAddressLimits& limits, u32 range_flags, u32 protect, u64 xflags) {
+void* mem_alloc_physical_backed(u64 size, const MemAddressLimits& limits, u32 range_flags, u32 protect,
+                                u64 xflags) {
     size = ALIGN_UP(size, MEM_PAGE_SIZE);
     u64 pages = size >> MEM_PAGE_SHIFT;
     u64* pfns = (u64*)VirtualAlloc(nullptr, pages * sizeof(u64), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);

@@ -13,8 +13,12 @@
 // Every range the title marks as GPU-visible is recorded in a registry that the graphics layer
 // uses to translate title GPU addresses.
 
-#define MEM_PAGE_SIZE KiB(64)
+#define MEM_PAGE_SIZE  KiB(64)
 #define MEM_PAGE_SHIFT 16
+
+// Physical memory is committed in chunks of this size (each one a section; see memory.cpp).
+#define MEM_CHUNK_SIZE  MiB(256)
+#define MEM_CHUNK_PAGES (MEM_CHUNK_SIZE / MEM_PAGE_SIZE)
 #define MEM_INVALID_PFN 0xFFFFFFFFu
 
 enum MemRangeFlags : u32 {
@@ -48,6 +52,11 @@ void mem_physical_free(u64 count, const u64* pfns);
 // Host pointer to a page frame through the linear view.
 u8* mem_physical_ptr(u64 pfn);
 
+// Physical memory chunks (committed sections, nullptr until first used), for opening them as GPU
+// heaps. Chunk i holds frames [i * MEM_CHUNK_PAGES, (i + 1) * MEM_CHUNK_PAGES).
+u32 mem_physical_chunk_count();
+void* mem_physical_chunk(u32 index); // section HANDLE
+
 // Virtual ranges ------------------------------------------------------------------------------
 
 // Address constraints for new reservations (0 = no constraint).
@@ -58,11 +67,13 @@ struct MemAddressLimits {
 };
 
 // Reserves a placeholder range for later physical page mapping.
-void* mem_reserve_placeholder(u64 size, const MemAddressLimits& limits, u32 range_flags, u32 protect, u64 xflags);
+void* mem_reserve_placeholder(u64 size, const MemAddressLimits& limits, u32 range_flags, u32 protect,
+                              u64 xflags);
 
 // Reserves a placeholder range, allocates physical pages for all of it and maps them: committed
 // memory that is explicitly backed by physical page frames.
-void* mem_alloc_physical_backed(u64 size, const MemAddressLimits& limits, u32 range_flags, u32 protect, u64 xflags);
+void* mem_alloc_physical_backed(u64 size, const MemAddressLimits& limits, u32 range_flags, u32 protect,
+                                u64 xflags);
 
 // Reserves (+ optionally commits) ordinary memory with address constraints. Returns nullptr on
 // failure. Ranges with MEM_RANGE_GPU are registered.

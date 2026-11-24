@@ -61,38 +61,19 @@ scheduler places threads better on hybrid CPUs than a fixed mapping would.
 
 ## Memory
 
-"Physical" memory is a pagefile-backed section (reserved, committed on allocation) split into
-64 KiB page frames. Ranges reserved for physical mapping are Win32 placeholders, and page frames
-are mapped into them with `MapViewOfFile3`. That gives real aliasing: the same frame at several
-addresses, as on console. Graphics allocations are placed inside the graphics address window
-reported by `D3D12ConfigureVirtualMemoryX` and recorded in a GPU range registry for the graphics
-layer.
+"Physical" memory is split into 64 KiB page frames, backed by committed pagefile sections of
+256 MiB ("chunks") that are created as frames get allocated, so the commit charge follows what the
+title actually uses. Freed frames give their RAM back to the OS and are zeroed on reuse. Ranges
+reserved for physical mapping are Win32 placeholders, and frames are mapped into them with
+`MapViewOfFile3`, which gives real aliasing: the same frame at several addresses, as on console.
+Graphics allocations are placed inside the graphics address window reported by
+`D3D12ConfigureVirtualMemoryX` and recorded in a GPU range registry for the graphics layer.
 
-## Graphics
-
-Console D3D12 objects are not COM objects: each starts with a pointer to a function table whose
-entries the title's inlined interface wrappers call as C functions (object first), in an order
-that differs from desktop D3D12, and several interfaces expose public data members that title code
-reads directly. We hand out objects with exactly that prefix, followed by private state that
-points at the desktop (Agility SDK) object. Unimplemented entries are named logging stubs.
-
-The console command list can also write command packets inline, straight into its command buffer,
-when the buffer's limit pointers allow it; otherwise every method goes through the function table.
-We keep those limits null, so all recording arrives at API level, the same path debug and
-instrumented console builds take, and is translated call by call. Device-side descriptor writes
-that titles can inline are routed through the table the same way.
-
-## Console subsystems (planned)
-
-| Area | Console side | Desktop side |
-|---|---|---|
-| Memory | title-managed virtual/physical pages, GPU sees CPU addresses (unified memory) | reserved address ranges + tracking so GPU resources can be shadowed in D3D12 heaps |
-| Graphics | console D3D12 (`d3d12_xs`), RDNA2 shader binaries, console swapchain/present | desktop D3D12; shaders recompiled at runtime (RDNA2 ISA → IR → DXIL via DXC, disk cache); our swapchain scales the title's output to the window |
-| Texture layout | console tiling/swizzle modes (`xg_xs`) | detiling on upload/readback |
-| Ray tracing | console BVH builder | DXR acceleration structures |
-| Audio | DSP/APU/SHAPE hardware | software implementation feeding XAudio2/WASAPI |
-| Storage | console DirectStorage with hardware zlib/BCPack decoders | desktop DirectStorage; console-only operations (zlib, BCPack, swizzle) run on our decoder threads through its custom decompression queue |
-| Input | GameInput | the host's GameInput (same API on console and desktop) |
+Unified memory without copies (in progress): committed sections can be opened as D3D12 heaps, so
+every console page can be made GPU-visible in place, which suits memory the CPU writes and the GPU
+reads. GPU-heavy resources (render targets, depth, UAVs, textures) go to VRAM instead, and data
+loaded into them is written there directly. The aim is that no title memory exists twice and
+nothing is copied every frame.
 
 ## File system
 
