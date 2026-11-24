@@ -44,6 +44,10 @@ add_executable(sludgemu WIN32
     hle/d3d12/console_object.cpp
     hle/d3d12/device.h
     hle/d3d12/device.cpp
+    hle/d3d12/d3d12_objects.h
+    hle/d3d12/command_queue.cpp
+    hle/d3d12/fence.cpp
+    hle/d3d12/command_allocator.cpp
     hle/dstorage/dstorage.cpp
 
     gpu/agility.cpp

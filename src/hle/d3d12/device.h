@@ -1,20 +1,10 @@
 #pragma once
 
 #include <windows.h>
-#include <d3d12.h>
 
-#include "hle/d3d12/console_object.h"
+#include "common/types.h"
 
-// Console ID3D12Device (all versions share one object and one function table).
-struct ConsoleDevice {
-    ConsoleObjectHeader header;
-    u64 null_constant_buffer_address; // GPU address of a zero-filled constant buffer
-    u8 out_of_line_flags[64];         // non-zero: titles route inlinable descriptor writes through the table
-
-    ID3D12Device10* desktop;
-};
-
-// Creation parameters passed by the title (layout is the console ABI).
+// Creation parameters passed by the title to D3D12XboxCreateDevice (layout is the console ABI).
 struct ConsoleDeviceParams {
     u32 version;
     u32 process_debug_flags;
