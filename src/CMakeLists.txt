@@ -35,12 +35,25 @@ add_executable(sludgemu WIN32
     hle/xmem/xmem.cpp
     hle/xmem/xmem_defs.h
     hle/d3d12/d3d12_xs.cpp
+    hle/xgameruntime/runtime_api.h
+    hle/xgameruntime/xgameruntime.h
+    hle/xgameruntime/xgameruntime.cpp
+    hle/xgameruntime/task_queue.h
+    hle/xgameruntime/task_queue.cpp
+    hle/xgameruntime/async.h
+    hle/xgameruntime/async.cpp
+    hle/xgameruntime/system.cpp
+    hle/xgameruntime/user.cpp
+    hle/xgameruntime/game_save.cpp
+    hle/xgameruntime/package.cpp
+    hle/xgameruntime/store.cpp
+    hle/xgameruntime/services.cpp
 
     platform/window.h
     platform/window.cpp
 )
 target_include_directories(sludgemu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(sludgemu PRIVATE sludge_options shell32 user32)
+target_link_libraries(sludgemu PRIVATE sludge_options shell32 user32 synchronization)
 
 # sludgemu.exe's implicit TLS slot (index 0) belongs to the title exe (see loader/tls_reserve.h),
 # so nothing else may use implicit TLS: no thread_local in our code, and no thread-safe static

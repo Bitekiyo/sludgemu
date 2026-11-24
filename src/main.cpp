@@ -124,7 +124,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
     log_init(log_path, opt.log_level);
     LOG_I("main", "sludgemu starting");
 
-    TitleInfo title;
+    TitleInfo& title = g_title;
     wchar_t error[1024];
     if (!title_resolve(opt.title_path, &title, error, ARRAY_COUNT(error))) {
         error_box(L"%s", error);

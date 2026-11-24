@@ -12,6 +12,9 @@ struct TitleInfo {
     char title_id[16];          // hex string, e.g. "1234ABCD" (empty if unknown)
 };
 
+// The title being run (filled in by main before anything else starts).
+extern TitleInfo g_title;
+
 // `path` may be the package directory (executable picked from MicrosoftGame.Config) or the
 // executable itself.
 bool title_resolve(const wchar_t* path, TitleInfo* out, wchar_t* error, usize error_cap);

@@ -3,6 +3,7 @@
 #include "common/log.h"
 #include "common/str.h"
 #include "hle/kernel/overrides.h"
+#include "hle/xgameruntime/xgameruntime.h"
 
 // Module tables live next to their implementations.
 extern const HleModule g_hle_module_xmem;
@@ -15,6 +16,7 @@ extern const HleModule g_hle_module_acphal;
 extern const HleModule g_hle_module_gameinput;
 extern const HleModule g_hle_module_xboxbvhbuilder;
 extern const HleModule g_hle_module_ffx_loader;
+extern const HleModule g_hle_module_xgameruntime;
 
 struct OverrideTable {
     const HleExport* exports;
@@ -32,7 +34,7 @@ static const HleModule* const k_modules[] = {
     &g_hle_module_xmem,      &g_hle_module_d3d12_xs,  &g_hle_module_xg_xs,
     &g_hle_module_chad,      &g_hle_module_xcrdapi,   &g_hle_module_xapu,
     &g_hle_module_acphal,    &g_hle_module_gameinput, &g_hle_module_xboxbvhbuilder,
-    &g_hle_module_ffx_loader,
+    &g_hle_module_ffx_loader, &g_hle_module_xgameruntime,
 };
 
 // Pseudo module handles: pointers into this array. Never dereferenced by the title as a PE image
@@ -47,6 +49,7 @@ static HleHandle g_handles[ARRAY_COUNT(k_modules)];
 
 void hle_init() {
     cpu_overrides_init();
+    xgameruntime_init();
     for (u32 i = 0; i < ARRAY_COUNT(k_modules); i++) {
         g_handles[i].magic = HLE_HANDLE_MAGIC;
         g_handles[i].module = k_modules[i];

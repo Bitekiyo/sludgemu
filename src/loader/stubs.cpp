@@ -8,13 +8,14 @@
 #include "common/str.h"
 #include "loader/crash.h"
 
-#define MAX_STUBS 8192
+#define MAX_STUBS      8192
 #define STUB_CODE_SIZE 32
 #define STUB_LOG_LIMIT 8
 
 struct StubInfo {
     char module[64];
     char name[128];
+    u64 return_value;
     volatile long calls;
 };
 
@@ -41,7 +42,7 @@ static u64 stub_handler(StubInfo* info) {
     }
     if (g_break_on_call && IsDebuggerPresent())
         __debugbreak();
-    return 0;
+    return info->return_value;
 }
 
 void stubs_init(bool break_on_call) {
@@ -53,6 +54,10 @@ void stubs_init(bool break_on_call) {
 }
 
 void* stub_create(const char* module, const char* name, u16 ordinal) {
+    return stub_create_ex(module, name, ordinal, 0);
+}
+
+void* stub_create_ex(const char* module, const char* name, u16 ordinal, u64 return_value) {
     AcquireSRWLockExclusive(&g_lock);
     if (g_count >= MAX_STUBS) {
         ReleaseSRWLockExclusive(&g_lock);
@@ -67,6 +72,7 @@ void* stub_create(const char* module, const char* name, u16 ordinal) {
         str_copy(info->name, sizeof(info->name), name);
     else
         snprintf(info->name, sizeof(info->name), "#%u", ordinal);
+    info->return_value = return_value;
 
     // mov rcx, imm64 ; mov rax, imm64 ; jmp rax
     u8* c = g_code + (usize)index * STUB_CODE_SIZE;
@@ -88,4 +94,6 @@ void* stub_create(const char* module, const char* name, u16 ordinal) {
     return c;
 }
 
-u32 stubs_hit_count() { return (u32)g_hit; }
+u32 stubs_hit_count() {
+    return (u32)g_hit;
+}

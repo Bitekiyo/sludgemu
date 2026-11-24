@@ -71,6 +71,8 @@ static void set_error(wchar_t* error, usize cap, const wchar_t* fmt, const wchar
     }
 }
 
+TitleInfo g_title;
+
 bool title_resolve(const wchar_t* path, TitleInfo* out, wchar_t* error, usize error_cap) {
     memset(out, 0, sizeof(*out));
 
