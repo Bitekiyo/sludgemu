@@ -1,0 +1,84 @@
+# --- build output ---
+/build/
+/out/
+/bin/
+/lib/
+CMakeUserPresets.json
+CMakeCache.txt
+CMakeFiles/
+cmake-build-*/
+*.obj
+*.o
+*.lib
+*.exp
+*.ilk
+*.pdb
+*.idb
+*.ipdb
+*.iobj
+*.pch
+*.dll
+*.exe
+
+# --- IDE ---
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.sln.docstates
+
+# --- local agent / personal notes ---
+CLAUDE.md
+CLAUDE.local.md
+.claude/
+.mcp.json
+
+# --- never commit Microsoft GDK / GDKX material ---
+GDK/
+GXDK/
+GRDK/
+*.xvd
+*.xvc
+*.msixvc
+MicrosoftGame.Config
+microsoft_gameconfig.bin
+
+# --- never commit title packages / data ---
+/games/
+/titles/
+appxmanifest.xml
+layout_*.xml
+resources.pri
+*.alignmentchunk
+
+# --- runtime artifacts ---
+*.log
+*.dmp
+*.mdmp
+shadercache/
+/dumps/
+/captures/
+
+# --- graphics captures ---
+*.rdc
+*.nsight-gfxproj
+*.ngfx-capture
+*.ngfx-gputrace
+*.nvperf
+
+# --- reverse engineering databases ---
+*.i64
+*.idb
+*.id0
+*.id1
+*.id2
+*.nam
+*.til
+*.$$$
+
+# --- misc ---
+__pycache__/
+*.pyc
+Thumbs.db
+desktop.ini

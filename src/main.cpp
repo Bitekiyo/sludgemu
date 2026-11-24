@@ -1,0 +1,144 @@
+// sludgemu — runs Xbox Series X|S titles on Windows desktop.
+//
+//   sludgemu.exe [options] <package dir | title exe> [-- title arguments]
+//
+//   --console          open a console window with the live log
+//   --log-level=LEVEL  trace | debug | info | warn | error   (default: info)
+//   --break-on-stub    break into the debugger when an unimplemented import is called
+
+#include <windows.h>
+#include <shellapi.h>
+#include <stdio.h>
+
+#include "common/log.h"
+#include "common/str.h"
+#include "core/title.h"
+#include "hle/hle.h"
+#include "loader/crash.h"
+#include "loader/loader.h"
+#include "loader/stubs.h"
+#include "platform/window.h"
+
+struct Options {
+    bool console;
+    bool break_on_stub;
+    LogLevel log_level;
+    const wchar_t* title_path;
+    wchar_t title_args[4096];
+};
+
+static void error_box(const wchar_t* fmt, const wchar_t* arg) {
+    wchar_t msg[2048];
+    _snwprintf(msg, ARRAY_COUNT(msg), fmt, arg);
+    msg[ARRAY_COUNT(msg) - 1] = 0;
+    char narrow[2048];
+    str_to_narrow(narrow, sizeof(narrow), msg);
+    LOG_E("main", "%s", narrow);
+    MessageBoxW(nullptr, msg, L"sludgemu", MB_OK | MB_ICONERROR);
+}
+
+static bool parse_options(int argc, wchar_t** argv, Options* opt) {
+    memset(opt, 0, sizeof(*opt));
+    opt->log_level = LOG_LEVEL_INFO;
+    int i = 1;
+    for (; i < argc; i++) {
+        const wchar_t* a = argv[i];
+        if (wcscmp(a, L"--") == 0) {
+            i++;
+            break;
+        }
+        if (wcscmp(a, L"--console") == 0) {
+            opt->console = true;
+        } else if (wcscmp(a, L"--break-on-stub") == 0) {
+            opt->break_on_stub = true;
+        } else if (wcsncmp(a, L"--log-level=", 12) == 0) {
+            const wchar_t* l = a + 12;
+            if (str_ieq_w(l, L"trace"))
+                opt->log_level = LOG_LEVEL_TRACE;
+            else if (str_ieq_w(l, L"debug"))
+                opt->log_level = LOG_LEVEL_DEBUG;
+            else if (str_ieq_w(l, L"info"))
+                opt->log_level = LOG_LEVEL_INFO;
+            else if (str_ieq_w(l, L"warn"))
+                opt->log_level = LOG_LEVEL_WARN;
+            else if (str_ieq_w(l, L"error"))
+                opt->log_level = LOG_LEVEL_ERROR;
+        } else if (a[0] == L'-' && a[1] == L'-') {
+            error_box(L"Unknown option: %s", a);
+            return false;
+        } else if (!opt->title_path) {
+            opt->title_path = a;
+        } else {
+            break; // first unknown positional starts the title's own arguments
+        }
+    }
+    // Everything left goes to the title, re-quoted where needed.
+    usize used = 0;
+    for (; i < argc; i++) {
+        bool quote = wcschr(argv[i], L' ') != nullptr;
+        int n = _snwprintf(opt->title_args + used, ARRAY_COUNT(opt->title_args) - used, quote ? L"%s\"%s\"" : L"%s%s",
+                           used ? L" " : L"", argv[i]);
+        if (n < 0)
+            break;
+        used += (usize)n;
+    }
+    return true;
+}
+
+int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
+    int argc = 0;
+    wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+
+    Options opt;
+    if (!parse_options(argc, argv, &opt))
+        return 1;
+    if (!opt.title_path) {
+        MessageBoxW(nullptr,
+                    L"Usage: sludgemu.exe [--console] [--log-level=LEVEL] <package directory | title exe> [-- args]",
+                    L"sludgemu", MB_OK | MB_ICONINFORMATION);
+        return 1;
+    }
+
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
+    if (opt.console) {
+        AllocConsole();
+        SetConsoleTitleW(L"sludgemu log");
+    }
+
+    wchar_t self_path[MAX_PATH], self_dir[MAX_PATH], log_path[MAX_PATH], dump_path[MAX_PATH];
+    GetModuleFileNameW(nullptr, self_path, MAX_PATH);
+    path_dir_w(self_dir, MAX_PATH, self_path);
+    _snwprintf(log_path, MAX_PATH, L"%s\\sludgemu.log", self_dir);
+    _snwprintf(dump_path, MAX_PATH, L"%s\\sludgemu_crash.dmp", self_dir);
+    log_init(log_path, opt.log_level);
+    LOG_I("main", "sludgemu starting");
+
+    TitleInfo title;
+    wchar_t error[1024];
+    if (!title_resolve(opt.title_path, &title, error, ARRAY_COUNT(error))) {
+        error_box(L"%s", error);
+        return 1;
+    }
+    char narrow[MAX_PATH * 2];
+    str_to_narrow(narrow, sizeof(narrow), title.exe_path);
+    LOG_I("main", "title executable: %s", narrow);
+    str_to_narrow(narrow, sizeof(narrow), title.display_name);
+    LOG_I("main", "title: %s (title id %s)", narrow, title.title_id[0] ? title.title_id : "unknown");
+
+    SetCurrentDirectoryW(title.dir);
+    crash_install(dump_path);
+    stubs_init(opt.break_on_stub);
+    hle_init();
+    window_init(title.display_name);
+
+    g_loader.init(title.dir);
+    if (!g_loader.load_main(title.exe_path)) {
+        error_box(L"Failed to load the title executable. See the log for details:\n%s", log_path);
+        return 1;
+    }
+    g_loader.set_command_line(opt.title_args);
+    LocalFree(argv);
+
+    g_loader.run_main();
+}
