@@ -209,6 +209,13 @@ bool mem_is_tracked(const void* addr) {
     return mem_find_range(addr) != nullptr;
 }
 
+void mem_set_range_protect(const void* addr, u32 protect) {
+    AcquireSRWLockExclusive(&g_mem.range_lock);
+    if (MemRange* r = find_range_locked(addr))
+        r->protect = protect;
+    ReleaseSRWLockExclusive(&g_mem.range_lock);
+}
+
 static MemRange* add_range(u8* base, u64 size, u32 flags, u32 protect, u64 xflags) {
     AcquireSRWLockExclusive(&g_mem.range_lock);
     if (g_mem.range_count >= MAX_RANGES) {

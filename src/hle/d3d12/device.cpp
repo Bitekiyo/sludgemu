@@ -10,6 +10,7 @@
 #include "hle/d3d12/console_iids.h"
 #include "hle/d3d12/d3d12_objects.h"
 #include "hle/d3d12/d3d12_tables.h"
+#include "hle/d3d12/frame_pacing.h"
 
 static_assert(offsetof(ConsoleDevice, null_constant_buffer_address) == 0x10, "device layout");
 static_assert(offsetof(ConsoleDevice, out_of_line_flags) == 0x18, "device layout");
@@ -67,6 +68,49 @@ static HRESULT WINAPI device_create_fence(ConsoleDevice* self, UINT64 initial_va
     return console_create_fence(self, initial_value, flags, iid, out);
 }
 
+// Console descriptors are raw hardware descriptors with fixed sizes, and descriptor handles are
+// plain pointers into heap memory that title code steps through with these strides.
+static UINT WINAPI device_get_descriptor_handle_increment_size(ConsoleDevice*,
+                                                               D3D12_DESCRIPTOR_HEAP_TYPE type) {
+    switch (type) {
+    case D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV:
+        return CONSOLE_DESCRIPTOR_SIZE_RESOURCE;
+    case D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER:
+        return CONSOLE_DESCRIPTOR_SIZE_SAMPLER;
+    case D3D12_DESCRIPTOR_HEAP_TYPE_RTV:
+        return CONSOLE_DESCRIPTOR_SIZE_RTV;
+    case D3D12_DESCRIPTOR_HEAP_TYPE_DSV:
+        return CONSOLE_DESCRIPTOR_SIZE_DSV;
+    default:
+        return 0;
+    }
+}
+
+// --- frame pacing (see frame_pacing.h) --------------------------------------------------------------
+
+static HRESULT WINAPI device_set_frame_interval_x(ConsoleDevice*, void* output, UINT length_us, UINT period,
+                                                  UINT flags) {
+    return frame_set_interval(length_us, period, flags);
+}
+
+static HRESULT WINAPI device_schedule_frame_event_x(ConsoleDevice*, UINT type, UINT offset_us,
+                                                    const FrameSignalList* signals, UINT flags) {
+    return frame_schedule_event((FrameEventType)type, offset_us, signals, flags);
+}
+
+static HRESULT WINAPI device_wait_frame_event_x(ConsoleDevice*, UINT type, UINT timeout_ms,
+                                                const FrameWaitList* extra, UINT flags, FrameToken* token) {
+    return frame_wait_event((FrameEventType)type, timeout_ms, extra, flags, token);
+}
+
+// No statistics are collected yet; S_FALSE means "nothing available for this frame".
+static HRESULT WINAPI device_get_frame_statistics_x(ConsoleDevice*, FrameToken token, UINT types, UINT* count,
+                                                    void* statistics) {
+    if (count)
+        *count = 0;
+    return S_FALSE;
+}
+
 // Struct return through a hidden pointer: a C entry receives it before the object.
 static D3D12_HEAP_PROPERTIES* WINAPI device_get_custom_heap_properties(D3D12_HEAP_PROPERTIES* ret,
                                                                        ConsoleDevice* self, UINT node_mask,
@@ -79,10 +123,15 @@ static const ConsoleEntry k_device_impl[] = {
     CONSOLE_ENTRY(7, device_get_node_count),
     CONSOLE_ENTRY(8, device_create_command_queue),
     CONSOLE_ENTRY(9, device_create_command_allocator),
+    CONSOLE_ENTRY(15, device_get_descriptor_handle_increment_size),
     CONSOLE_ENTRY(26, device_get_custom_heap_properties),
     CONSOLE_ENTRY(36, device_create_fence),
     CONSOLE_ENTRY(48, device_create_command_queue_x),
     CONSOLE_ENTRY(73, device_create_command_list_x),
+    CONSOLE_ENTRY(78, device_set_frame_interval_x),
+    CONSOLE_ENTRY(79, device_schedule_frame_event_x),
+    CONSOLE_ENTRY(80, device_wait_frame_event_x),
+    CONSOLE_ENTRY(81, device_get_frame_statistics_x),
 };
 
 HRESULT console_create_device(void* adapter, const ConsoleDeviceParams* params, REFIID iid, void** out) {

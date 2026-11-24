@@ -46,8 +46,13 @@ static MemAddressLimits limits_from_flags(u64 xflags, u32 alloc_type) {
         if (!l.highest || hi < l.highest)
             l.highest = hi;
     }
-    if (xflags & XMEMF_GPU_32BIT)
+    if (xflags & XMEMF_GPU_32BIT) {
         l.highest = 0xFFFFFFFFull;
+    } else if (gpu && l.lowest < GiB(4)) {
+        // The graphics window's part below 4 GiB is small; keep it for allocations that need
+        // 32-bit GPU addresses instead of filling it with ones that don't.
+        l.lowest = GiB(4);
+    }
     if ((alloc_type & XMEM_TYPE_2MB_PAGES) || (xflags & XMEMF_2MB_ALIGN))
         l.alignment = MiB(2);
     return l;
@@ -61,7 +66,21 @@ void* xmem_virtual_alloc(void* base, usize size, u32 alloc_type, u64 xflags, u32
     MemAddressLimits limits = limits_from_flags(gpu ? (xflags | XMEMF_GPU) : xflags, alloc_type);
 
     void* p = nullptr;
-    if (alloc_type & XMEM_TYPE_PHYSICAL) {
+    if ((alloc_type & MEM_REPLACE_PLACEHOLDER) && base) {
+        // Titles carve placeholders up themselves: reserve one, split it with VirtualFree
+        // (MEM_PRESERVE_PLACEHOLDER), then turn each piece into a mapping range. Our placeholder
+        // ranges split per page on demand, so a piece only needs its protection recorded.
+        const MemRange* r = mem_find_range(base);
+        if (r && (r->flags & MEM_RANGE_PLACEHOLDER)) {
+            if ((cpu_prot & 0xFF) != PAGE_NOACCESS)
+                mem_set_range_protect(base, cpu_prot);
+            p = base;
+        } else {
+            LOG_E("xmem", "MEM_REPLACE_PLACEHOLDER at %p outside a placeholder range", base);
+        }
+    } else if (alloc_type & MEM_RESERVE_PLACEHOLDER) {
+        p = mem_reserve_placeholder(size, limits, range_flags, cpu_prot, xflags);
+    } else if (alloc_type & XMEM_TYPE_PHYSICAL) {
         // As with plain VirtualAlloc, MEM_COMMIT without a base address implies MEM_RESERVE.
         if (base || !(alloc_type & (MEM_RESERVE | MEM_COMMIT))) {
             LOG_E("xmem", "unsupported physical allocation (base=%p type=0x%x xflags=0x%llx prot=0x%x)", base,

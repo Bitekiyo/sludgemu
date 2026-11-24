@@ -89,6 +89,9 @@ bool mem_map_physical_scatter(void* const* vas, u64 count, const u64* pfns);
 bool mem_release(void* base);
 
 const MemRange* mem_find_range(const void* addr);
+
+// Changes the host protection used for future mappings in the range containing `addr`.
+void mem_set_range_protect(const void* addr, u32 protect);
 bool mem_is_tracked(const void* addr);
 
 // Graphics address window reported to the title (D3D12 virtual memory configuration).

@@ -21,14 +21,19 @@ static LPVOID WINAPI hk_VirtualAlloc(LPVOID base, SIZE_T size, DWORD type, DWORD
 
 static BOOL WINAPI hk_VirtualFree(LPVOID base, SIZE_T size, DWORD type) {
     if (base && mem_is_tracked(base)) {
+        const MemRange* r = mem_find_range(base);
+        if ((type & MEM_PRESERVE_PLACEHOLDER) && r && (r->flags & MEM_RANGE_PLACEHOLDER)) {
+            // Splitting a placeholder: our placeholder ranges split per page when mapped.
+            return TRUE;
+        }
         if (type & MEM_RELEASE) {
             bool ok = mem_release(base);
             LOG_D("kernel", "VirtualFree(%p, MEM_RELEASE) on tracked range -> %d", base, ok);
             return ok;
         }
-        const MemRange* r = mem_find_range(base);
         if (r && (r->flags & MEM_RANGE_PLACEHOLDER)) {
-            LOG_W("kernel", "VirtualFree(%p, 0x%llx, 0x%lx) on a physical-mapping range ignored", base, (u64)size, type);
+            LOG_W("kernel", "VirtualFree(%p, 0x%llx, 0x%lx) on a physical-mapping range ignored", base,
+                  (u64)size, type);
             return TRUE;
         }
     }

@@ -53,6 +53,8 @@ add_executable(sludgemu WIN32
     hle/d3d12/fence.cpp
     hle/d3d12/command_allocator.cpp
     hle/d3d12/command_list.cpp
+    hle/d3d12/frame_pacing.h
+    hle/d3d12/frame_pacing.cpp
     hle/dstorage/dstorage.cpp
 
     gpu/agility.cpp

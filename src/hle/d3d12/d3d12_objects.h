@@ -7,6 +7,12 @@
 
 // Console D3D12 object types and their creation functions (one source file per type).
 
+// Console descriptor sizes (raw hardware descriptors, fixed per heap type).
+#define CONSOLE_DESCRIPTOR_SIZE_RESOURCE 32 // CBV / SRV / UAV
+#define CONSOLE_DESCRIPTOR_SIZE_SAMPLER  16
+#define CONSOLE_DESCRIPTOR_SIZE_RTV      112
+#define CONSOLE_DESCRIPTOR_SIZE_DSV      128
+
 struct ConsoleDevice {
     ConsoleObjectHeader header;
     u64 null_constant_buffer_address; // GPU address of a zero-filled constant buffer
