@@ -96,9 +96,12 @@ blocks are implemented natively on the Windows thread pool.
 
 ## Dependencies
 
-Fetched at configure time, never vendored: the DirectStorage redistributable (NuGet, copied next to
-`sludgemu.exe` and delay-loaded) and libdeflate (zlib decoding). The Agility SDK will follow the
-same pattern.
+Fetched at configure time, never vendored:
+- the D3D12 Agility SDK (NuGet): the desktop D3D12 runtime we translate to, independent of the OS
+  build. `D3D12Core.dll` goes to `D3D12\` next to `sludgemu.exe`, which exports
+  `D3D12SDKVersion` / `D3D12SDKPath`. Its headers take precedence over the Windows SDK's.
+- the DirectStorage redistributable (NuGet), copied next to `sludgemu.exe` and delay-loaded.
+- libdeflate, for zlib decoding.
 
 ## Debugging conventions
 

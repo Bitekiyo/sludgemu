@@ -70,4 +70,16 @@ set(SLUDGE_DSTORAGE_DLLS
     ${dstorage_pkg_SOURCE_DIR}/native/bin/x64/dstorage.dll
     ${dstorage_pkg_SOURCE_DIR}/native/bin/x64/dstoragecore.dll)
 
+# D3D12 Agility SDK: the desktop D3D12 runtime we translate to, independent of the OS build.
+# D3D12Core.dll (and the debug layer) go to bin/<config>/D3D12/, found through the
+# D3D12SDKVersion / D3D12SDKPath exports of sludgemu.exe. Its headers take precedence over the
+# Windows SDK's.
+sludge_fetch_nuget(agility_pkg Microsoft.Direct3D.D3D12 1.620.2
+    70489669c2bbeaf318b62d72b0ac3e753d521387bfc848c9763791c4e920bfcc)
+add_library(agility INTERFACE)
+target_include_directories(agility BEFORE INTERFACE ${agility_pkg_SOURCE_DIR}/build/native/include)
+set(SLUDGE_AGILITY_DLLS
+    ${agility_pkg_SOURCE_DIR}/build/native/bin/x64/D3D12Core.dll
+    ${agility_pkg_SOURCE_DIR}/build/native/bin/x64/d3d12SDKLayers.dll)
+
 add_subdirectory(src)

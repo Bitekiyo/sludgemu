@@ -39,6 +39,8 @@ add_executable(sludgemu WIN32
     hle/xmem/xmem_defs.h
     hle/d3d12/d3d12_xs.cpp
     hle/dstorage/dstorage.cpp
+
+    gpu/agility.cpp
     hle/xgameruntime/runtime_api.h
     hle/xgameruntime/xgameruntime.h
     hle/xgameruntime/xgameruntime.cpp
@@ -57,13 +59,15 @@ add_executable(sludgemu WIN32
     platform/window.cpp
 )
 target_include_directories(sludgemu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(sludgemu PRIVATE sludge_options shell32 user32 synchronization delayimp
-    dstorage libdeflate::libdeflate_static)
+target_link_libraries(sludgemu PRIVATE agility sludge_options shell32 user32 synchronization delayimp
+    dstorage libdeflate::libdeflate_static d3d12 dxgi)
 
 # Loaded only when a title uses DirectStorage.
 target_link_options(sludgemu PRIVATE /DELAYLOAD:dstorage.dll)
 add_custom_command(TARGET sludgemu POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${SLUDGE_DSTORAGE_DLLS} $<TARGET_FILE_DIR:sludgemu>)
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${SLUDGE_DSTORAGE_DLLS} $<TARGET_FILE_DIR:sludgemu>
+    COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:sludgemu>/D3D12
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${SLUDGE_AGILITY_DLLS} $<TARGET_FILE_DIR:sludgemu>/D3D12)
 
 # sludgemu.exe's implicit TLS slot (index 0) belongs to the title exe (see loader/tls_reserve.h),
 # so nothing else may use implicit TLS: no thread_local in our code, and no thread-safe static
