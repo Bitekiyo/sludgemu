@@ -3,6 +3,7 @@
 #include <windows.h>
 
 #include "common/log.h"
+#include "core/console_profile.h"
 #include "core/memory.h"
 #include "hle/hle.h"
 #include "hle/xmem/xmem.h"
@@ -11,7 +12,6 @@
 
 // Title-visible memory budget. Matches a typical console title partition; the backing section is
 // sized a bit larger so we can hand out everything we report.
-#define TITLE_MEMORY_LIMIT (GiB(13) + MiB(512))
 
 static volatile u64 g_peak_used = 0;
 
@@ -136,7 +136,7 @@ static BOOL WINAPI XMemMapPhysicalPagesScatter(PVOID* vas, ULONG_PTR count, PULO
 static BOOL WINAPI XMemGetWorkingSetStatistics(DWORD flags, XMemWorkingSetStats* stats) {
     memset(stats, 0, sizeof(*stats));
     u64 phys_used = mem_physical_used_pages() << MEM_PAGE_SHIFT;
-    stats->game_limit = TITLE_MEMORY_LIMIT;
+    stats->game_limit = console_title_memory();
     stats->game_used = phys_used;
     stats->game_physical_pages = (u32)mem_physical_used_pages();
     stats->gpu_optimal_limit = GiB(10);
@@ -229,7 +229,7 @@ static void WINAPI XMemFree(PVOID p, ULONGLONG attributes) {
 }
 
 void xmem_init() {
-    if (!mem_init(GiB(16)))
+    if (!mem_init(console_profile().physical_memory))
         FATAL("memory subsystem initialization failed");
 }
 

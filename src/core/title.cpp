@@ -126,6 +126,11 @@ bool title_resolve(const wchar_t* path, TitleInfo* out, wchar_t* error, usize er
                 xml_attr(sv, "DefaultDisplayName", display, sizeof(display));
         }
         xml_text(xml_find_tag(config, "TitleId"), out->title_id, sizeof(out->title_id));
+        char mode[32];
+        if (xml_text(xml_find_tag(config, "XboxAnacondaTitleMemory"), mode, sizeof(mode)))
+            out->advanced_memory_series_x = _stricmp(mode, "Advanced") == 0;
+        if (xml_text(xml_find_tag(config, "XboxLockhartTitleMemory"), mode, sizeof(mode)))
+            out->advanced_memory_series_s = _stricmp(mode, "Advanced") == 0;
         if (const char* pls = xml_find_tag(config, "PersistentLocalStorage")) {
             char size_mb[32];
             if (xml_text(xml_find_tag(pls, "SizeMB"), size_mb, sizeof(size_mb)))

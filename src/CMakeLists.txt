@@ -14,6 +14,8 @@ add_executable(sludgemu WIN32
     core/memory.cpp
     core/vfs.h
     core/vfs.cpp
+    core/console_profile.h
+    core/console_profile.cpp
 
     loader/pe_image.h
     loader/pe_image.cpp
@@ -34,6 +36,7 @@ add_executable(sludgemu WIN32
     hle/kernel/memory_overrides.cpp
     hle/kernel/cpu_overrides.cpp
     hle/kernel/file_overrides.cpp
+    hle/kernel/registry_overrides.cpp
     hle/xmem/xmem.h
     hle/xmem/xmem.cpp
     hle/xmem/xmem_defs.h

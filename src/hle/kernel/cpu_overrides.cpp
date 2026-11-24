@@ -9,19 +9,16 @@
 #include <windows.h>
 
 #include "common/log.h"
+#include "core/console_profile.h"
 #include "common/thread_slot.h"
 #include "core/memory.h"
 #include "hle/kernel/overrides.h"
 
-#define CONSOLE_CORES 7
+#define CONSOLE_CORES            7
 #define CONSOLE_THREADS_PER_CORE 2
-#define CONSOLE_LOGICAL (CONSOLE_CORES * CONSOLE_THREADS_PER_CORE)
-#define CONSOLE_CORES_PER_CCX 4
-#define CONSOLE_ALL_MASK ((1ull << CONSOLE_LOGICAL) - 1)
-
-// Reported to the title; matches what the xmem working-set statistics use.
-#define CONSOLE_TOTAL_PHYS GiB(16)
-#define CONSOLE_TITLE_PHYS (GiB(13) + MiB(512))
+#define CONSOLE_LOGICAL          (CONSOLE_CORES * CONSOLE_THREADS_PER_CORE)
+#define CONSOLE_CORES_PER_CCX    4
+#define CONSOLE_ALL_MASK         ((1ull << CONSOLE_LOGICAL) - 1)
 
 static u32 build_topology(SYSTEM_LOGICAL_PROCESSOR_INFORMATION* out, u32 cap) {
     u32 n = 0;
@@ -89,7 +86,8 @@ static u32 build_topology(SYSTEM_LOGICAL_PROCESSOR_INFORMATION* out, u32 cap) {
     return n;
 }
 
-static BOOL WINAPI hk_GetLogicalProcessorInformation(PSYSTEM_LOGICAL_PROCESSOR_INFORMATION buffer, PDWORD length) {
+static BOOL WINAPI hk_GetLogicalProcessorInformation(PSYSTEM_LOGICAL_PROCESSOR_INFORMATION buffer,
+                                                     PDWORD length) {
     if (!length) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return FALSE;
@@ -114,14 +112,17 @@ static BOOL WINAPI hk_GetLogicalProcessorInformation(PSYSTEM_LOGICAL_PROCESSOR_I
 // mask + 1 so an untouched slot (0) means "all processors".
 static ThreadSlot g_title_affinity;
 
-void cpu_overrides_init() { g_title_affinity.init(); }
+void cpu_overrides_init() {
+    g_title_affinity.init();
+}
 
 static u64 title_affinity() {
     uptr v = g_title_affinity.get();
     return v ? (u64)(v - 1) : CONSOLE_ALL_MASK;
 }
 
-static BOOL WINAPI hk_SetThreadGroupAffinity(HANDLE thread, const GROUP_AFFINITY* affinity, PGROUP_AFFINITY previous) {
+static BOOL WINAPI hk_SetThreadGroupAffinity(HANDLE thread, const GROUP_AFFINITY* affinity,
+                                             PGROUP_AFFINITY previous) {
     if (!affinity || affinity->Group != 0 || !(affinity->Mask & CONSOLE_ALL_MASK)) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return FALSE;
@@ -156,11 +157,14 @@ static BOOL WINAPI hk_GlobalMemoryStatusEx(LPMEMORYSTATUSEX status) {
         return FALSE;
     }
     u64 used = mem_physical_used_pages() << MEM_PAGE_SHIFT;
-    u64 avail = used < CONSOLE_TITLE_PHYS ? CONSOLE_TITLE_PHYS - used : 0;
-    status->dwMemoryLoad = (DWORD)((used * 100) / CONSOLE_TOTAL_PHYS);
-    status->ullTotalPhys = CONSOLE_TOTAL_PHYS;
+    // Same numbers as the xmem working-set statistics: the console profile's budget.
+    u64 total = console_profile().physical_memory;
+    u64 budget = console_title_memory();
+    u64 avail = used < budget ? budget - used : 0;
+    status->dwMemoryLoad = (DWORD)((used * 100) / total);
+    status->ullTotalPhys = total;
     status->ullAvailPhys = avail;
-    status->ullTotalPageFile = CONSOLE_TOTAL_PHYS; // no paging on console: commit == physical
+    status->ullTotalPageFile = total; // no paging on console: commit == physical
     status->ullAvailPageFile = avail;
     status->ullTotalVirtual = 1ull << 47;
     status->ullAvailVirtual = (1ull << 47) - GiB(64);

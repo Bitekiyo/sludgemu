@@ -7,6 +7,7 @@
 #include <stdlib.h>
 
 #include "common/log.h"
+#include "core/console_profile.h"
 #include "core/title.h"
 
 // --- XGame ---------------------------------------------------------------------------------------
@@ -113,6 +114,34 @@ static HRESULT WINAPI XPersistentLocalStorageGetSpaceInfo(RuntimeSelf, PlsSpaceI
     return S_OK;
 }
 
+// --- XSystem ------------------------------------------------------------------------------------
+
+struct RuntimeVersion {
+    u16 major;
+    u16 minor;
+    u16 build;
+    u16 revision;
+};
+
+struct SystemAnalyticsInfo {
+    RuntimeVersion os_version;
+    RuntimeVersion hosting_os_version;
+    char family[64];
+    char form[64];
+};
+
+// Runtime interfaces are compiled C++ classes, so a struct return comes back through a hidden
+// pointer passed after the object.
+static SystemAnalyticsInfo* WINAPI XSystemGetAnalyticsInfo(RuntimeSelf, SystemAnalyticsInfo* ret) {
+    memset(ret, 0, sizeof(*ret));
+    const RuntimeVersion console_os = {10, 0, 25398, 0}; // the console OS's Windows core version
+    ret->os_version = console_os;
+    ret->hosting_os_version = console_os;
+    strcpy(ret->family, "Xbox");
+    strcpy(ret->form, console_profile().name);
+    return ret;
+}
+
 // --- feature availability ------------------------------------------------------------------------
 
 // Runtime feature areas, numbered as titles pass them.
@@ -147,7 +176,7 @@ static const GUID k_XSystemAnalytics_iids[] = {
     {0xb884675d, 0xb738, 0x4a9c, {0x81, 0x5d, 0x9a, 0x9a, 0x1e, 0x0c, 0x6c, 0x9b}},
 };
 static const RuntimeMethod k_XSystemAnalytics_methods[] = {
-    {3, "XSystemGetAnalyticsInfo", nullptr},
+    {3, "XSystemGetAnalyticsInfo", (void*)&XSystemGetAnalyticsInfo},
 };
 extern const RuntimeApi g_runtime_api_XSystemAnalytics = RUNTIME_API(
     "XSystemAnalytics", &k_XSystemAnalytics_provider, k_XSystemAnalytics_iids, k_XSystemAnalytics_methods);

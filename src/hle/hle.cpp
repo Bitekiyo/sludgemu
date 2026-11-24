@@ -25,7 +25,7 @@ struct OverrideTable {
 static const OverrideTable k_override_tables[] = {
     {g_module_overrides, &g_module_override_count}, {g_window_overrides, &g_window_override_count},
     {g_memory_overrides, &g_memory_override_count}, {g_cpu_overrides, &g_cpu_override_count},
-    {g_file_overrides, &g_file_override_count},
+    {g_file_overrides, &g_file_override_count},     {g_registry_overrides, &g_registry_override_count},
 };
 
 static const HleModule* const k_modules[] = {

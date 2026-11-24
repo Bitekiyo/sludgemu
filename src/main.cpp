@@ -6,6 +6,7 @@
 //   --log-level=LEVEL  trace | debug | info | warn | error   (default: info)
 //   --break-on-stub    break into the debugger when an unimplemented import is called
 //   --gpu-debug        enable the D3D12 debug layer
+//   --model=MODEL      console to present as: series-x (default) or series-s
 //   --dump-threads-after=N   log every thread's backtrace every N seconds (hang diagnosis)
 //   --watch-write=SPEC       log every write to an 8-byte location ("module.dll+0xRVA" or "0xADDR")
 
@@ -16,6 +17,7 @@
 
 #include "common/log.h"
 #include "common/str.h"
+#include "core/console_profile.h"
 #include "core/title.h"
 #include "gpu/gpu.h"
 #include "hle/hle.h"
@@ -29,6 +31,7 @@ struct Options {
     bool console;
     bool break_on_stub;
     bool gpu_debug;
+    ConsoleModel model;
     u32 dump_threads_after;
     char watch_write[128];
     LogLevel log_level;
@@ -58,6 +61,11 @@ static bool parse_options(int argc, wchar_t** argv, Options* opt) {
         }
         if (wcscmp(a, L"--console") == 0) {
             opt->console = true;
+        } else if (wcsncmp(a, L"--model=", 8) == 0) {
+            if (!console_model_parse(a + 8, &opt->model)) {
+                error_box(L"Unknown console model: %s\nUse series-x or series-s.", a + 8);
+                return false;
+            }
         } else if (wcscmp(a, L"--gpu-debug") == 0) {
             opt->gpu_debug = true;
         } else if (wcscmp(a, L"--break-on-stub") == 0) {
@@ -145,6 +153,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
     SetCurrentDirectoryW(title.dir);
     crash_install(dump_path);
     stubs_init(opt.break_on_stub);
+    console_profile_select(opt.model);
+    LOG_I("main", "presenting as %s, title memory %llu MiB", console_profile().name,
+          console_title_memory() >> 20);
     xmem_init();
     hle_init();
     GpuOptions gpu_options = {};

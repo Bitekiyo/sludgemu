@@ -6,11 +6,13 @@
 
 // What we know about the title being launched, mostly from its MicrosoftGame.Config.
 struct TitleInfo {
-    wchar_t dir[MAX_PATH];      // package root
-    wchar_t exe_path[MAX_PATH]; // full path to the executable
-    wchar_t display_name[256];  // window caption
-    char title_id[16];          // hex string, e.g. "1234ABCD" (empty if unknown)
-    u64 pls_quota;              // persistent local storage size in bytes (0 if none declared)
+    wchar_t dir[MAX_PATH];         // package root
+    wchar_t exe_path[MAX_PATH];    // full path to the executable
+    wchar_t display_name[256];     // window caption
+    char title_id[16];             // hex string, e.g. "1234ABCD" (empty if unknown)
+    u64 pls_quota;                 // persistent local storage size in bytes (0 if none declared)
+    bool advanced_memory_series_x; // title memory mode "Advanced" (default Standard)
+    bool advanced_memory_series_s;
 };
 
 // The title being run (filled in by main before anything else starts).
