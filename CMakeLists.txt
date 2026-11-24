@@ -83,3 +83,6 @@ set(SLUDGE_AGILITY_DLLS
     ${agility_pkg_SOURCE_DIR}/build/native/bin/x64/d3d12SDKLayers.dll)
 
 add_subdirectory(src)
+
+enable_testing()
+add_subdirectory(tests)

@@ -75,13 +75,21 @@ bool mem_init(u64 physical_bytes) {
         LOG_E("memory", "physical memory size %llu MiB exceeds %u chunks", physical_bytes >> 20, MAX_CHUNKS);
         return false;
     }
-    // The linear view starts as one placeholder; chunks are mapped into it as they are created.
+    // The linear view is one placeholder per chunk; a chunk's section replaces its placeholder when
+    // the chunk is created.
     g_mem.linear =
         (u8*)g_mem.virtual_alloc2(GetCurrentProcess(), nullptr, physical_bytes,
                                   MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0);
     if (!g_mem.linear) {
         LOG_E("memory", "cannot reserve the physical memory view (%lu)", GetLastError());
         return false;
+    }
+    for (u32 i = 0; i + 1 < g_mem.chunk_count; i++) {
+        if (!VirtualFree(g_mem.linear + (u64)i * MEM_CHUNK_SIZE, MEM_CHUNK_SIZE,
+                         MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) {
+            LOG_E("memory", "cannot split the physical memory view (%lu)", GetLastError());
+            return false;
+        }
     }
     u64 words = (g_mem.total_pages + 63) / 64;
     g_mem.used_bitmap = (u64*)VirtualAlloc(nullptr, words * 8 * 2, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
@@ -123,9 +131,6 @@ static void create_chunk(u32 index) {
     if (!section)
         FATAL("cannot commit %llu MiB of physical memory (%lu)", MEM_CHUNK_SIZE >> 20, GetLastError());
     u8* slot = g_mem.linear + (u64)index * MEM_CHUNK_SIZE;
-    if (!VirtualFree(slot, MEM_CHUNK_SIZE, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) &&
-        GetLastError() != ERROR_INVALID_PARAMETER)
-        FATAL("cannot split the physical memory view (%lu)", GetLastError());
     if (!g_mem.map_view3(section, GetCurrentProcess(), slot, 0, MEM_CHUNK_SIZE, MEM_REPLACE_PLACEHOLDER,
                          PAGE_READWRITE, nullptr, 0))
         FATAL("cannot map physical memory chunk %u (%lu)", index, GetLastError());
@@ -386,26 +391,35 @@ bool mem_release(void* base) {
         return false;
     }
     if (r->flags & MEM_RANGE_PLACEHOLDER) {
+        // Every piece of address space is released exactly once:
+        //  - a mapped page: unmapping without MEM_PRESERVE_PLACEHOLDER frees its address space,
+        //  - a split, unmapped page: it is its own placeholder,
+        //  - a run of unsplit pages: one placeholder (pages are only ever carved out of the run
+        //    around them, so a maximal run of unsplit pages is exactly one placeholder).
         u64 pages = r->size >> MEM_PAGE_SHIFT;
         bool owns = (r->flags & MEM_RANGE_OWNS_PAGES) != 0;
-        for (u64 p = 0; p < pages; p++) {
-            u32 s = r->page_pfn[p];
-            if (s != PAGE_STATE_UNSPLIT && s != PAGE_STATE_SPLIT) {
-                g_mem.unmap_view2(GetCurrentProcess(), r->base + (p << MEM_PAGE_SHIFT), 0);
+        HANDLE proc = GetCurrentProcess();
+        for (u64 p = 0; p < pages;) {
+            u8* va = r->base + (p << MEM_PAGE_SHIFT);
+            u32 state = r->page_pfn[p];
+            u64 run = 1;
+            bool ok;
+            if (state == PAGE_STATE_UNSPLIT) {
+                while (p + run < pages && r->page_pfn[p + run] == PAGE_STATE_UNSPLIT)
+                    run++;
+                ok = VirtualFree(va, 0, MEM_RELEASE) != FALSE;
+            } else if (state == PAGE_STATE_SPLIT) {
+                ok = VirtualFree(va, 0, MEM_RELEASE) != FALSE;
+            } else {
+                ok = g_mem.unmap_view2(proc, va, 0) != FALSE;
                 if (owns) {
-                    u64 pfn = s;
+                    u64 pfn = state;
                     mem_physical_free(1, &pfn);
                 }
             }
-        }
-        // Remaining placeholders: release each split page, then whatever is left unsplit.
-        for (u64 p = 0; p < pages; p++) {
-            if (r->page_pfn[p] != PAGE_STATE_UNSPLIT)
-                VirtualFree(r->base + (p << MEM_PAGE_SHIFT), 0, MEM_RELEASE);
-        }
-        for (u64 p = 0; p < pages; p++) {
-            if (r->page_pfn[p] == PAGE_STATE_UNSPLIT)
-                VirtualFree(r->base + (p << MEM_PAGE_SHIFT), 0, MEM_RELEASE);
+            if (!ok)
+                LOG_E("memory", "releasing %p (%llu pages) failed (%lu)", va, run, GetLastError());
+            p += run;
         }
         VirtualFree(r->page_pfn, 0, MEM_RELEASE);
     } else {

@@ -69,13 +69,27 @@ void log_flush() {
     ReleaseSRWLockExclusive(&g_log.lock);
 }
 
-void log_set_level(LogLevel min_level) { g_log.min_level = min_level; }
+void log_set_level(LogLevel min_level) {
+    g_log.min_level = min_level;
+}
 
-bool log_enabled(LogLevel level) { return level >= g_log.min_level; }
+bool log_enabled(LogLevel level) {
+    return level >= g_log.min_level;
+}
 
-bool log_once_flag(volatile long* flag) { return InterlockedExchange(flag, 1) == 0; }
+bool log_once_flag(volatile long* flag) {
+    return InterlockedExchange(flag, 1) == 0;
+}
+
+static volatile long g_error_count = 0;
+
+u32 log_error_count() {
+    return (u32)g_error_count;
+}
 
 static void log_vprintf(LogLevel level, const char* channel, const char* fmt, va_list args) {
+    if (level >= LOG_LEVEL_ERROR)
+        InterlockedIncrement(&g_error_count);
     if (level < g_log.min_level)
         return;
     ensure_timer();
