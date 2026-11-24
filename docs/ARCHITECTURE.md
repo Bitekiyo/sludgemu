@@ -68,6 +68,20 @@ addresses, as on console. Graphics allocations are placed inside the graphics ad
 reported by `D3D12ConfigureVirtualMemoryX` and recorded in a GPU range registry for the graphics
 layer.
 
+## Graphics
+
+Console D3D12 objects are not COM objects: each starts with a pointer to a function table whose
+entries the title's inlined interface wrappers call as C functions (object first), in an order
+that differs from desktop D3D12, and several interfaces expose public data members that title code
+reads directly. We hand out objects with exactly that prefix, followed by private state that
+points at the desktop (Agility SDK) object. Unimplemented entries are named logging stubs.
+
+The console command list can also write command packets inline, straight into its command buffer,
+when the buffer's limit pointers allow it; otherwise every method goes through the function table.
+We keep those limits null, so all recording arrives at API level, the same path debug and
+instrumented console builds take, and is translated call by call. Device-side descriptor writes
+that titles can inline are routed through the table the same way.
+
 ## Console subsystems (planned)
 
 | Area | Console side | Desktop side |

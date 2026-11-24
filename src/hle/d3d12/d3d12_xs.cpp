@@ -4,16 +4,17 @@
 
 #include "common/log.h"
 #include "core/memory.h"
+#include "hle/d3d12/device.h"
 #include "hle/hle.h"
 
 // Console graphics virtual-memory configuration (in/out). Layout matches the title's ABI.
 struct GpuVmConfig {
-    u32 flags;                    // in
-    u32 page_table_4mb_pages;     // in (console page table sizing, ignored)
-    u32 frame_preserve_bytes;     // in (cross-process frame buffer preservation, ignored)
+    u32 flags;                // in
+    u32 page_table_4mb_pages; // in (console page table sizing, ignored)
+    u32 frame_preserve_bytes; // in (cross-process frame buffer preservation, ignored)
     u32 pad;
-    u64 min_graphics_address;     // out
-    u64 max_graphics_address;     // out
+    u64 min_graphics_address; // out
+    u64 max_graphics_address; // out
 };
 static_assert(sizeof(GpuVmConfig) == 32, "GpuVmConfig layout");
 
@@ -27,13 +28,19 @@ static HRESULT WINAPI D3D12ConfigureVirtualMemoryX(GpuVmConfig* cfg) {
     mem_set_gpu_window(lowest, highest);
     cfg->min_graphics_address = lowest;
     cfg->max_graphics_address = highest;
-    LOG_I("d3d12", "ConfigureVirtualMemoryX(flags=0x%x, pt=%u, preserve=%u) -> graphics VA 0x%llx..0x%llx", cfg->flags,
-          cfg->page_table_4mb_pages, cfg->frame_preserve_bytes, lowest, highest);
+    LOG_I("d3d12", "ConfigureVirtualMemoryX(flags=0x%x, pt=%u, preserve=%u) -> graphics VA 0x%llx..0x%llx",
+          cfg->flags, cfg->page_table_4mb_pages, cfg->frame_preserve_bytes, lowest, highest);
     return S_OK;
+}
+
+static HRESULT WINAPI D3D12XboxCreateDevice(void* adapter, const ConsoleDeviceParams* params, REFIID iid,
+                                            void** device) {
+    return console_create_device(adapter, params, iid, device);
 }
 
 static const HleExport k_exports[] = {
     HLE_EXPORT(D3D12ConfigureVirtualMemoryX),
+    HLE_EXPORT(D3D12XboxCreateDevice),
 };
 
 extern const HleModule g_hle_module_d3d12_xs = {"d3d12_xs.dll", k_exports, ARRAY_COUNT(k_exports)};

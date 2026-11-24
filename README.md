@@ -37,6 +37,7 @@ sludgemu.exe [options] <package directory | title exe> [-- title arguments]
 | `--console` | open a console window with the live log |
 | `--log-level=LEVEL` | `trace`, `debug`, `info` (default), `warn`, `error` |
 | `--break-on-stub` | break into an attached debugger when an unimplemented import is called |
+| `--gpu-debug` | enable the D3D12 debug layer |
 | `--dump-threads-after=N` | log a backtrace of every thread every N seconds (for diagnosing hangs) |
 | `--watch-write=SPEC` | hardware watchpoint: log every write (value + backtrace) to an 8-byte location, `module.dll+0xRVA` or `0xADDRESS` |
 

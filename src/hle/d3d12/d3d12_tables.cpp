@@ -1,0 +1,152 @@
+// Entry names of the console graphics function tables, by index. The order is the console ABI;
+// see console_object.h for how tables are built.
+
+#include "hle/d3d12/d3d12_tables.h"
+
+const char* const k_command_list_entries[150] = {
+    "QueryInterface", "AddRef", "Release", "GetPrivateData", "SetPrivateData", "SetPrivateDataInterface", "SetName",
+    "GetDevice", "GetType", "Close", "Reset", "ClearState", "DrawInstanced", "DrawIndexedInstanced", "Dispatch",
+    "CopyBufferRegion", "CopyTextureRegion", "CopyResource", "CopyTiles", "ResolveSubresource",
+    "IASetPrimitiveTopology", "RSSetViewports", "RSSetScissorRects", "OMSetBlendFactor", "OMSetStencilRef",
+    "SetPipelineState", "ResourceBarrier", "ExecuteBundle", "BeginQuery", "EndQuery", "ResolveQueryData",
+    "SetPredication", "SetDescriptorHeaps", "SetComputeRootSignature", "SetGraphicsRootSignature",
+    "SetComputeRootDescriptorTable", "SetGraphicsRootDescriptorTable", "SetComputeRoot32BitConstant",
+    "SetGraphicsRoot32BitConstant", "SetComputeRoot32BitConstants", "SetGraphicsRoot32BitConstants",
+    "SetComputeRootConstantBufferView", "SetGraphicsRootConstantBufferView", "SetComputeRootShaderResourceView",
+    "SetGraphicsRootShaderResourceView", "SetComputeRootUnorderedAccessView", "SetGraphicsRootUnorderedAccessView",
+    "IASetIndexBuffer", "IASetVertexBuffers", "SOSetTargets", "OMSetRenderTargets", "ClearDepthStencilView",
+    "ClearRenderTargetView", "ClearUnorderedAccessViewUint", "ClearUnorderedAccessViewFloat", "DiscardResource",
+    "SetMarker", "BeginEvent", "EndEvent", "InsertGpuMarker", "InsertTimingMarker", "ExecuteIndirect",
+    "CopyMemoryToMemoryX", "FillMemoryWith32BitValueX", "FillMemoryWith64BitValueX", "FillMemoryWith128BitValueX",
+    "SetOcclusionQueryControlX", "SetPerfectOcclusionQueriesX", "SetHiStencilControlX", "FlushPipelineX",
+    "OMSetDepthBoundsX", "Write32BitValueBottomOfPipeX", "Write64BitValueBottomOfPipeX", "Wait32BitValueX",
+    "Wait64BitValueX", "SetPixelShaderDepthForceZOrderX", "ExecuteIndirectBundleX", "SetupOrderedAppendCounterX",
+    "WriteGDSX", "ReadGDSX", "DispatchX", "SetHiStencilStateX", "RSSetMSAAParametersX", "DrawIndexedX", "NopX",
+    "CopyTextureRegionX", "CopyResourceX", "Deprecated_SetPredicationBufferX", "Deprecated_AdvancePredicationX",
+    "ExecuteCommandListsX", "Write32BitValueTopOfPipeX", "Write64BitValueTopOfPipeX",
+    "Write32BitValueBottomOfShaderX", "GetExecutionCommandSizeX", "CloseBundleX", "KickoffX", "RSSetDepthBiasX",
+    "SetGraphicsShaderLimitsX", "SetComputeShaderLimitsX", "SetResourceCompressionStateX", "DispatchMeshX",
+    "DriverHintX", "StartCountersX", "SampleCountersX", "StopCountersX", "SetDeferredPrimitiveBatchBinningX",
+    "DeferredPrimitiveBreakBatchX", "AtomicCopyBufferUINT", "AtomicCopyBufferUINT64", "OMSetDepthBounds",
+    "SetSamplePositions", "ResolveSubresourceRegion", "SetViewInstanceMask", "WriteBufferImmediate",
+    "SetProtectedResourceSession", "BeginRenderPass", "EndRenderPass", "InitializeMetaCommand",
+    "ExecuteMetaCommand", "BuildRaytracingAccelerationStructure",
+    "EmitRaytracingAccelerationStructurePostbuildInfo", "CopyRaytracingAccelerationStructure", "SetPipelineState1",
+    "DispatchRays", "CpuValidateResultX", "BuildRaytracingAccelerationStructureFromCanonicalBVH",
+    "RSSetShadingRate", "RSSetShadingRateImage", "RSSetShadingRateX", "DispatchMesh",
+    "BuildRaytracingAccelerationStructureBatchedX", "SyncTopOfPipeX", "SyncBottomOfPipeX",
+    "BuildRaytracingAccelerationStructureBatched2X", "DispatchRaysX", "PrefetchMemoryX", "PrefetchPipelineStateX",
+    "Write32BitValueBottomOfPipe2X", "Write64BitValueBottomOfPipe2X", "ResetX", "ResourceBarrierX",
+    "SetShaderScratchSpaceX", "OMSetSampleMaskX", "WritePRTLODStatisticsX", "EnableLiveDebuggingX",
+    "SetComputeShaderLaunchParametersX", "Barrier", "OMSetFrontAndBackStencilRef", "AllocateFromCommandAllocatorX",
+    "RehydrateRaytracingAccelerationStructureBatchedX",
+};
+
+const char* const k_device_entries[139] = {
+    "QueryInterface", "AddRef", "Release", "GetPrivateData", "SetPrivateData", "SetPrivateDataInterface", "SetName",
+    "GetNodeCount", "CreateCommandQueue", "CreateCommandAllocator", "CreateGraphicsPipelineState",
+    "CreateComputePipelineState", "CreateCommandList", "CheckFeatureSupport", "CreateDescriptorHeap",
+    "GetDescriptorHandleIncrementSize", "CreateRootSignature", "CreateConstantBufferView",
+    "CreateShaderResourceView", "CreateUnorderedAccessView", "CreateRenderTargetView", "CreateDepthStencilView",
+    "CreateSampler", "CopyDescriptors", "CopyDescriptorsSimple", "GetResourceAllocationInfo",
+    "GetCustomHeapProperties", "CreateCommittedResource", "CreateHeap", "CreatePlacedResource",
+    "CreateReservedResource", "CreateSharedHandle", "OpenSharedHandle", "OpenSharedHandleByName", "MakeResident",
+    "Evict", "CreateFence", "GetDeviceRemovedReason", "GetCopyableFootprints", "CreateQueryHeap",
+    "SetStablePowerState", "CreateCommandSignature", "GetResourceTiling", "GetAdapterLuid", "CreatePlacedResourceX",
+    "CreateComponentPlacedResourceX", "CreatePlacedShaderResourceViewX", "CreatePlacedUnorderedAccessViewX",
+    "CreateCommandQueueX", "SetDriverHintX", "SetHangCallbacksX", "ReportGpuHangX", "SetDebugFlagsX",
+    "GetDebugFlagsX", "SetDebugCallbackX", "CreateDerivedGraphicsPipelineStateX", "SerializeGraphicsPipelineStateX",
+    "DeserializeGraphicsPipelineStateX", "EnableManualGraphicsTLBInvalidationX", "GetDefaultMSAAParametersX",
+    "CreateGraphicsPipelineStateX", "CreateSamplerX", "CreateComputePipelineStateX",
+    "CreateDerivedComputePipelineStateX", "RegisterCustomFenceLocationX", "UnregisterCustomFenceLocationX",
+    "SerializeComputePipelineStateX", "DeserializeComputePipelineStateX", "GetGpuHardwareConfigurationX",
+    "SetDebugErrorFilterX", "CreatePlacedRawShaderResourceViewX", "CreatePlacedRawUnorderedAccessViewX",
+    "SetGpuMemoryPriorityX", "CreateCommandListX", "RegisterPagePoolX", "UnregisterPagePoolX",
+    "CreateCommittedResourceX", "CreateComponentPlacedResourceX1", "SetFrameIntervalX", "ScheduleFrameEventX",
+    "WaitFrameEventX", "GetFrameStatisticsX", "CreateCounterSetX", "CreatePipelineLibrary",
+    "SetEventOnMultipleFenceCompletion", "SetResidencyPriority", "CreatePipelineState",
+    "OpenExistingHeapFromAddress", "OpenExistingHeapFromFileMapping", "EnqueueMakeResident", "CreateCommandList1",
+    "CreateProtectedResourceSession", "CreateCommittedResource1", "CreateHeap1", "CreateReservedResource1",
+    "GetResourceAllocationInfo1", "CreateLifetimeTracker", "RemoveDevice", "EnumerateMetaCommands",
+    "EnumerateMetaCommandParameters", "CreateMetaCommand", "CreateStateObject",
+    "GetRaytracingAccelerationStructurePrebuildInfo", "CheckDriverMatchingIdentifier",
+    "StoreDXRStateObjectDescX_DeprecatedUnused", "SetBackgroundProcessingMode", "AddToStateObject",
+    "CreateProtectedResourceSession1", "GetResourceAllocationInfo2", "CreateCommittedResource2",
+    "CreatePlacedResource1", "CreateSamplerFeedbackUnorderedAccessViewX", "GetCopyableFootprints1",
+    "CreateMinMipShaderResourceViewX", "SerializeStateObjectX", "DeserializeStateObjectX",
+    "GetRaytracingAccelerationStructurePrebuildInfoX", "GetShaderResourceViewPRTLODIndexX",
+    "SetShaderResourceViewPRTLODIndexX", "AddBlobToGpuHangDumpX", "RegisterPagePool2X",
+    "SetShaderRecompileCallbackX", "SetCompileTimeShaderPdbPathX", "XboxReserved1", "CreateCommandQueue1",
+    "CreateShaderCacheSession", "ShaderCacheControl", "CreateCommittedResource3", "CreatePlacedResource2",
+    "CreateReservedResource2", "CreateSampler2", "EnableLiveDebuggingX", "ReportGpuHaltX", "CreatePlacedResourceX1",
+    "CreateComponentPlacedResourceX2", "IsLiveDebugServerActiveX", "RehydrateRaytracingAccelerationStructureX",
+    "ValidateAccelerationStructureBuildDescCrc32X", "QueryBVHStatsCPUX",
+};
+
+const char* const k_command_queue_entries[38] = {
+    "QueryInterface", "AddRef", "Release", "GetPrivateData", "SetPrivateData", "SetPrivateDataInterface", "SetName",
+    "GetDevice", "UpdateTileMappings", "CopyTileMappings", "ExecuteCommandLists", "SetMarker", "BeginEvent",
+    "EndEvent", "InsertGpuMarker", "InsertTimingMarker", "Signal", "Wait", "GetTimestampFrequency",
+    "GetClockCalibration", "PIXGpuCaptureNextFrame", "PIXGpuBeginCapture", "PIXGpuEndCapture", "SuspendX",
+    "ResumeX", "SignalX", "InvalidateGraphicsTLBX", "KickoffX", "GetDesc", "CopyPageMappingsX",
+    "ClearPageMappingsX", "CopyPageMappingsBatchX", "PresentX", "SetHDRToneMapperX", "Signal2X",
+    "ExecuteCommandLists2X", "EnableLiveDebuggingX", "WaitX",
+};
+
+const char* const k_resource_entries[20] = {
+    "QueryInterface", "AddRef", "Release", "GetPrivateData", "SetPrivateData", "SetPrivateDataInterface", "SetName",
+    "GetDevice", "Map", "Unmap", "GetDesc", "GetGPUVirtualAddress", "WriteToSubresource", "ReadFromSubresource",
+    "GetHeapProperties", "GetPlacementDescX", "GetValidationFlagsX", "SetValidationFlagsX",
+    "GetProtectedResourceSession", "GetDesc1",
+};
+
+const char* const k_pipeline_state_entries[14] = {
+    "QueryInterface", "AddRef", "Release", "GetPrivateData", "SetPrivateData", "SetPrivateDataInterface", "SetName",
+    "GetDevice", "GetCachedBlob", "GetGraphicsDesc", "GetComputeDesc", "GetInformationX", "SetOptionX",
+    "PatchShadersX",
+};
+
+const char* const k_descriptor_heap_entries[12] = {
+    "QueryInterface", "AddRef", "Release", "GetPrivateData", "SetPrivateData", "SetPrivateDataInterface", "SetName",
+    "GetDevice", "GetDesc", "GetCPUDescriptorHandleForHeapStart", "GetGPUDescriptorHandleForHeapStart",
+    "GetSamplerBorderColorTableX",
+};
+
+const char* const k_fence_entries[13] = {
+    "QueryInterface", "AddRef", "Release", "GetPrivateData", "SetPrivateData", "SetPrivateDataInterface", "SetName",
+    "GetDevice", "GetCompletedValue", "SetEventOnCompletion", "Signal", "GetCreationFlags", "GetGpuAddressX",
+};
+
+const char* const k_command_allocator_entries[10] = {
+    "QueryInterface", "AddRef", "Release", "GetPrivateData", "SetPrivateData", "SetPrivateDataInterface", "SetName",
+    "GetDevice", "Reset", "SetAllocatorCallbackX",
+};
+
+const char* const k_root_signature_entries[9] = {
+    "QueryInterface", "AddRef", "Release", "GetPrivateData", "SetPrivateData", "SetPrivateDataInterface", "SetName",
+    "GetDevice", "GetComputeDescriptorX",
+};
+
+const char* const k_heap_entries[11] = {
+    "QueryInterface", "AddRef", "Release", "GetPrivateData", "SetPrivateData", "SetPrivateDataInterface", "SetName",
+    "GetDevice", "GetDesc", "GetProtectedResourceSession", "GetGpuAddressX",
+};
+
+const char* const k_query_heap_entries[8] = {
+    "QueryInterface", "AddRef", "Release", "GetPrivateData", "SetPrivateData", "SetPrivateDataInterface", "SetName",
+    "GetDevice",
+};
+
+const char* const k_command_signature_entries[8] = {
+    "QueryInterface", "AddRef", "Release", "GetPrivateData", "SetPrivateData", "SetPrivateDataInterface", "SetName",
+    "GetDevice",
+};
+
+const char* const k_dma_command_list_entries[34] = {
+    "QueryInterface", "AddRef", "Release", "GetPrivateData", "SetPrivateData", "SetPrivateDataInterface", "SetName",
+    "GetDevice", "GetType", "Close", "Reset", "CopyBufferRegion", "CopyTextureRegion", "CopyResource", "CopyTiles",
+    "ResourceBarrier", "BeginQuery", "EndQuery", "ResolveQueryData", "SetMarker", "BeginEvent", "EndEvent",
+    "InsertGpuMarker", "InsertTimingMarker", "CopyMemoryToMemoryX", "FillMemoryWith32BitValueX",
+    "Write64BitValueBottomOfPipeX", "Wait64BitValueX", "CopyLastErrorCodeToMemoryX", "LZDecompressMemoryX",
+    "LZCompressMemoryX", "JPEGDecodeMemoryX", "EnqueueDwordsX", "KickoffX",
+};

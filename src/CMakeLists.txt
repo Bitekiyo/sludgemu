@@ -38,9 +38,17 @@ add_executable(sludgemu WIN32
     hle/xmem/xmem.cpp
     hle/xmem/xmem_defs.h
     hle/d3d12/d3d12_xs.cpp
+    hle/d3d12/d3d12_tables.h
+    hle/d3d12/d3d12_tables.cpp
+    hle/d3d12/console_object.h
+    hle/d3d12/console_object.cpp
+    hle/d3d12/device.h
+    hle/d3d12/device.cpp
     hle/dstorage/dstorage.cpp
 
     gpu/agility.cpp
+    gpu/gpu.h
+    gpu/gpu.cpp
     hle/xgameruntime/runtime_api.h
     hle/xgameruntime/xgameruntime.h
     hle/xgameruntime/xgameruntime.cpp

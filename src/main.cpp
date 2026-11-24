@@ -5,6 +5,7 @@
 //   --console          open a console window with the live log
 //   --log-level=LEVEL  trace | debug | info | warn | error   (default: info)
 //   --break-on-stub    break into the debugger when an unimplemented import is called
+//   --gpu-debug        enable the D3D12 debug layer
 //   --dump-threads-after=N   log every thread's backtrace every N seconds (hang diagnosis)
 //   --watch-write=SPEC       log every write to an 8-byte location ("module.dll+0xRVA" or "0xADDR")
 
@@ -16,6 +17,7 @@
 #include "common/log.h"
 #include "common/str.h"
 #include "core/title.h"
+#include "gpu/gpu.h"
 #include "hle/hle.h"
 #include "hle/xmem/xmem.h"
 #include "loader/crash.h"
@@ -26,6 +28,7 @@
 struct Options {
     bool console;
     bool break_on_stub;
+    bool gpu_debug;
     u32 dump_threads_after;
     char watch_write[128];
     LogLevel log_level;
@@ -55,6 +58,8 @@ static bool parse_options(int argc, wchar_t** argv, Options* opt) {
         }
         if (wcscmp(a, L"--console") == 0) {
             opt->console = true;
+        } else if (wcscmp(a, L"--gpu-debug") == 0) {
+            opt->gpu_debug = true;
         } else if (wcscmp(a, L"--break-on-stub") == 0) {
             opt->break_on_stub = true;
         } else if (wcsncmp(a, L"--dump-threads-after=", 21) == 0) {
@@ -86,8 +91,8 @@ static bool parse_options(int argc, wchar_t** argv, Options* opt) {
     usize used = 0;
     for (; i < argc; i++) {
         bool quote = wcschr(argv[i], L' ') != nullptr;
-        int n = _snwprintf(opt->title_args + used, ARRAY_COUNT(opt->title_args) - used, quote ? L"%s\"%s\"" : L"%s%s",
-                           used ? L" " : L"", argv[i]);
+        int n = _snwprintf(opt->title_args + used, ARRAY_COUNT(opt->title_args) - used,
+                           quote ? L"%s\"%s\"" : L"%s%s", used ? L" " : L"", argv[i]);
         if (n < 0)
             break;
         used += (usize)n;
@@ -103,9 +108,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
     if (!parse_options(argc, argv, &opt))
         return 1;
     if (!opt.title_path) {
-        MessageBoxW(nullptr,
-                    L"Usage: sludgemu.exe [--console] [--log-level=LEVEL] <package directory | title exe> [-- args]",
-                    L"sludgemu", MB_OK | MB_ICONINFORMATION);
+        MessageBoxW(
+            nullptr,
+            L"Usage: sludgemu.exe [--console] [--log-level=LEVEL] <package directory | title exe> [-- args]",
+            L"sludgemu", MB_OK | MB_ICONINFORMATION);
         return 1;
     }
 
@@ -141,6 +147,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
     stubs_init(opt.break_on_stub);
     xmem_init();
     hle_init();
+    GpuOptions gpu_options = {};
+    gpu_options.debug_layer = opt.gpu_debug;
+    gpu_set_options(gpu_options);
     window_init(title.display_name);
 
     // Before the title is mapped, so this helper thread never runs title thread-attach code.
