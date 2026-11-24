@@ -4,6 +4,10 @@
 
 #include "common/types.h"
 
+// Reads the names of the DLLs a PE file imports, straight from the file (nothing is mapped or
+// executed). Returns false if the file can't be parsed or has more than `max` imports.
+bool pe_file_import_names(const wchar_t* path, char (*names)[64], u32 max, u32* count);
+
 // A PE32+ image mapped by hand into our process.
 class PeImage {
 public:

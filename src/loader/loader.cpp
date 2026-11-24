@@ -5,11 +5,18 @@
 
 #include "common/log.h"
 #include "common/str.h"
+#include "common/thread_slot.h"
 #include "hle/hle.h"
+#include "loader/crash.h"
 #include "loader/stubs.h"
-#include "tls/sludge_tls.h"
+#include "loader/tls_reserve.h"
 
 Loader g_loader;
+
+typedef LONG(NTAPI* NtQueryInformationThreadFn)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+
+static NtQueryInformationThreadFn g_nt_query_information_thread = nullptr;
+static ThreadSlot g_title_thread; // nonzero on threads the title created
 
 // The title package ships Xbox builds of the VC++ runtime. The host's builds are ABI compatible
 // and actually work on desktop, so these always come from System32.
@@ -29,7 +36,11 @@ static bool is_host_runtime_dll(const char* name) {
 void Loader::init(const wchar_t* title_dir) {
     InitializeCriticalSection(&m_lock);
     str_copy_w(m_title_dir, MAX_PATH, title_dir);
-    sludge_tls_set_thread_callback(&Loader::thread_callback);
+    g_title_thread.init();
+    g_nt_query_information_thread =
+        (NtQueryInformationThreadFn)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread");
+    if (!tls_reserve_init(&Loader::thread_callback))
+        FATAL("TLS slot 0 is not available for the title (see log)");
 }
 
 void Loader::set_command_line(const wchar_t* args) {
@@ -85,6 +96,29 @@ PeImage* Loader::find_containing(const void* addr) {
     return nullptr;
 }
 
+void Loader::remember_host_module(HMODULE handle, const char* name) {
+    EnterCriticalSection(&m_lock);
+    u32 n = m_host_module_count;
+    bool known = false;
+    for (u32 i = 0; i < n; i++)
+        if (m_host_modules[i].handle == handle)
+            known = true;
+    if (!known && n < k_max_host_modules) {
+        m_host_modules[n].handle = handle;
+        str_copy(m_host_modules[n].name, sizeof(m_host_modules[n].name), name);
+        m_host_module_count = n + 1; // publish after the entry is complete
+    }
+    LeaveCriticalSection(&m_lock);
+}
+
+const char* Loader::host_module_name(HMODULE handle) {
+    u32 n = m_host_module_count;
+    for (u32 i = 0; i < n; i++)
+        if (m_host_modules[i].handle == handle)
+            return m_host_modules[i].name;
+    return nullptr;
+}
+
 ModuleRef Loader::open_module(const char* dll_name) {
     ModuleRef ref;
     const char* name = path_file_name(dll_name);
@@ -95,12 +129,17 @@ ModuleRef Loader::open_module(const char* dll_name) {
         return ref;
     }
 
+    wchar_t native_path[MAX_PATH] = {};
     EnterCriticalSection(&m_lock);
     ref.image = find_by_name(name);
     if (!ref.image && !is_host_runtime_dll(name)) {
         wchar_t path[MAX_PATH];
-        if (title_local_path(name, path, MAX_PATH))
-            ref.image = load_image(path, false);
+        if (title_local_path(name, path, MAX_PATH)) {
+            if (can_load_natively(path))
+                str_copy_w(native_path, MAX_PATH, path);
+            else
+                ref.image = load_image(path, false);
+        }
     }
     LeaveCriticalSection(&m_lock);
     if (ref.image) {
@@ -108,9 +147,25 @@ ModuleRef Loader::open_module(const char* dll_name) {
         return ref;
     }
 
+    if (native_path[0]) {
+        // Outside m_lock: the native loader takes the loader lock, and code running under the
+        // loader lock (thread attach) may call back into us. Dependencies are searched in
+        // System32 only, so the package's console builds of the VC++ runtime are never picked up.
+        ref.host = LoadLibraryExW(native_path, nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if (ref.host) {
+            ref.kind = MODULE_HOST;
+            remember_host_module(ref.host, name);
+            LOG_I("loader", "%s: no console imports, loaded natively at %p", name, (void*)ref.host);
+            return ref;
+        }
+        LOG_E("loader", "%s: native load failed (%lu)", name, GetLastError());
+        return ref;
+    }
+
     ref.host = LoadLibraryExA(name, nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (ref.host) {
         ref.kind = MODULE_HOST;
+        remember_host_module(ref.host, name);
         return ref;
     }
     LOG_E("loader", "module %s not found anywhere (error %lu)", name, GetLastError());
@@ -182,33 +237,62 @@ bool Loader::bind_imports(PeImage* image) {
     return true;
 }
 
-bool Loader::setup_main_tls(PeImage* image) {
+// The title exe's implicit TLS lives in slot 0, which sludgemu.exe reserves for it (see
+// loader/tls_reserve.h), exactly where a native launch would put it. Hand-mapped DLLs can't have
+// implicit TLS; title DLLs that don't import console modules are loaded natively and get it from
+// the OS.
+bool Loader::setup_image_tls(PeImage* image) {
     const IMAGE_DATA_DIRECTORY& d = image->dir(IMAGE_DIRECTORY_ENTRY_TLS);
     if (!d.Size)
         return true;
-    IMAGE_TLS_DIRECTORY64* tls = image->at_rva<IMAGE_TLS_DIRECTORY64>(d.VirtualAddress);
-    m_tls_template = (const u8*)tls->StartAddressOfRawData;
-    m_tls_template_size = (u32)(tls->EndAddressOfRawData - tls->StartAddressOfRawData);
-    m_tls_zero_fill = tls->SizeOfZeroFill;
-
-    u32 needed = m_tls_template_size + m_tls_zero_fill;
-    u32 capacity = sludge_tls_capacity();
-    if (needed > capacity) {
-        LOG_E("loader", "%s needs 0x%x bytes of TLS, only 0x%x reserved", image->name, needed, capacity);
+    if (image->is_dll) {
+        LOG_E("loader", "%s has implicit TLS and imports console modules; that combination isn't supported",
+              image->name);
         return false;
     }
-    *(u32*)tls->AddressOfIndex = sludge_tls_index();
-    m_tls_ready = true;
-    init_thread_tls(); // the calling (main) thread already exists
-    LOG_I("loader", "%s: TLS template 0x%x bytes (+0x%x zero fill) in slot %u", image->name, m_tls_template_size,
-          m_tls_zero_fill, sludge_tls_index());
+    IMAGE_TLS_DIRECTORY64* tls = image->at_rva<IMAGE_TLS_DIRECTORY64>(d.VirtualAddress);
+    const u8* tmpl = (const u8*)tls->StartAddressOfRawData;
+    u32 tmpl_size = (u32)(tls->EndAddressOfRawData - tls->StartAddressOfRawData);
+    u32 zero_fill = tls->SizeOfZeroFill;
+    if (tmpl_size + zero_fill > tls_reserve_capacity()) {
+        LOG_E("loader", "%s needs 0x%x bytes of TLS, only 0x%x reserved", image->name, tmpl_size + zero_fill,
+              tls_reserve_capacity());
+        return false;
+    }
+    *(u32*)tls->AddressOfIndex = tls_reserve_index();
+    m_tls_template = tmpl;
+    m_tls_template_size = tmpl_size;
+    m_tls_zero_fill = zero_fill;
+    m_tls_image = image; // publish for thread attach
+    init_thread_tls();   // the calling thread already exists
+    LOG_I("loader", "%s: TLS template 0x%x bytes (+0x%x zero fill) in slot %u", image->name, tmpl_size, zero_fill,
+          tls_reserve_index());
     return true;
 }
 
 void Loader::init_thread_tls() {
-    u8* block = (u8*)sludge_tls_block();
+    if (!m_tls_image)
+        return;
+    u8* block = (u8*)tls_reserve_block();
     memcpy(block, m_tls_template, m_tls_template_size);
     memset(block + m_tls_template_size, 0, m_tls_zero_fill);
+}
+
+// A title DLL can go through the native loader when everything it imports is a plain host DLL:
+// nothing we implement (HLE) and no other title DLL.
+bool Loader::can_load_natively(const wchar_t* path) const {
+    char names[128][64];
+    u32 count = 0;
+    if (!pe_file_import_names(path, names, ARRAY_COUNT(names), &count))
+        return false;
+    for (u32 i = 0; i < count; i++) {
+        if (hle_find_module(names[i]))
+            return false;
+        wchar_t local[MAX_PATH];
+        if (!is_host_runtime_dll(names[i]) && title_local_path(names[i], local, MAX_PATH))
+            return false;
+    }
+    return true;
 }
 
 void Loader::call_tls_callbacks(PeImage* image, DWORD reason) {
@@ -223,22 +307,49 @@ void Loader::call_tls_callbacks(PeImage* image, DWORD reason) {
 
 typedef BOOL(WINAPI* DllEntryFn)(HINSTANCE, DWORD, LPVOID);
 
+// Win32 start address of the calling thread (what was passed to CreateThread).
+static void* current_thread_start_address() {
+    void* start = nullptr;
+    const ULONG k_thread_query_set_win32_start_address = 9;
+    if (g_nt_query_information_thread)
+        g_nt_query_information_thread(GetCurrentThread(), k_thread_query_set_win32_start_address, &start, sizeof(start),
+                                      nullptr);
+    return start;
+}
+
 void Loader::notify_thread(DWORD reason) {
     if (!m_main)
         return;
     if (reason == DLL_THREAD_ATTACH) {
-        if (m_tls_ready)
-            init_thread_tls();
+        // Every thread gets the title images' TLS templates: it's a plain copy and gives correct
+        // initial values for any title code that ends up running there.
+        init_thread_tls();
+        crash_watch_current_thread();
+        // Title TLS callbacks / DLL thread notifications only run for threads the title created.
+        // Running them on our helper threads or host thread-pool workers executes title CRT code
+        // under the loader lock at arbitrary points (e.g. while the title CRT is still starting)
+        // and deadlocks. Thread-local objects with dynamic init are still initialized lazily on
+        // first access thanks to MSVC's TLS guards.
+        bool title_thread = find_containing(current_thread_start_address()) != nullptr;
+        g_title_thread.set(title_thread);
+        if (!title_thread)
+            return;
         call_tls_callbacks(m_main, reason);
+    } else if (!g_title_thread.get()) {
+        return;
     }
     u32 n = m_count;
     for (u32 i = 0; i < n; i++) {
         PeImage* img = &m_images[i];
         if (img == m_main || !img->initialized)
             continue;
+        if (reason == DLL_THREAD_ATTACH)
+            call_tls_callbacks(img, reason);
         DllEntryFn entry = (DllEntryFn)img->entry_point();
         if (entry)
             entry((HINSTANCE)img->base, reason, nullptr);
+        if (reason == DLL_THREAD_DETACH)
+            call_tls_callbacks(img, reason);
     }
     if (reason == DLL_THREAD_DETACH)
         call_tls_callbacks(m_main, reason);
@@ -260,18 +371,15 @@ PeImage* Loader::load_image(const wchar_t* path, bool is_main) {
         m_main = image;
 
     image->register_unwind_info();
-    if (is_main) {
-        if (!setup_main_tls(image))
-            return nullptr;
-    } else if (image->dir(IMAGE_DIRECTORY_ENTRY_TLS).Size) {
-        LOG_W("loader", "%s has implicit TLS; only the main image's TLS is supported so far", image->name);
-    }
+    if (!setup_image_tls(image))
+        return nullptr;
 
     if (!bind_imports(image))
         return nullptr;
     image->protect_sections();
 
     if (!is_main) {
+        call_tls_callbacks(image, DLL_PROCESS_ATTACH); // native order: TLS callbacks, then DllMain
         DllEntryFn entry = (DllEntryFn)image->entry_point();
         if (entry) {
             LOG_D("loader", "%s: DllMain(PROCESS_ATTACH)", image->name);

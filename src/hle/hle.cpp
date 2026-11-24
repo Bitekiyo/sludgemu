@@ -24,6 +24,8 @@ struct OverrideTable {
 static const OverrideTable k_override_tables[] = {
     {g_module_overrides, &g_module_override_count},
     {g_window_overrides, &g_window_override_count},
+    {g_memory_overrides, &g_memory_override_count},
+    {g_cpu_overrides, &g_cpu_override_count},
 };
 
 static const HleModule* const k_modules[] = {
@@ -44,6 +46,7 @@ struct HleHandle {
 static HleHandle g_handles[ARRAY_COUNT(k_modules)];
 
 void hle_init() {
+    cpu_overrides_init();
     for (u32 i = 0; i < ARRAY_COUNT(k_modules); i++) {
         g_handles[i].magic = HLE_HANDLE_MAGIC;
         g_handles[i].module = k_modules[i];
