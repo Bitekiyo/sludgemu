@@ -13,6 +13,9 @@ extern const u32 g_window_override_count;
 extern const HleExport g_memory_overrides[];
 extern const u32 g_memory_override_count;
 
+extern const HleExport g_file_overrides[];
+extern const u32 g_file_override_count;
+
 extern const HleExport g_cpu_overrides[];
 extern const u32 g_cpu_override_count;
 void cpu_overrides_init();

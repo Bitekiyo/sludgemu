@@ -17,7 +17,7 @@ legally obtained, decrypted title package.
 ## Building
 
 Requirements: Windows 10/11 x64, Visual Studio 2022 (MSVC, "Desktop development with C++"),
-CMake 3.24+.
+CMake 3.24+, and network access on the first configure (dependencies are fetched then).
 
 ```
 cmake --preset vs2022

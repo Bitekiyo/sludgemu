@@ -77,8 +77,28 @@ layer.
 | Texture layout | console tiling/swizzle modes (`xg_xs`) | detiling on upload/readback |
 | Ray tracing | console BVH builder | DXR acceleration structures |
 | Audio | DSP/APU/SHAPE hardware | software implementation feeding XAudio2/WASAPI |
-| Storage | console DirectStorage with hardware decompression | software decompression + file I/O |
+| Storage | console DirectStorage with hardware zlib/BCPack decoders | desktop DirectStorage; console-only operations (zlib, BCPack, swizzle) run on our decoder threads through its custom decompression queue |
 | Input | GameInput | the host's GameInput (same API on console and desktop) |
+
+## File system
+
+On console the package is mounted at `G:\`. File-system overrides and DirectStorage translate
+those paths to the package directory (`core/vfs`); other paths reach the title from runtime APIs
+and are host paths already.
+
+## Game Runtime
+
+Titles reach the Game Runtime (`xgameruntime.dll`) through statically linked thunks: each flat API
+(`XUserAddAsync`, `XTaskQueueCreate`, ...) asks `QueryApiImpl(provider, iid)` for an interface and
+calls one vtable method. The HLE module describes every vtable as provider + interface IDs + slot
+table; unimplemented methods are named logging stubs returning `E_NOTIMPL`. Task queues and async
+blocks are implemented natively on the Windows thread pool.
+
+## Dependencies
+
+Fetched at configure time, never vendored: the DirectStorage redistributable (NuGet, copied next to
+`sludgemu.exe` and delay-loaded) and libdeflate (zlib decoding). The Agility SDK will follow the
+same pattern.
 
 ## Debugging conventions
 
@@ -87,6 +107,7 @@ layer.
 - Diagnostics built in: `--dump-threads-after=N` for hangs, and `--watch-write=SPEC` for
   hardware write watchpoints on a location (`module.dll+0xRVA`, `0xADDR`, or `ldrentry:N` for
   native loader entries). Crash logs also check the native loader's module index for
-  corruption. Diagnostic code paths never take the loader lock.
+  corruption. Title asserts (breakpoints) are logged first-chance with a backtrace, since titles
+  install their own unhandled-exception filters. Diagnostic code paths never take the loader lock.
 - Graphics problems are investigated with a frame capture (RenderDoc / Nsight Graphics), not by
   guessing.

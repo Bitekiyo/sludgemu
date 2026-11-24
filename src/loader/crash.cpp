@@ -32,7 +32,8 @@ void describe_address(const void* addr, char* out, usize cap) {
     void* base = nullptr;
     if (RtlPcToFileHeader((PVOID)addr, &base) && base) {
         const u8* b = (const u8*)base;
-        const IMAGE_NT_HEADERS64* nt = (const IMAGE_NT_HEADERS64*)(b + ((const IMAGE_DOS_HEADER*)b)->e_lfanew);
+        const IMAGE_NT_HEADERS64* nt =
+            (const IMAGE_NT_HEADERS64*)(b + ((const IMAGE_DOS_HEADER*)b)->e_lfanew);
         const IMAGE_DATA_DIRECTORY& ed = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
         const char* mod_name = (HMODULE)base == GetModuleHandleW(nullptr) ? "sludgemu.exe" : "?";
         if (ed.Size)
@@ -45,16 +46,26 @@ void describe_address(const void* addr, char* out, usize cap) {
 
 static const char* exception_name(DWORD code) {
     switch (code) {
-    case EXCEPTION_ACCESS_VIOLATION: return "ACCESS_VIOLATION";
-    case EXCEPTION_ILLEGAL_INSTRUCTION: return "ILLEGAL_INSTRUCTION";
-    case EXCEPTION_PRIV_INSTRUCTION: return "PRIV_INSTRUCTION";
-    case EXCEPTION_INT_DIVIDE_BY_ZERO: return "INT_DIVIDE_BY_ZERO";
-    case EXCEPTION_STACK_OVERFLOW: return "STACK_OVERFLOW";
-    case EXCEPTION_BREAKPOINT: return "BREAKPOINT";
-    case EXCEPTION_IN_PAGE_ERROR: return "IN_PAGE_ERROR";
-    case 0xE06D7363: return "C++ EXCEPTION";
-    case 0xC0000409: return "STACK_BUFFER_OVERRUN (fastfail)";
-    default: return "?";
+    case EXCEPTION_ACCESS_VIOLATION:
+        return "ACCESS_VIOLATION";
+    case EXCEPTION_ILLEGAL_INSTRUCTION:
+        return "ILLEGAL_INSTRUCTION";
+    case EXCEPTION_PRIV_INSTRUCTION:
+        return "PRIV_INSTRUCTION";
+    case EXCEPTION_INT_DIVIDE_BY_ZERO:
+        return "INT_DIVIDE_BY_ZERO";
+    case EXCEPTION_STACK_OVERFLOW:
+        return "STACK_OVERFLOW";
+    case EXCEPTION_BREAKPOINT:
+        return "BREAKPOINT";
+    case EXCEPTION_IN_PAGE_ERROR:
+        return "IN_PAGE_ERROR";
+    case 0xE06D7363:
+        return "C++ EXCEPTION";
+    case 0xC0000409:
+        return "STACK_BUFFER_OVERRUN (fastfail)";
+    default:
+        return "?";
     }
 }
 
@@ -62,8 +73,8 @@ static const char* exception_name(DWORD code) {
 // a red-black tree whose nodes live inside each LDR_DATA_TABLE_ENTRY. Checks that every node's
 // child links point at another module's node (or are null) and reports the ones that don't.
 // Offsets are those of the 64-bit LDR_DATA_TABLE_ENTRY on Windows 8+.
-#define LDR_ENTRY_DLLBASE 0x30
-#define LDR_ENTRY_BASENAME 0x58
+#define LDR_ENTRY_DLLBASE         0x30
+#define LDR_ENTRY_BASENAME        0x58
 #define LDR_ENTRY_BASE_INDEX_NODE 0xC8
 
 static bool readable(const void* p, usize bytes) {
@@ -108,8 +119,8 @@ static void validate_loader_index() {
             const UNICODE_STRING* name = (const UNICODE_STRING*)(entries[i] + LDR_ENTRY_BASENAME);
             char narrow[128] = "?";
             if (name->Buffer && readable(name->Buffer, name->Length))
-                WideCharToMultiByte(CP_UTF8, 0, name->Buffer, name->Length / 2, narrow, sizeof(narrow) - 1, nullptr,
-                                    nullptr);
+                WideCharToMultiByte(CP_UTF8, 0, name->Buffer, name->Length / 2, narrow, sizeof(narrow) - 1,
+                                    nullptr, nullptr);
             LOG_E("crash", "  loader index corrupt: %s entry %p, %s child at %p = 0x%llx", narrow, entries[i],
                   side ? "right" : "left", &node[side], child);
             bad++;
@@ -124,10 +135,12 @@ static void log_exception(const char* kind, EXCEPTION_POINTERS* ep) {
     const CONTEXT* c = ep->ContextRecord;
     char where[200];
     describe_address(er->ExceptionAddress, where, sizeof(where));
-    LOG_E("crash", "%s exception 0x%08lx %s at %s", kind, er->ExceptionCode, exception_name(er->ExceptionCode),
-          where);
+    LOG_E("crash", "%s exception 0x%08lx %s at %s", kind, er->ExceptionCode,
+          exception_name(er->ExceptionCode), where);
     if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && er->NumberParameters >= 2) {
-        const char* op = er->ExceptionInformation[0] == 0 ? "read" : (er->ExceptionInformation[0] == 1 ? "write" : "execute");
+        const char* op = er->ExceptionInformation[0] == 0
+                             ? "read"
+                             : (er->ExceptionInformation[0] == 1 ? "write" : "execute");
         LOG_E("crash", "  %s of address 0x%llx", op, (unsigned long long)er->ExceptionInformation[1]);
     }
     validate_loader_index();
@@ -151,7 +164,8 @@ static void log_exception(const char* kind, EXCEPTION_POINTERS* ep) {
         } else {
             void* handler_data;
             DWORD64 establisher;
-            RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, ctx.Rip, fn, &ctx, &handler_data, &establisher, nullptr);
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, ctx.Rip, fn, &ctx, &handler_data, &establisher,
+                             nullptr);
         }
     }
     log_flush();
@@ -163,17 +177,20 @@ static void write_minidump(EXCEPTION_POINTERS* ep) {
     HMODULE dbghelp = LoadLibraryW(L"dbghelp.dll");
     if (!dbghelp)
         return;
-    typedef BOOL(WINAPI * MiniDumpWriteDumpFn)(HANDLE, DWORD, HANDLE, MINIDUMP_TYPE, PMINIDUMP_EXCEPTION_INFORMATION,
-                                               PMINIDUMP_USER_STREAM_INFORMATION, PMINIDUMP_CALLBACK_INFORMATION);
+    typedef BOOL(WINAPI *
+                 MiniDumpWriteDumpFn)(HANDLE, DWORD, HANDLE, MINIDUMP_TYPE, PMINIDUMP_EXCEPTION_INFORMATION,
+                                      PMINIDUMP_USER_STREAM_INFORMATION, PMINIDUMP_CALLBACK_INFORMATION);
     MiniDumpWriteDumpFn write = (MiniDumpWriteDumpFn)GetProcAddress(dbghelp, "MiniDumpWriteDump");
     if (!write)
         return;
-    HANDLE f = CreateFileW(g_dump_path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    HANDLE f =
+        CreateFileW(g_dump_path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (f == INVALID_HANDLE_VALUE)
         return;
     MINIDUMP_EXCEPTION_INFORMATION mei = {GetCurrentThreadId(), ep, FALSE};
-    MINIDUMP_TYPE type = (MINIDUMP_TYPE)(MiniDumpWithDataSegs | MiniDumpWithHandleData | MiniDumpWithThreadInfo |
-                                         MiniDumpWithIndirectlyReferencedMemory | MiniDumpWithUnloadedModules);
+    MINIDUMP_TYPE type =
+        (MINIDUMP_TYPE)(MiniDumpWithDataSegs | MiniDumpWithHandleData | MiniDumpWithThreadInfo |
+                        MiniDumpWithIndirectlyReferencedMemory | MiniDumpWithUnloadedModules);
     if (write(GetCurrentProcess(), GetCurrentProcessId(), f, type, &mei, nullptr, nullptr))
         LOG_E("crash", "minidump written");
     CloseHandle(f);
@@ -228,7 +245,8 @@ bool crash_arm_write_watch(const char* spec) {
         }
         const UNICODE_STRING* name = (const UNICODE_STRING*)((const u8*)e + LDR_ENTRY_BASENAME);
         char narrow[128] = "?";
-        WideCharToMultiByte(CP_UTF8, 0, name->Buffer, name->Length / 2, narrow, sizeof(narrow) - 1, nullptr, nullptr);
+        WideCharToMultiByte(CP_UTF8, 0, name->Buffer, name->Length / 2, narrow, sizeof(narrow) - 1, nullptr,
+                            nullptr);
         LOG_I("watch", "loader entry %u is %s at %p", want, narrow, e);
         addr = (u64)e;
     } else if (plus) {
@@ -268,7 +286,8 @@ bool crash_arm_write_watch(const char* spec) {
                 armed += set_thread_watch(GetCurrentThread(), true);
                 continue;
             }
-            HANDLE th = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, te.th32ThreadID);
+            HANDLE th = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE,
+                                   te.th32ThreadID);
             if (th) {
                 armed += set_thread_watch(th, false);
                 CloseHandle(th);
@@ -288,7 +307,8 @@ static void log_watch_hit(EXCEPTION_POINTERS* ep) {
     u64 value = *(volatile u64*)g_watch_addr;
     char where[200];
     describe_address((void*)ep->ContextRecord->Rip, where, sizeof(where));
-    LOG_W("watch", "write #%ld to 0x%llx: value now 0x%llx, after instruction before %s", n, g_watch_addr, value, where);
+    LOG_W("watch", "write #%ld to 0x%llx: value now 0x%llx, after instruction before %s", n, g_watch_addr,
+          value, where);
     CONTEXT ctx = *ep->ContextRecord;
     u64 frames[16];
     u32 count = capture_frames(&ctx, frames, ARRAY_COUNT(frames));
@@ -305,9 +325,12 @@ static LONG CALLBACK vectored_handler(EXCEPTION_POINTERS* ep) {
         ep->ContextRecord->Dr6 = 0;
         return EXCEPTION_CONTINUE_EXECUTION;
     }
+    // Breakpoints are title asserts; the title usually installs its own unhandled-exception
+    // filter, so this is the only place they get reported.
     bool interesting = code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_ILLEGAL_INSTRUCTION ||
                        code == EXCEPTION_PRIV_INSTRUCTION || code == EXCEPTION_INT_DIVIDE_BY_ZERO ||
-                       code == EXCEPTION_STACK_OVERFLOW || code == EXCEPTION_IN_PAGE_ERROR;
+                       code == EXCEPTION_STACK_OVERFLOW || code == EXCEPTION_IN_PAGE_ERROR ||
+                       code == EXCEPTION_BREAKPOINT;
     if (interesting && InterlockedIncrement(&g_first_chance_logged) <= FIRST_CHANCE_LOG_LIMIT)
         log_exception("first-chance", ep);
     return EXCEPTION_CONTINUE_SEARCH;
@@ -337,14 +360,15 @@ static u32 capture_frames(CONTEXT* ctx, u64* frames, u32 max_frames) {
         } else {
             void* handler_data;
             DWORD64 establisher;
-            RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, ctx->Rip, fn, ctx, &handler_data, &establisher, nullptr);
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, ctx->Rip, fn, ctx, &handler_data, &establisher,
+                             nullptr);
         }
     }
     return n;
 }
 
 #define DUMP_MAX_THREADS 512
-#define DUMP_MAX_FRAMES 32
+#define DUMP_MAX_FRAMES  32
 
 struct ThreadDump {
     DWORD tid;
@@ -363,11 +387,12 @@ void crash_dump_all_threads(const char* reason) {
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     if (snap != INVALID_HANDLE_VALUE) {
         THREADENTRY32 te = {sizeof(te)};
-        for (BOOL ok = Thread32First(snap, &te); ok && count < DUMP_MAX_THREADS; ok = Thread32Next(snap, &te)) {
+        for (BOOL ok = Thread32First(snap, &te); ok && count < DUMP_MAX_THREADS;
+             ok = Thread32Next(snap, &te)) {
             if (te.th32OwnerProcessID != pid || te.th32ThreadID == self)
                 continue;
-            HANDLE th = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE,
-                                   te.th32ThreadID);
+            HANDLE th = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
+                                   FALSE, te.th32ThreadID);
             if (!th)
                 continue;
             if (SuspendThread(th) != (DWORD)-1) {
@@ -375,7 +400,8 @@ void crash_dump_all_threads(const char* reason) {
                 ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
                 ThreadDump& d = s_dumps[count];
                 d.tid = te.th32ThreadID;
-                d.frame_count = GetThreadContext(th, &ctx) ? capture_frames(&ctx, d.frames, DUMP_MAX_FRAMES) : 0;
+                d.frame_count =
+                    GetThreadContext(th, &ctx) ? capture_frames(&ctx, d.frames, DUMP_MAX_FRAMES) : 0;
                 ResumeThread(th);
                 count++;
             }

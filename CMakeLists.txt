@@ -40,4 +40,34 @@ target_compile_definitions(sludge_options INTERFACE
 )
 target_link_options(sludge_options INTERFACE /DEBUG:FULL)
 
+# Third-party libraries are fetched at configure time; nothing is vendored into the repo.
+include(FetchContent)
+
+# libdeflate: fast zlib/deflate decompression (console DirectStorage requests).
+set(LIBDEFLATE_BUILD_SHARED_LIB OFF CACHE BOOL "" FORCE)
+set(LIBDEFLATE_BUILD_GZIP OFF CACHE BOOL "" FORCE)
+set(LIBDEFLATE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(LIBDEFLATE_COMPRESSION_SUPPORT OFF CACHE BOOL "" FORCE)
+set(LIBDEFLATE_GZIP_SUPPORT OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(libdeflate
+    GIT_REPOSITORY https://github.com/ebiggers/libdeflate.git
+    GIT_TAG v1.26
+    GIT_SHALLOW TRUE)
+FetchContent_MakeAvailable(libdeflate)
+
+include(cmake/nuget.cmake)
+
+# DirectStorage (desktop): backs the console DirectStorage API. Redistributable DLLs are copied
+# next to sludgemu.exe.
+sludge_fetch_nuget(dstorage_pkg Microsoft.Direct3D.DirectStorage 1.3.0
+    8ab6c1082537565388b79050d94fdd7f5f437cd0f1d909e7b19f786042b97177)
+add_library(dstorage SHARED IMPORTED GLOBAL)
+set_target_properties(dstorage PROPERTIES
+    IMPORTED_IMPLIB ${dstorage_pkg_SOURCE_DIR}/native/lib/x64/dstorage.lib
+    IMPORTED_LOCATION ${dstorage_pkg_SOURCE_DIR}/native/bin/x64/dstorage.dll
+    INTERFACE_INCLUDE_DIRECTORIES ${dstorage_pkg_SOURCE_DIR}/native/include)
+set(SLUDGE_DSTORAGE_DLLS
+    ${dstorage_pkg_SOURCE_DIR}/native/bin/x64/dstorage.dll
+    ${dstorage_pkg_SOURCE_DIR}/native/bin/x64/dstoragecore.dll)
+
 add_subdirectory(src)
