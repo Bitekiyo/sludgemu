@@ -3,6 +3,7 @@
 
 #include "hle/xgameruntime/runtime_api.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 
 #include "common/log.h"
@@ -18,6 +19,97 @@ static HRESULT WINAPI XGameGetXboxTitleId(RuntimeSelf, u32* title_id) {
         return E_FAIL;
     }
     *title_id = (u32)strtoul(g_title.title_id, nullptr, 16);
+    return S_OK;
+}
+
+// --- display -------------------------------------------------------------------------------------
+
+enum HdrModeResult : u32 {
+    HDR_MODE_UNKNOWN = 0,
+    HDR_MODE_ENABLED = 1,
+    HDR_MODE_DISABLED = 2,
+};
+
+// HDR output arrives with the swapchain work; until then titles render SDR.
+static u32 WINAPI XDisplayTryEnableHdrMode(RuntimeSelf, u32 preference, void* info) {
+    LOG_I("xgr", "XDisplayTryEnableHdrMode: HDR output not supported yet, staying SDR");
+    return HDR_MODE_DISABLED;
+}
+
+// --- persistent local storage --------------------------------------------------------------------
+// A per-title directory under the user's local app data, with the quota the package declares.
+
+struct PlsSpaceInfo {
+    u64 available_free_bytes;
+    u64 total_free_bytes;
+};
+
+static bool pls_path(char* out, usize cap, usize* used) {
+    wchar_t dir[MAX_PATH];
+    if (!title_data_dir(L"PersistentLocalStorage", dir, MAX_PATH))
+        return false;
+    int n = WideCharToMultiByte(CP_UTF8, 0, dir, -1, out, (int)cap, nullptr, nullptr);
+    if (n <= 0)
+        return false;
+    if (used)
+        *used = (usize)n;
+    return true;
+}
+
+static u64 directory_size(const wchar_t* dir) {
+    wchar_t pattern[MAX_PATH];
+    _snwprintf(pattern, MAX_PATH, L"%s*", dir);
+    pattern[MAX_PATH - 1] = 0;
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE)
+        return 0;
+    u64 total = 0;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0)
+                continue;
+            wchar_t sub[MAX_PATH];
+            _snwprintf(sub, MAX_PATH, L"%s%s\\", dir, fd.cFileName);
+            sub[MAX_PATH - 1] = 0;
+            total += directory_size(sub);
+        } else {
+            total += ((u64)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+        }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return total;
+}
+
+static HRESULT WINAPI XPersistentLocalStorageGetPathSize(RuntimeSelf, usize* size) {
+    char path[MAX_PATH * 3];
+    if (!size || !pls_path(path, sizeof(path), size))
+        return E_FAIL;
+    return S_OK;
+}
+
+static HRESULT WINAPI XPersistentLocalStorageGetPath(RuntimeSelf, usize size, char* path, usize* used) {
+    char buf[MAX_PATH * 3];
+    usize n = 0;
+    if (!path || !pls_path(buf, sizeof(buf), &n))
+        return E_FAIL;
+    if (size < n)
+        return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+    memcpy(path, buf, n);
+    if (used)
+        *used = n;
+    LOG_I("xgr", "persistent local storage: %s", buf);
+    return S_OK;
+}
+
+static HRESULT WINAPI XPersistentLocalStorageGetSpaceInfo(RuntimeSelf, PlsSpaceInfo* info) {
+    wchar_t dir[MAX_PATH];
+    if (!info || !title_data_dir(L"PersistentLocalStorage", dir, MAX_PATH))
+        return E_FAIL;
+    u64 used = directory_size(dir);
+    u64 free_bytes = g_title.pls_quota > used ? g_title.pls_quota - used : 0;
+    info->available_free_bytes = free_bytes;
+    info->total_free_bytes = free_bytes;
     return S_OK;
 }
 
@@ -92,7 +184,7 @@ static const GUID k_XDisplay_iids[] = {
     {0x35f07670, 0x706e, 0x4bfb, {0x94, 0x76, 0x09, 0x07, 0x98, 0xc5, 0xeb, 0xf3}},
 };
 static const RuntimeMethod k_XDisplay_methods[] = {
-    {4, "XDisplayTryEnableHdrMode", nullptr},
+    {4, "XDisplayTryEnableHdrMode", (void*)&XDisplayTryEnableHdrMode},
 };
 extern const RuntimeApi g_runtime_api_XDisplay =
     RUNTIME_API("XDisplay", &k_XDisplay_provider, k_XDisplay_iids, k_XDisplay_methods);
@@ -139,9 +231,9 @@ static const GUID k_XPersistentLocalStorage_iids[] = {
     {0x41a4e10c, 0x5a7e, 0x41d9, {0x8c, 0x37, 0x37, 0xbd, 0xe6, 0x2a, 0x07, 0xd6}},
 };
 static const RuntimeMethod k_XPersistentLocalStorage_methods[] = {
-    {3, "XPersistentLocalStorageGetPathSize", nullptr},
-    {4, "XPersistentLocalStorageGetPath", nullptr},
-    {5, "XPersistentLocalStorageGetSpaceInfo", nullptr},
+    {3, "XPersistentLocalStorageGetPathSize", (void*)&XPersistentLocalStorageGetPathSize},
+    {4, "XPersistentLocalStorageGetPath", (void*)&XPersistentLocalStorageGetPath},
+    {5, "XPersistentLocalStorageGetSpaceInfo", (void*)&XPersistentLocalStorageGetSpaceInfo},
     {6, "XPersistentLocalStoragePromptUserForSpaceAsync", nullptr},
     {7, "XPersistentLocalStoragePromptUserForSpaceResult", nullptr},
     {8, "XPersistentLocalStorageMountForPackage", nullptr},

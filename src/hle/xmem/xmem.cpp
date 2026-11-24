@@ -56,12 +56,14 @@ static MemAddressLimits limits_from_flags(u64 xflags, u32 alloc_type) {
 void* xmem_virtual_alloc(void* base, usize size, u32 alloc_type, u64 xflags, u32 protect) {
     u32 cpu_prot = cpu_protect_from_console(protect);
     bool gpu = (xflags & XMEMF_GPU) || (protect & XMEM_PROT_GRAPHICS_MASK);
-    u32 range_flags = (gpu ? MEM_RANGE_GPU : 0) | ((cpu_prot & 0xFF) != PAGE_NOACCESS ? MEM_RANGE_CPU_ACCESS : 0);
+    u32 range_flags =
+        (gpu ? MEM_RANGE_GPU : 0) | ((cpu_prot & 0xFF) != PAGE_NOACCESS ? MEM_RANGE_CPU_ACCESS : 0);
     MemAddressLimits limits = limits_from_flags(gpu ? (xflags | XMEMF_GPU) : xflags, alloc_type);
 
     void* p = nullptr;
     if (alloc_type & XMEM_TYPE_PHYSICAL) {
-        if (base || !(alloc_type & MEM_RESERVE)) {
+        // As with plain VirtualAlloc, MEM_COMMIT without a base address implies MEM_RESERVE.
+        if (base || !(alloc_type & (MEM_RESERVE | MEM_COMMIT))) {
             LOG_E("xmem", "unsupported physical allocation (base=%p type=0x%x xflags=0x%llx prot=0x%x)", base,
                   alloc_type, xflags, protect);
             SetLastError(ERROR_INVALID_PARAMETER);
@@ -86,7 +88,8 @@ void* xmem_virtual_alloc(void* base, usize size, u32 alloc_type, u64 xflags, u32
 // ---------------------------------------------------------------------------------------------
 // Exports
 
-static PVOID WINAPI XMemVirtualAlloc(PVOID base, SIZE_T size, DWORD alloc_type, ULONGLONG xflags, DWORD protect) {
+static PVOID WINAPI XMemVirtualAlloc(PVOID base, SIZE_T size, DWORD alloc_type, ULONGLONG xflags,
+                                     DWORD protect) {
     return xmem_virtual_alloc(base, size, alloc_type, xflags, protect);
 }
 
@@ -101,8 +104,8 @@ static BOOL WINAPI XMemAllocatePhysicalPages(ULONGLONG xflags, PULONG_PTR count,
     u64 used = mem_physical_used_pages() << MEM_PAGE_SHIFT;
     if (used > g_peak_used)
         g_peak_used = used;
-    LOG_D("xmem", "AllocatePhysicalPages(xflags=0x%llx, %llu pages) -> first pfn 0x%llx, %llu MiB in use", xflags, n,
-          n ? (u64)pages[0] : 0ull, used >> 20);
+    LOG_D("xmem", "AllocatePhysicalPages(xflags=0x%llx, %llu pages) -> first pfn 0x%llx, %llu MiB in use",
+          xflags, n, n ? (u64)pages[0] : 0ull, used >> 20);
     return TRUE;
 }
 
@@ -143,7 +146,9 @@ static BOOL WINAPI XMemGetWorkingSetStatistics(DWORD flags, XMemWorkingSetStats*
     return TRUE;
 }
 
-static BOOL WINAPI XMemIsToolsMemAvailable() { return FALSE; }
+static BOOL WINAPI XMemIsToolsMemAvailable() {
+    return FALSE;
+}
 
 static BOOL WINAPI XMemTransferMemory(DWORD type, SIZE_T size) {
     LOG_I("xmem", "TransferMemory(type=%lu, %llu MiB): accepted, no-op", type, (u64)size >> 20);

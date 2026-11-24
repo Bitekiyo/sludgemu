@@ -1,6 +1,7 @@
 #include "core/title.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 
 #include "common/log.h"
 #include "common/str.h"
@@ -47,8 +48,8 @@ static bool xml_attr(const char* tag, const char* attr, char* out, usize cap) {
         return false;
     usize alen = strlen(attr);
     for (const char* p = tag; p + alen + 2 < end; p++) {
-        if ((p[-1] == ' ' || p[-1] == '\t' || p[-1] == '\n' || p[-1] == '\r') && strncmp(p, attr, alen) == 0 &&
-            p[alen] == '=' && p[alen + 1] == '"') {
+        if ((p[-1] == ' ' || p[-1] == '\t' || p[-1] == '\n' || p[-1] == '\r') &&
+            strncmp(p, attr, alen) == 0 && p[alen] == '=' && p[alen + 1] == '"') {
             const char* v = p + alen + 2;
             const char* q = strchr(v, '"');
             if (!q || q > end)
@@ -62,6 +63,18 @@ static bool xml_attr(const char* tag, const char* attr, char* out, usize cap) {
         }
     }
     return false;
+}
+
+// Copies the text content of the element starting at `tag` (up to the next '<').
+static bool xml_text(const char* tag, char* out, usize cap) {
+    const char* v = tag ? strchr(tag, '>') : nullptr;
+    if (!v)
+        return false;
+    usize i = 0;
+    for (v++; i + 1 < cap && *v && *v != '<'; v++)
+        out[i++] = *v;
+    out[i] = 0;
+    return true;
 }
 
 static void set_error(wchar_t* error, usize cap, const wchar_t* fmt, const wchar_t* arg) {
@@ -112,14 +125,11 @@ bool title_resolve(const wchar_t* path, TitleInfo* out, wchar_t* error, usize er
             if (const char* sv = xml_find_tag(config, "ShellVisuals"))
                 xml_attr(sv, "DefaultDisplayName", display, sizeof(display));
         }
-        if (const char* tid = xml_find_tag(config, "TitleId")) {
-            const char* v = strchr(tid, '>');
-            if (v) {
-                usize i = 0;
-                for (v++; i + 1 < sizeof(out->title_id) && *v && *v != '<'; v++)
-                    out->title_id[i++] = *v;
-                out->title_id[i] = 0;
-            }
+        xml_text(xml_find_tag(config, "TitleId"), out->title_id, sizeof(out->title_id));
+        if (const char* pls = xml_find_tag(config, "PersistentLocalStorage")) {
+            char size_mb[32];
+            if (xml_text(xml_find_tag(pls, "SizeMB"), size_mb, sizeof(size_mb)))
+                out->pls_quota = strtoull(size_mb, nullptr, 10) << 20;
         }
         HeapFree(GetProcessHeap(), 0, config);
     } else {
@@ -148,5 +158,29 @@ bool title_resolve(const wchar_t* path, TitleInfo* out, wchar_t* error, usize er
         str_to_wide(out->display_name, ARRAY_COUNT(out->display_name), display);
     else
         str_copy_w(out->display_name, ARRAY_COUNT(out->display_name), path_file_name_w(out->exe_path));
+    return true;
+}
+
+bool title_data_dir(const wchar_t* name, wchar_t* out, usize cap) {
+    wchar_t base[MAX_PATH];
+    DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", base, MAX_PATH);
+    if (!n || n >= MAX_PATH)
+        return false;
+    wchar_t title_id[16];
+    str_to_wide(title_id, ARRAY_COUNT(title_id), g_title.title_id[0] ? g_title.title_id : "unknown");
+
+    // Create each level; CreateDirectoryW fails harmlessly when it already exists.
+    const wchar_t* levels[3] = {L"sludgemu", title_id, name};
+    usize len = (usize)_snwprintf(out, cap, L"%s", base);
+    for (u32 i = 0; i < 3; i++) {
+        int written = _snwprintf(out + len, cap - len, L"\\%s", levels[i]);
+        if (written < 0 || len + (usize)written + 2 > cap)
+            return false;
+        len += (usize)written;
+        if (!CreateDirectoryW(out, nullptr) && GetLastError() != ERROR_ALREADY_EXISTS)
+            return false;
+    }
+    out[len++] = L'\\';
+    out[len] = 0;
     return true;
 }
