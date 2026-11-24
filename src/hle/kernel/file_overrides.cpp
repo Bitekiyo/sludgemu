@@ -40,6 +40,15 @@ static HANDLE WINAPI hk_CreateFileW(LPCWSTR path, DWORD access, DWORD share, LPS
     return h;
 }
 
+static HANDLE WINAPI hk_CreateFile2(LPCWSTR path, DWORD access, DWORD share, DWORD disposition,
+                                    LPCREATEFILE2_EXTENDED_PARAMETERS params) {
+    wchar_t buf[PATH_CAP];
+    const wchar_t* p = host_path(path, buf);
+    HANDLE h = CreateFile2(p, access, share, disposition, params);
+    log_access("CreateFile2", p, h != INVALID_HANDLE_VALUE);
+    return h;
+}
+
 static DWORD WINAPI hk_GetFileAttributesW(LPCWSTR path) {
     wchar_t buf[PATH_CAP];
     const wchar_t* p = host_path(path, buf);
@@ -100,6 +109,7 @@ static BOOL WINAPI hk_MoveFileExW(LPCWSTR from, LPCWSTR to, DWORD flags) {
 
 const HleExport g_file_overrides[] = {
     HLE_EXPORT_AS(hk_CreateFileW, "CreateFileW"),
+    HLE_EXPORT_AS(hk_CreateFile2, "CreateFile2"),
     HLE_EXPORT_AS(hk_GetFileAttributesW, "GetFileAttributesW"),
     HLE_EXPORT_AS(hk_GetFileAttributesA, "GetFileAttributesA"),
     HLE_EXPORT_AS(hk_GetFileAttributesExW, "GetFileAttributesExW"),
