@@ -7,6 +7,7 @@
 
 #include "common/log.h"
 #include "gpu/gpu.h"
+#include "hle/d3d12/console_iids.h"
 #include "hle/d3d12/d3d12_objects.h"
 #include "hle/d3d12/d3d12_tables.h"
 
@@ -14,11 +15,10 @@ static_assert(offsetof(ConsoleDevice, null_constant_buffer_address) == 0x10, "de
 static_assert(offsetof(ConsoleDevice, out_of_line_flags) == 0x18, "device layout");
 static_assert(offsetof(ConsoleDevice, desktop) == 88, "device state follows the public members");
 
-// Interface IDs are shared with desktop D3D12.
 static const GUID* const k_device_iids[] = {
     &__uuidof(ID3D12Object),   &__uuidof(ID3D12Device),  &__uuidof(ID3D12Device1), &__uuidof(ID3D12Device2),
     &__uuidof(ID3D12Device3),  &__uuidof(ID3D12Device4), &__uuidof(ID3D12Device5), &__uuidof(ID3D12Device6),
-    &__uuidof(ID3D12Device7),  &__uuidof(ID3D12Device8), &__uuidof(ID3D12Device9), &__uuidof(ID3D12Device10),
+    &__uuidof(ID3D12Device7),  &IID_ConsoleDevice8,      &__uuidof(ID3D12Device9), &__uuidof(ID3D12Device10),
     &__uuidof(ID3D12Device11),
 };
 
@@ -56,6 +56,12 @@ static HRESULT WINAPI device_create_command_allocator(ConsoleDevice* self, D3D12
     return console_create_command_allocator(self, type, iid, out);
 }
 
+static HRESULT WINAPI device_create_command_list_x(ConsoleDevice* self, const ConsoleCommandListDesc* desc,
+                                                   ConsoleCommandAllocator* allocator, void* initial_state,
+                                                   REFIID iid, void** out) {
+    return console_create_command_list(self, desc, allocator, initial_state, iid, out);
+}
+
 static HRESULT WINAPI device_create_fence(ConsoleDevice* self, UINT64 initial_value, D3D12_FENCE_FLAGS flags,
                                           REFIID iid, void** out) {
     return console_create_fence(self, initial_value, flags, iid, out);
@@ -76,6 +82,7 @@ static const ConsoleEntry k_device_impl[] = {
     CONSOLE_ENTRY(26, device_get_custom_heap_properties),
     CONSOLE_ENTRY(36, device_create_fence),
     CONSOLE_ENTRY(48, device_create_command_queue_x),
+    CONSOLE_ENTRY(73, device_create_command_list_x),
 };
 
 HRESULT console_create_device(void* adapter, const ConsoleDeviceParams* params, REFIID iid, void** out) {
@@ -100,6 +107,7 @@ HRESULT console_create_device(void* adapter, const ConsoleDeviceParams* params, 
         console_command_queue_init();
         console_fence_init();
         console_command_allocator_init();
+        console_command_list_init();
     }
     if (!out)
         return S_FALSE; // capability check only

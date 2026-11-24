@@ -40,6 +40,7 @@ add_executable(sludgemu WIN32
     hle/d3d12/d3d12_xs.cpp
     hle/d3d12/d3d12_tables.h
     hle/d3d12/d3d12_tables.cpp
+    hle/d3d12/console_iids.h
     hle/d3d12/console_object.h
     hle/d3d12/console_object.cpp
     hle/d3d12/device.h
@@ -48,6 +49,7 @@ add_executable(sludgemu WIN32
     hle/d3d12/command_queue.cpp
     hle/d3d12/fence.cpp
     hle/d3d12/command_allocator.cpp
+    hle/d3d12/command_list.cpp
     hle/dstorage/dstorage.cpp
 
     gpu/agility.cpp

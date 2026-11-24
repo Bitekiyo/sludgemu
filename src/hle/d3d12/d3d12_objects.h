@@ -35,6 +35,36 @@ struct ConsoleCommandAllocator {
     ID3D12CommandAllocator* desktop;
 };
 
+// The command buffer write cursor of a console command list. Inlined title code writes packets only
+// while current < limit_draw / limit_api; we keep them null.
+struct ConsolePutBuffer {
+    u32* current;
+    u32* limit;
+    u32* limit_draw;
+    u32* limit_api;
+    u32* unbiased_limit_api;
+    u32 reserved[64];
+};
+
+struct ConsoleCommandList {
+    ConsoleObjectHeader header;
+    D3D12_COMMAND_LIST_TYPE type;
+    ConsolePutBuffer putter;
+    u8 cpu_state[4];                      // shmem dirty, wave32 PSO, last draw indexed, predication used
+    u32 graphics_root_packet_header[128]; // per root parameter, set with the root signature
+    u32 compute_root_packet_header[128];
+    u32 graphics_pso_shadow[8]; // copy of the bound pipeline state's packet
+
+    ID3D12GraphicsCommandList7* desktop;
+};
+
+struct ConsoleCommandListDesc {
+    D3D12_COMMAND_LIST_TYPE type;
+    u32 flags;
+    u32 node_mask;
+    u32 resource_barrier_batch_size;
+};
+
 // Console extended queue description (CreateCommandQueueX).
 struct ConsoleQueueDescX {
     D3D12_COMMAND_LIST_TYPE type;
@@ -47,10 +77,14 @@ struct ConsoleQueueDescX {
 void console_command_queue_init();
 void console_fence_init();
 void console_command_allocator_init();
+void console_command_list_init();
 
 HRESULT console_create_command_queue(ConsoleDevice* device, const D3D12_COMMAND_QUEUE_DESC* desc, REFIID iid,
                                      void** out);
 HRESULT console_create_command_allocator(ConsoleDevice* device, D3D12_COMMAND_LIST_TYPE type, REFIID iid,
                                          void** out);
+HRESULT console_create_command_list(ConsoleDevice* device, const ConsoleCommandListDesc* desc,
+                                    ConsoleCommandAllocator* allocator, void* initial_state, REFIID iid,
+                                    void** out);
 HRESULT console_create_fence(ConsoleDevice* device, UINT64 initial_value, D3D12_FENCE_FLAGS flags, REFIID iid,
                              void** out);
