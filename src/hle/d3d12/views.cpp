@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "common/log.h"
+#include "gpu/formats.h"
 #include "gpu/gpu_window.h"
 #include "hle/d3d12/d3d12_objects.h"
 #include "hle/d3d12/views.h"
@@ -121,16 +122,115 @@ static ID3D12Resource* buffer_view_target(u64 buffer_address, u64 first_element,
     return a.buffer;
 }
 
-// The desktop texture behind a texture view; nullptr for a null view. `*ok` is false if the console
-// resource has no usable desktop texture.
-static ID3D12Resource* texture_view_target(void* resource, bool* ok) {
-    *ok = true;
-    if (!resource)
-        return nullptr;
+// --- texture views -----------------------------------------------------------------------------------
+//
+// Texture views go through their full description: desktop formats can differ from the console's
+// (depth textures are typeless, console-only formats have stand-ins), so what a null description
+// means is spelled out, and a view desktop can't make becomes a null view of the same kind rather
+// than leaving the slot stale.
+
+// The desktop format of a texture view the title made in console format `view` (UNKNOWN: the
+// texture's own); false if desktop can't show the texture that way.
+static bool texture_view_format(const ConsoleResource* r, DXGI_FORMAT view, bool shader_read,
+                                DXGI_FORMAT* out) {
+    if (!format_view_compatible(r->desc.Format, view)) {
+        LOG_W_ONCE("d3d12",
+                   "texture of format %d viewed as format %d: no desktop equivalent, writing null views",
+                   r->desc.Format, view);
+        return false;
+    }
+    DXGI_FORMAT f = view != DXGI_FORMAT_UNKNOWN ? view : r->desc.Format;
+    *out = shader_read ? format_desktop_shader_read(f) : format_desktop(f);
+    return *out != DXGI_FORMAT_UNKNOWN;
+}
+
+// The texture's desktop counterpart; nullptr (the view becomes null) for a null resource or one with
+// no desktop texture.
+static ID3D12Resource* texture_view_target(const ConsoleResource* r) {
     u64 offset;
-    ID3D12Resource* desktop = console_resource_desktop((ConsoleResource*)resource, &offset);
-    *ok = desktop != nullptr;
-    return desktop;
+    return r ? console_resource_desktop((ConsoleResource*)r, &offset) : nullptr;
+}
+
+// Null views still need a format of their kind; reads through them return zero whatever it is.
+#define NULL_VIEW_FORMAT       DXGI_FORMAT_R8G8B8A8_UNORM
+#define NULL_DEPTH_VIEW_FORMAT DXGI_FORMAT_D32_FLOAT
+
+static bool is_array(const D3D12_RESOURCE_DESC1& r) {
+    return r.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D && r.DepthOrArraySize > 1;
+}
+
+// Whole-texture descriptions, in the texture's own format (UNKNOWN until texture_view_format).
+static D3D12_SHADER_RESOURCE_VIEW_DESC whole_texture_srv(const D3D12_RESOURCE_DESC1& r) {
+    D3D12_SHADER_RESOURCE_VIEW_DESC d = {};
+    d.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    const UINT all = (UINT)-1;
+    if (r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D) {
+        d.ViewDimension = is_array(r) ? D3D12_SRV_DIMENSION_TEXTURE1DARRAY : D3D12_SRV_DIMENSION_TEXTURE1D;
+        d.Texture1DArray.MipLevels = all;
+        d.Texture1DArray.ArraySize = r.DepthOrArraySize;
+    } else if (r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
+        d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+        d.Texture3D.MipLevels = all;
+    } else if (r.SampleDesc.Count > 1) {
+        d.ViewDimension =
+            is_array(r) ? D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY : D3D12_SRV_DIMENSION_TEXTURE2DMS;
+        d.Texture2DMSArray.ArraySize = r.DepthOrArraySize;
+    } else {
+        d.ViewDimension = is_array(r) ? D3D12_SRV_DIMENSION_TEXTURE2DARRAY : D3D12_SRV_DIMENSION_TEXTURE2D;
+        d.Texture2DArray.MipLevels = all;
+        d.Texture2DArray.ArraySize = r.DepthOrArraySize;
+    }
+    return d;
+}
+
+static D3D12_UNORDERED_ACCESS_VIEW_DESC whole_texture_uav(const D3D12_RESOURCE_DESC1& r) {
+    D3D12_UNORDERED_ACCESS_VIEW_DESC d = {};
+    if (r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D) {
+        d.ViewDimension = is_array(r) ? D3D12_UAV_DIMENSION_TEXTURE1DARRAY : D3D12_UAV_DIMENSION_TEXTURE1D;
+        d.Texture1DArray.ArraySize = r.DepthOrArraySize;
+    } else if (r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
+        d.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+        d.Texture3D.WSize = (UINT)-1;
+    } else {
+        d.ViewDimension = is_array(r) ? D3D12_UAV_DIMENSION_TEXTURE2DARRAY : D3D12_UAV_DIMENSION_TEXTURE2D;
+        d.Texture2DArray.ArraySize = r.DepthOrArraySize;
+    }
+    return d;
+}
+
+static D3D12_RENDER_TARGET_VIEW_DESC whole_texture_rtv(const D3D12_RESOURCE_DESC1& r) {
+    D3D12_RENDER_TARGET_VIEW_DESC d = {};
+    if (r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D) {
+        d.ViewDimension = is_array(r) ? D3D12_RTV_DIMENSION_TEXTURE1DARRAY : D3D12_RTV_DIMENSION_TEXTURE1D;
+        d.Texture1DArray.ArraySize = r.DepthOrArraySize;
+    } else if (r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
+        d.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE3D;
+        d.Texture3D.WSize = (UINT)-1;
+    } else if (r.SampleDesc.Count > 1) {
+        d.ViewDimension =
+            is_array(r) ? D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY : D3D12_RTV_DIMENSION_TEXTURE2DMS;
+        d.Texture2DMSArray.ArraySize = r.DepthOrArraySize;
+    } else {
+        d.ViewDimension = is_array(r) ? D3D12_RTV_DIMENSION_TEXTURE2DARRAY : D3D12_RTV_DIMENSION_TEXTURE2D;
+        d.Texture2DArray.ArraySize = r.DepthOrArraySize;
+    }
+    return d;
+}
+
+static D3D12_DEPTH_STENCIL_VIEW_DESC whole_texture_dsv(const D3D12_RESOURCE_DESC1& r) {
+    D3D12_DEPTH_STENCIL_VIEW_DESC d = {};
+    if (r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D) {
+        d.ViewDimension = is_array(r) ? D3D12_DSV_DIMENSION_TEXTURE1DARRAY : D3D12_DSV_DIMENSION_TEXTURE1D;
+        d.Texture1DArray.ArraySize = r.DepthOrArraySize;
+    } else if (r.SampleDesc.Count > 1) {
+        d.ViewDimension =
+            is_array(r) ? D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY : D3D12_DSV_DIMENSION_TEXTURE2DMS;
+        d.Texture2DMSArray.ArraySize = r.DepthOrArraySize;
+    } else {
+        d.ViewDimension = is_array(r) ? D3D12_DSV_DIMENSION_TEXTURE2DARRAY : D3D12_DSV_DIMENSION_TEXTURE2D;
+        d.Texture2DArray.ArraySize = r.DepthOrArraySize;
+    }
+    return d;
 }
 
 static bool is_buffer(void* resource) {
@@ -211,14 +311,17 @@ void WINAPI device_create_shader_resource_view(ConsoleDevice* self, void* resour
         desktop = buffer_view_target(r->gpu_address, d.Buffer.FirstElement, d.Buffer.NumElements, element,
                                      &d.Buffer.FirstElement);
     } else {
-        bool ok;
-        desktop = texture_view_target(resource, &ok);
-        if (!desc && !ok)
-            return; // no description to make a null view from
-        if (desc)
-            d = *desc;
+        const ConsoleResource* r = (const ConsoleResource*)resource;
+        if (!r && !desc)
+            return; // the console API requires one or the other
+        d = desc ? *desc : whole_texture_srv(r->desc);
+        desktop = texture_view_target(r);
+        if (!desktop || !texture_view_format(r, d.Format, true, &d.Format)) {
+            desktop = nullptr;
+            d.Format = NULL_VIEW_FORMAT;
+        }
     }
-    self->desktop->CreateShaderResourceView(desktop, desc || is_buffer(resource) ? &d : nullptr, slot.cpu);
+    self->desktop->CreateShaderResourceView(desktop, &d, slot.cpu);
     finish_write(slot);
 }
 
@@ -248,15 +351,17 @@ void WINAPI device_create_unordered_access_view(ConsoleDevice* self, void* resou
             }
         }
     } else {
-        bool ok;
-        desktop = texture_view_target(resource, &ok);
-        if (!desc && !ok)
+        const ConsoleResource* r = (const ConsoleResource*)resource;
+        if (!r && !desc)
             return;
-        if (desc)
-            d = desktop_uav_desc(desc);
+        d = desc ? desktop_uav_desc(desc) : whole_texture_uav(r->desc);
+        desktop = texture_view_target(r);
+        if (!desktop || !texture_view_format(r, d.Format, false, &d.Format)) {
+            desktop = nullptr;
+            d.Format = NULL_VIEW_FORMAT;
+        }
     }
-    self->desktop->CreateUnorderedAccessView(desktop, desktop_counter,
-                                             desc || is_buffer(resource) ? &d : nullptr, slot.cpu);
+    self->desktop->CreateUnorderedAccessView(desktop, desktop_counter, &d, slot.cpu);
     finish_write(slot);
 }
 
@@ -266,11 +371,16 @@ void WINAPI device_create_render_target_view(ConsoleDevice* self, void* resource
     DescriptorSlot slot;
     if (!console_descriptor_slots(dest.ptr, 1, &slot))
         return;
-    bool ok;
-    ID3D12Resource* desktop = texture_view_target(resource, &ok);
-    if (!ok && !desc)
+    const ConsoleResource* r = (const ConsoleResource*)resource;
+    if (!r && !desc)
         return;
-    self->desktop->CreateRenderTargetView(desktop, desc, slot.cpu);
+    D3D12_RENDER_TARGET_VIEW_DESC d = desc ? *desc : whole_texture_rtv(r->desc);
+    ID3D12Resource* desktop = texture_view_target(r);
+    if (!desktop || !texture_view_format(r, d.Format, false, &d.Format)) {
+        desktop = nullptr;
+        d.Format = NULL_VIEW_FORMAT;
+    }
+    self->desktop->CreateRenderTargetView(desktop, &d, slot.cpu);
     finish_write(slot);
 }
 
@@ -280,11 +390,16 @@ void WINAPI device_create_depth_stencil_view(ConsoleDevice* self, void* resource
     DescriptorSlot slot;
     if (!console_descriptor_slots(dest.ptr, 1, &slot))
         return;
-    bool ok;
-    ID3D12Resource* desktop = texture_view_target(resource, &ok);
-    if (!ok && !desc)
+    const ConsoleResource* r = (const ConsoleResource*)resource;
+    if (!r && !desc)
         return;
-    self->desktop->CreateDepthStencilView(desktop, desc, slot.cpu);
+    D3D12_DEPTH_STENCIL_VIEW_DESC d = desc ? *desc : whole_texture_dsv(r->desc);
+    ID3D12Resource* desktop = texture_view_target(r);
+    if (!desktop || !texture_view_format(r, d.Format, false, &d.Format)) {
+        desktop = nullptr;
+        d.Format = NULL_DEPTH_VIEW_FORMAT;
+    }
+    self->desktop->CreateDepthStencilView(desktop, &d, slot.cpu);
     finish_write(slot);
 }
 

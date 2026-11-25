@@ -2,6 +2,7 @@
 // writes.
 
 #include "common/log.h"
+#include "gpu/formats.h"
 #include "hle/d3d12/command_list.h"
 
 static D3D12_GPU_VIRTUAL_ADDRESS translate(u64 address, u64 size, GpuAddress* out) {
@@ -83,8 +84,17 @@ static bool copy_location(const D3D12_TEXTURE_COPY_LOCATION* in, D3D12_TEXTURE_C
     out->pResource = list_resource(in->pResource, &base);
     if (!out->pResource)
         return false;
-    if (in->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT)
+    if (in->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT) {
+        // Bytes in memory keep the console format's layout, which a stand-in format can't read.
+        DXGI_FORMAT f = in->PlacedFootprint.Footprint.Format;
+        if (format_has_stand_in(f) || format_desktop(f) == DXGI_FORMAT_UNKNOWN) {
+            LOG_W_ONCE("d3d12",
+                       "CopyTextureRegion through memory in format %d has no desktop equivalent; skipped", f);
+            return false;
+        }
+        out->PlacedFootprint.Footprint.Format = format_desktop(f);
         out->PlacedFootprint.Offset += base;
+    }
     return true;
 }
 
@@ -120,8 +130,8 @@ static void WINAPI list_resolve_subresource(ConsoleCommandList* self, void* dst,
     u64 base;
     ID3D12Resource* d = list_resource(dst, &base);
     ID3D12Resource* s = list_resource(src, &base);
-    if (d && s)
-        self->desktop->ResolveSubresource(d, dst_subresource, s, src_subresource, format);
+    if (d && s && format_desktop(format) != DXGI_FORMAT_UNKNOWN)
+        self->desktop->ResolveSubresource(d, dst_subresource, s, src_subresource, format_desktop(format));
 }
 
 static void WINAPI list_copy_memory_to_memory_x(ConsoleCommandList* self, UINT64 dst, UINT64 src, UINT64 size,

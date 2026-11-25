@@ -17,6 +17,8 @@
 #define CONSOLE_FORMAT_R10G10B10_SNORM_A2_UNORM ((DXGI_FORMAT)189)
 #define CONSOLE_FORMAT_R4G4_UNORM               ((DXGI_FORMAT)190)
 #define CONSOLE_FORMAT_R24G8_UNORM              ((DXGI_FORMAT)191)
+#define CONSOLE_FORMAT_SAMPLER_FEEDBACK_MIN_MIP ((DXGI_FORMAT)187) // desktop: 189
+#define CONSOLE_FORMAT_SAMPLER_FEEDBACK_REGIONS ((DXGI_FORMAT)188) // desktop: 190
 
 enum FormatKind : u8 {
     FORMAT_KIND_UNKNOWN,
@@ -38,3 +40,29 @@ struct FormatInfo {
 
 // Properties of `format`; kind is FORMAT_KIND_UNKNOWN for formats with no storage.
 FormatInfo format_info(DXGI_FORMAT format);
+
+// --- desktop equivalents ---------------------------------------------------------------------------
+//
+// Every console format goes through these before reaching desktop D3D12: some console values name
+// different desktop formats, and console-only formats have none. Those get a stand-in that holds at
+// least their precision, with its own storage size.
+
+// The desktop format for a view, clear value or copy footprint; DXGI_FORMAT_UNKNOWN for a value
+// with no desktop meaning.
+DXGI_FORMAT format_desktop(DXGI_FORMAT format);
+
+// The desktop format to create a texture in: as format_desktop, but depth formats are typeless, the
+// only way desktop shaders may read a depth texture (console shaders can read any).
+DXGI_FORMAT format_desktop_resource(DXGI_FORMAT format);
+
+// The desktop format a shader reads a texture through when its view names no format: the depth
+// plane for depth formats, format_desktop otherwise.
+DXGI_FORMAT format_desktop_shader_read(DXGI_FORMAT format);
+
+// The console format is drawn through a stand-in whose storage differs, so views can't reinterpret
+// it as another format, nor it as them, and copies can't move its bytes as they are.
+bool format_has_stand_in(DXGI_FORMAT format);
+
+// Whether desktop can show a texture created in console format `resource` through a view in console
+// format `view` (UNKNOWN: the texture's own). Formats with stand-ins only alias their own family.
+bool format_view_compatible(DXGI_FORMAT resource, DXGI_FORMAT view);

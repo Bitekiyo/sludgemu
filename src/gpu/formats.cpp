@@ -153,3 +153,93 @@ FormatInfo format_info(DXGI_FORMAT f) {
         return {FORMAT_KIND_UNKNOWN, 0, 1, 1};
     }
 }
+
+// --- desktop equivalents ---------------------------------------------------------------------------
+
+DXGI_FORMAT format_desktop(DXGI_FORMAT f) {
+    switch ((u32)f) {
+    case CONSOLE_FORMAT_R10G10B10_7E3_A2_FLOAT:
+    case CONSOLE_FORMAT_R10G10B10_6E4_A2_FLOAT:
+        return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    case CONSOLE_FORMAT_R10G10B10_SNORM_A2_UNORM:
+        return DXGI_FORMAT_R16G16B16A16_SNORM; // alpha's 0..1 fits the signed range
+    case CONSOLE_FORMAT_R4G4_UNORM:
+        return DXGI_FORMAT_R8G8_UNORM;
+    case CONSOLE_FORMAT_D16_UNORM_S8_UINT:
+    case CONSOLE_FORMAT_R24G8_UNORM:
+        return DXGI_FORMAT_D24_UNORM_S8_UINT;
+    case CONSOLE_FORMAT_R16_UNORM_X8_TYPELESS:
+        return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+    case CONSOLE_FORMAT_X16_TYPELESS_G8_UINT:
+        return DXGI_FORMAT_X24_TYPELESS_G8_UINT;
+    case CONSOLE_FORMAT_SAMPLER_FEEDBACK_MIN_MIP:
+        return DXGI_FORMAT_SAMPLER_FEEDBACK_MIN_MIP_OPAQUE;
+    case CONSOLE_FORMAT_SAMPLER_FEEDBACK_REGIONS:
+        return DXGI_FORMAT_SAMPLER_FEEDBACK_MIP_REGION_USED_OPAQUE;
+    default:
+        // The rest share their values; past the last shared one, desktop's meanings differ.
+        if ((u32)f <= DXGI_FORMAT_B4G4R4A4_UNORM || (f >= DXGI_FORMAT_P208 && f <= DXGI_FORMAT_V408))
+            return f;
+        return DXGI_FORMAT_UNKNOWN;
+    }
+}
+
+DXGI_FORMAT format_desktop_resource(DXGI_FORMAT f) {
+    DXGI_FORMAT d = format_desktop(f);
+    switch (d) {
+    case DXGI_FORMAT_D32_FLOAT:
+        return DXGI_FORMAT_R32_TYPELESS;
+    case DXGI_FORMAT_D16_UNORM:
+        return DXGI_FORMAT_R16_TYPELESS;
+    case DXGI_FORMAT_D24_UNORM_S8_UINT:
+        return DXGI_FORMAT_R24G8_TYPELESS;
+    case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+        return DXGI_FORMAT_R32G8X24_TYPELESS;
+    default:
+        return d;
+    }
+}
+
+DXGI_FORMAT format_desktop_shader_read(DXGI_FORMAT f) {
+    DXGI_FORMAT d = format_desktop(f);
+    switch (d) {
+    case DXGI_FORMAT_D32_FLOAT:
+        return DXGI_FORMAT_R32_FLOAT;
+    case DXGI_FORMAT_D16_UNORM:
+        return DXGI_FORMAT_R16_UNORM;
+    case DXGI_FORMAT_D24_UNORM_S8_UINT:
+        return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+    case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+        return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+    default:
+        return d;
+    }
+}
+
+bool format_has_stand_in(DXGI_FORMAT f) {
+    switch ((u32)f) {
+    case CONSOLE_FORMAT_R10G10B10_7E3_A2_FLOAT:
+    case CONSOLE_FORMAT_R10G10B10_6E4_A2_FLOAT:
+    case CONSOLE_FORMAT_R10G10B10_SNORM_A2_UNORM:
+    case CONSOLE_FORMAT_R4G4_UNORM:
+    case CONSOLE_FORMAT_D16_UNORM_S8_UINT:
+    case CONSOLE_FORMAT_R16_UNORM_X8_TYPELESS:
+    case CONSOLE_FORMAT_X16_TYPELESS_G8_UINT:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool is_d16_s8_family(DXGI_FORMAT f) {
+    return f == CONSOLE_FORMAT_D16_UNORM_S8_UINT || f == CONSOLE_FORMAT_R16_UNORM_X8_TYPELESS ||
+           f == CONSOLE_FORMAT_X16_TYPELESS_G8_UINT;
+}
+
+bool format_view_compatible(DXGI_FORMAT resource, DXGI_FORMAT view) {
+    if (view == DXGI_FORMAT_UNKNOWN || view == resource)
+        return true;
+    if (!format_has_stand_in(resource) && !format_has_stand_in(view))
+        return true; // desktop checks the rest itself
+    return is_d16_s8_family(resource) && is_d16_s8_family(view);
+}

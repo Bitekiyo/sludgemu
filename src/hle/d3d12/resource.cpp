@@ -4,6 +4,7 @@
 #include "hle/d3d12/d3d12_objects.h"
 #include "hle/d3d12/d3d12_tables.h"
 #include "gpu/console_layout.h"
+#include "gpu/formats.h"
 #include "hle/xmem/xmem.h"
 
 static const GUID* const k_resource_iids[] = {&__uuidof(ID3D12Object),    &__uuidof(ID3D12DeviceChild),
@@ -43,6 +44,7 @@ static D3D12_TEXTURE_LAYOUT desktop_texture_layout(D3D12_TEXTURE_LAYOUT layout) 
 static D3D12_RESOURCE_DESC1 desktop_texture_desc(const D3D12_RESOURCE_DESC1& console) {
     D3D12_RESOURCE_DESC1 desc = console;
     desc.Alignment = 0;
+    desc.Format = format_desktop_resource(console.Format);
     desc.Layout = desktop_texture_layout(desc.Layout);
     desc.Flags = (D3D12_RESOURCE_FLAGS)(desc.Flags & k_desktop_resource_flags);
     return desc;
@@ -50,10 +52,17 @@ static D3D12_RESOURCE_DESC1 desktop_texture_desc(const D3D12_RESOURCE_DESC1& con
 
 static ID3D12Resource* create_texture(ConsoleResource* r) {
     D3D12_RESOURCE_DESC1 desc = desktop_texture_desc(r->desc);
+    if (desc.Format == DXGI_FORMAT_UNKNOWN) {
+        LOG_E("d3d12", "texture at 0x%llx has format %d, which desktop D3D12 has no equivalent for",
+              r->gpu_address, r->desc.Format);
+        return nullptr;
+    }
     D3D12_HEAP_PROPERTIES heap = {D3D12_HEAP_TYPE_DEFAULT};
+    D3D12_CLEAR_VALUE clear_value = r->clear_value;
+    clear_value.Format = format_desktop(r->clear_value.Format);
     bool clear_allowed =
         desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
-    const D3D12_CLEAR_VALUE* clear = r->has_clear_value && clear_allowed ? &r->clear_value : nullptr;
+    const D3D12_CLEAR_VALUE* clear = r->has_clear_value && clear_allowed ? &clear_value : nullptr;
 
     ID3D12Resource* texture = nullptr;
     // The layout the title's first barrier will name. A texture created undefined has no contents
@@ -62,6 +71,14 @@ static ID3D12Resource* create_texture(ConsoleResource* r) {
         r->initial_layout == D3D12_BARRIER_LAYOUT_UNDEFINED ? D3D12_BARRIER_LAYOUT_COMMON : r->initial_layout;
     HRESULT hr = gpu_device()->CreateCommittedResource3(&heap, D3D12_HEAP_FLAG_NONE, &desc, layout, clear,
                                                         nullptr, 0, nullptr, IID_PPV_ARGS(&texture));
+    if (hr == E_INVALIDARG && clear) {
+        // The clear value only tells the driver which clears are fast; desktop is stricter about
+        // its format (never typeless), so do without one it refuses.
+        LOG_W_ONCE("d3d12", "texture clear value format %d refused; creating textures without it",
+                   r->clear_value.Format);
+        hr = gpu_device()->CreateCommittedResource3(&heap, D3D12_HEAP_FLAG_NONE, &desc, layout, nullptr,
+                                                    nullptr, 0, nullptr, IID_PPV_ARGS(&texture));
+    }
     if (FAILED(hr)) {
         LOG_E("d3d12",
               "cannot create the desktop texture for 0x%llx (dim %d, %llux%ux%u, mips %u, format %d, "
