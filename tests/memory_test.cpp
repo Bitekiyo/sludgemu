@@ -130,19 +130,21 @@ static void test_runs_and_remaps() {
     if (!base)
         return;
 
-    // Frames come from a fresh area of physical memory, so they are consecutive.
+    // Frames come from a fresh area of physical memory, so they are consecutive (page numbers count
+    // 4 KiB units, so consecutive frames are 16 apart).
     u64 run[8];
     CHECK(mem_physical_alloc(8, run));
     for (u32 i = 1; i < 8; i++)
-        CHECK(run[i] == run[0] + i);
+        CHECK(run[i] == run[0] + ((u64)i << MEM_PAGE_NUMBER_SHIFT));
     u64 other[2];
     CHECK(mem_physical_alloc(2, other));
     tag_frames(run, 8);
     tag_frames(other, 2);
     u32 errors = log_error_count();
 
-    // A run of consecutive frames is one view.
+    // A run of consecutive frames is one view, once backed.
     CHECK(mem_map_physical(base + 4 * PAGE, 8, run));
+    mem_prepare(base + 4 * PAGE, 8 * PAGE);
     void* alloc;
     u64 size;
     u32 state;
@@ -178,6 +180,7 @@ static void test_runs_and_remaps() {
     // frames don't starts a new one.
     CHECK(mem_map_physical(base + 12 * PAGE, 2, &run[0]));
     CHECK(mem_map_physical(base + 14 * PAGE, 1, &run[2]));
+    mem_prepare(base + 12 * PAGE, 3 * PAGE);
     CHECK(mem_backing_block(base + 14 * PAGE, &block));
     CHECK(block.base == base + 12 * PAGE && block.size == 3 * PAGE && block.host == mem_physical_ptr(run[0]));
     CHECK(mem_backing_block(base + 11 * PAGE, &block) && block.base == base + 8 * PAGE); // run[7], run[0]: no
@@ -238,6 +241,7 @@ static void test_out_of_order_slices_form_one_block() {
     CHECK(mem_map_physical(base + 10 * PAGE, 10, &ids[30]));
 
     MemBlock block;
+    mem_prepare(base, pages * PAGE);
     CHECK(mem_backing_block(base + 25 * PAGE, &block));
     CHECK(block.base == base && block.size == pages * PAGE);
     base[3 * PAGE + 5] = 0x42; // ids[23], seen through the linear view
@@ -246,6 +250,79 @@ static void test_out_of_order_slices_form_one_block() {
 
     CHECK(mem_release(base));
     mem_physical_free(pages, ids);
+}
+
+// Mapped frames stay placeholders until touched; a CPU access backs them transparently, and
+// mem_prepare backs them for those that can't fault (the GPU, kernel I/O).
+static void test_lazy_backing() {
+    const u32 pages = 8;
+    MemAddressLimits limits = {};
+    u8* base = (u8*)mem_reserve_placeholder(pages * PAGE, limits, 0, PAGE_READWRITE, 0);
+    CHECK(base != nullptr);
+    if (!base)
+        return;
+    u64 frames[pages];
+    CHECK(mem_physical_alloc(pages, frames));
+    tag_frames(frames, pages);
+    CHECK(mem_map_physical(base, pages, frames));
+
+    void* alloc;
+    u64 size;
+    u32 state;
+    query_allocation(base, &alloc, &size, &state);
+    CHECK(state == MEM_RESERVE); // pending
+    MemBlock block;
+    CHECK(!mem_backing_block(base, &block));
+    CHECK(shows_frame(base + 5 * PAGE, frames[5])); // the access backs the pages and retries
+    query_allocation(base, &alloc, &size, &state);
+    CHECK(state == MEM_COMMIT);
+
+    // Remapped pages are pending again; mem_prepare backs them.
+    CHECK(mem_map_physical(base + 2 * PAGE, 2, &frames[6]));
+    query_allocation(base + 2 * PAGE, &alloc, &size, &state);
+    CHECK(state == MEM_RESERVE);
+    mem_prepare(base + 2 * PAGE, 2 * PAGE);
+    CHECK(mem_backing_block(base + 2 * PAGE, &block));
+    CHECK(shows_frame(base + 3 * PAGE, frames[7]));
+
+    // Page number 0 is how titles release a slot: it unmaps.
+    u64 none = 0;
+    u32 errors = log_error_count();
+    CHECK(mem_map_physical(base + 3 * PAGE, 1, &none));
+    CHECK(log_error_count() == errors);
+    mem_prepare(base + 3 * PAGE, PAGE);
+    query_allocation(base + 3 * PAGE, &alloc, &size, &state);
+    CHECK(state == MEM_RESERVE);
+
+    CHECK(mem_release(base));
+    CHECK(range_is_free(base, pages * PAGE));
+    mem_physical_free(pages, frames);
+}
+
+// Large commits are reserved and committed as they're touched, a granule at a time.
+static void test_lazy_commit() {
+    MemAddressLimits limits = {};
+    const u64 size = MiB(64);
+    u8* base = (u8*)mem_alloc_virtual(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE, limits, 0, 0);
+    CHECK(base != nullptr);
+    if (!base)
+        return;
+    void* alloc;
+    u64 region;
+    u32 state;
+    query_allocation(base + MiB(40), &alloc, &region, &state);
+    CHECK(state == MEM_RESERVE);
+    base[MiB(40) + 12] = 7; // faults, gets committed, retries
+    CHECK(base[MiB(40) + 12] == 7);
+    query_allocation(base + MiB(40), &alloc, &region, &state);
+    CHECK(state == MEM_COMMIT);
+    query_allocation(base + MiB(20), &alloc, &region, &state);
+    CHECK(state == MEM_RESERVE); // untouched parts stay reserved
+    mem_prepare(base + MiB(20), 16);
+    query_allocation(base + MiB(20), &alloc, &region, &state);
+    CHECK(state == MEM_COMMIT);
+    CHECK(mem_release(base));
+    CHECK(range_is_free(base, size));
 }
 
 int main() {
@@ -260,6 +337,8 @@ int main() {
     test_out_of_order_slices_form_one_block();
     test_backed_release();
     test_frames_zeroed_on_reuse();
+    test_lazy_backing();
+    test_lazy_commit();
     printf("%s (%d failures)\n", g_failures ? "FAILED" : "passed", g_failures);
     return g_failures;
 }
