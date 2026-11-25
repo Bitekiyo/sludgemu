@@ -19,6 +19,7 @@
 #include "common/str.h"
 #include "core/console_profile.h"
 #include "core/title.h"
+#include "gpu/console_layout.h"
 #include "gpu/gpu.h"
 #include "hle/hle.h"
 #include "hle/xmem/xmem.h"
@@ -157,6 +158,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
     LOG_I("main", "presenting as %s, title memory %llu MiB", console_profile().name,
           console_title_memory() >> 20);
     xmem_init();
+    if (!console_layout_init(console_profile().model))
+        return 1;
     hle_init();
     GpuOptions gpu_options = {};
     gpu_options.debug_layer = opt.gpu_debug;

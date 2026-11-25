@@ -55,6 +55,8 @@ FetchContent_Declare(libdeflate
     GIT_SHALLOW TRUE)
 FetchContent_MakeAvailable(libdeflate)
 
+include(cmake/addrlib.cmake)
+
 include(cmake/nuget.cmake)
 
 # DirectStorage (desktop): backs the console DirectStorage API. Redistributable DLLs are copied

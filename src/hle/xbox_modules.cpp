@@ -4,7 +4,6 @@
 
 #include "hle/hle.h"
 
-HLE_EMPTY_MODULE(g_hle_module_xg_xs, "xg_xs.dll");           // texture layout / tiling
 HLE_EMPTY_MODULE(g_hle_module_chad, "chad.dll");             // audio DSP
 HLE_EMPTY_MODULE(g_hle_module_xapu, "xapu.dll");             // audio processing unit
 HLE_EMPTY_MODULE(g_hle_module_acphal, "acphal.dll");         // audio control processor HAL

@@ -71,6 +71,11 @@ add_executable(sludgemu WIN32
     gpu/gpu.cpp
     gpu/gpu_window.h
     gpu/gpu_window.cpp
+    gpu/formats.h
+    gpu/formats.cpp
+    gpu/console_layout.h
+    gpu/console_layout.cpp
+    hle/xg/xg_xs.cpp
     hle/xgameruntime/runtime_api.h
     hle/xgameruntime/xgameruntime.h
     hle/xgameruntime/xgameruntime.cpp
@@ -90,7 +95,7 @@ add_executable(sludgemu WIN32
 )
 target_include_directories(sludgemu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(sludgemu PRIVATE agility sludge_options shell32 user32 synchronization delayimp
-    dstorage libdeflate::libdeflate_static d3d12 dxgi)
+    dstorage libdeflate::libdeflate_static addrlib d3d12 dxgi)
 
 # Loaded only when a title uses DirectStorage.
 target_link_options(sludgemu PRIVATE /DELAYLOAD:dstorage.dll)

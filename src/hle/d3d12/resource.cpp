@@ -3,6 +3,7 @@
 #include "common/log.h"
 #include "hle/d3d12/d3d12_objects.h"
 #include "hle/d3d12/d3d12_tables.h"
+#include "gpu/console_layout.h"
 #include "hle/xmem/xmem.h"
 
 static const GUID* const k_resource_iids[] = {&__uuidof(ID3D12Object),    &__uuidof(ID3D12DeviceChild),
@@ -69,24 +70,32 @@ static ID3D12Resource* create_texture(ConsoleResource* r) {
     return texture;
 }
 
+// Textures take what their console layout takes: titles place them in their own memory and stream
+// data into them in that layout.
 D3D12_RESOURCE_ALLOCATION_INFO console_resource_allocation_info(const D3D12_RESOURCE_DESC1& desc) {
     if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
         u64 alignment = desc.Alignment ? desc.Alignment : D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
         return {ALIGN_UP(desc.Width, alignment), alignment};
     }
-    static volatile long once = 0;
-    if (log_once_flag(&once))
-        LOG_W("d3d12", "texture memory sizes follow desktop layouts, not console ones, for now");
-    D3D12_RESOURCE_DESC1 d = desktop_texture_desc(desc);
-    D3D12_RESOURCE_ALLOCATION_INFO1 unused;
-    D3D12_RESOURCE_ALLOCATION_INFO info = gpu_device()->GetResourceAllocationInfo2(0, 1, &d, &unused);
-    if (info.SizeInBytes == UINT64_MAX)
+    ConsoleTextureDesc t = {};
+    t.dimension = desc.Dimension;
+    t.width = desc.Width;
+    t.height = desc.Height;
+    t.depth_or_array_size = desc.DepthOrArraySize;
+    t.mip_levels = desc.MipLevels;
+    t.format = desc.Format;
+    t.sample_count = desc.SampleDesc.Count;
+    t.layout = desc.Layout;
+    t.flags = desc.Flags;
+    ConsoleTextureLayout layout;
+    if (!console_texture_layout(t, &layout)) {
         LOG_E("d3d12",
-              "no desktop layout for texture dim %d, %llux%ux%u, mips %u, format %d, samples %u/%u, "
-              "layout 0x%x, flags 0x%x, alignment 0x%llx",
+              "no console layout for texture dim %d, %llux%ux%u, mips %u, format %d, layout 0x%x, flags 0x%x",
               desc.Dimension, desc.Width, desc.Height, desc.DepthOrArraySize, desc.MipLevels, desc.Format,
-              desc.SampleDesc.Count, desc.SampleDesc.Quality, desc.Layout, desc.Flags, desc.Alignment);
-    return info;
+              desc.Layout, desc.Flags);
+        return {UINT64_MAX, 0};
+    }
+    return {layout.size, layout.base_alignment};
 }
 
 ID3D12Resource* console_resource_desktop(ConsoleResource* r, u64* offset) {

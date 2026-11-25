@@ -98,6 +98,12 @@ layouts, so they get desktop textures in video memory; their title pages are nev
 Descriptor heaps live in title memory (handles are plain addresses there) and are mirrored by
 desktop heaps slot for slot; every descriptor write and copy updates both.
 
+Console textures sit in title memory in the console GPU's layout (RDNA2 swizzle modes, mip chains
+smallest first, compression metadata planes), and titles size, place and fill them from that
+layout, so it has to be exact. `gpu/console_layout` computes it with addrlib configured as the
+console GPU; the two console models differ in memory pipes and packers. The same layouts back the
+console texture layout library (`xg_xs.dll`) and resource sizes.
+
 ## File system
 
 On console the package is mounted at `G:\`. File-system overrides and DirectStorage translate
@@ -120,6 +126,7 @@ Fetched at configure time, never vendored:
   `D3D12SDKVersion` / `D3D12SDKPath`. Its headers take precedence over the Windows SDK's.
 - the DirectStorage redistributable (NuGet), copied next to `sludgemu.exe` and delay-loaded.
 - libdeflate, for zlib decoding.
+- AMD's address library (addrlib, from Mesa), for console texture layouts.
 
 ## Debugging conventions
 
