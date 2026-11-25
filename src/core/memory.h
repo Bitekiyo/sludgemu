@@ -35,6 +35,7 @@ enum MemRangeFlags : u32 {
     MEM_RANGE_CPU_ACCESS = 1u << 2,  // CPU may access (not GPU-only)
     MEM_RANGE_OWNS_PAGES = 1u << 3,  // physical pages were allocated with the range; freed on release
     MEM_RANGE_LAZY = 1u << 4,        // committed by the title but reserved here, committed when touched
+    MEM_RANGE_SECTION = 1u << 5, // a section the GPU sees through a view of its own (see mem_alloc_virtual)
 };
 
 // Description of a tracked range. Ranges can be released by another thread at any time, so they
@@ -94,6 +95,11 @@ void* mem_alloc_physical_backed(u64 size, const MemAddressLimits& limits, u32 ra
 // Reserves (+ optionally commits) ordinary memory with address constraints. Returns nullptr on
 // failure. Ranges with MEM_RANGE_GPU are registered. Large commits are only reserved and get
 // committed as they are touched, like mapped physical frames (see mem_map_physical).
+//
+// New GPU-visible ranges are views of a section, which the GPU sees through a second view of ours
+// (MemBlock::host): heaps opened over memory lock its pages, and pages locked that way can't have
+// their protection changed, so the title's own addresses must never be the ones locked. Sections
+// can't decommit: decommitting part of such a range keeps it committed.
 void* mem_alloc_virtual(void* base, u64 size, u32 alloc_type, u32 protect, const MemAddressLimits& limits,
                         u32 range_flags, u64 xflags);
 

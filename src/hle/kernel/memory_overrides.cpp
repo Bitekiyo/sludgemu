@@ -37,6 +37,12 @@ static BOOL WINAPI hk_VirtualFree(LPVOID base, SIZE_T size, DWORD type) {
                   (u64)size, type);
             return TRUE;
         }
+        if ((type & MEM_DECOMMIT) && (r.flags & MEM_RANGE_SECTION)) {
+            // Section memory can't be decommitted; the title won't touch it again until it commits it.
+            LOG_W_ONCE("kernel", "decommitting GPU memory keeps it committed (first at %p, 0x%llx bytes)",
+                       base, (u64)size);
+            return TRUE;
+        }
     }
     return VirtualFree(base, size, type);
 }

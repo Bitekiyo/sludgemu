@@ -319,6 +319,47 @@ static void test_lazy_commit() {
     CHECK(range_is_free(base, size));
 }
 
+// GPU-visible ranges are sections: the title's view commits as it is touched, the backing block is our
+// own view of the same memory, and the title's pages can be protected (nothing locks them).
+static void test_gpu_section_ranges() {
+    MemAddressLimits limits = {};
+    const u64 size = MiB(64);
+    u8* base = (u8*)mem_alloc_virtual(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE, limits,
+                                      MEM_RANGE_GPU, 0);
+    CHECK(base != nullptr);
+    if (!base)
+        return;
+    MemRange r;
+    CHECK(mem_query_range(base, &r) && (r.flags & MEM_RANGE_SECTION) && (r.flags & MEM_RANGE_LAZY));
+    void* alloc;
+    u64 region;
+    u32 state;
+    query_allocation(base + MiB(20), &alloc, &region, &state);
+    CHECK(state == MEM_RESERVE); // lazily committed
+    base[MiB(20) + 5] = 42;      // faults, gets committed, retries
+    query_allocation(base + MiB(20), &alloc, &region, &state);
+    CHECK(state == MEM_COMMIT);
+    MemBlock block;
+    CHECK(mem_backing_block(base + MiB(20), &block));
+    CHECK(block.base == base && block.size == size && block.host != base);
+    CHECK(block.host && block.host[MiB(20) + 5] == 42); // the same memory
+    DWORD old;
+    CHECK(VirtualProtect(base + MiB(20), 4096, PAGE_READONLY, &old) && old == PAGE_READWRITE);
+    CHECK(VirtualProtect(base + MiB(20), 4096, PAGE_READWRITE, &old));
+    // Committing inside a reserved section range uses the range's protection.
+    u8* reserved =
+        (u8*)mem_alloc_virtual(nullptr, MiB(4), MEM_RESERVE, PAGE_READWRITE, limits, MEM_RANGE_GPU, 0);
+    CHECK(reserved != nullptr);
+    if (reserved) {
+        CHECK(mem_alloc_virtual(reserved + MiB(1), MiB(1), MEM_COMMIT, PAGE_READWRITE | PAGE_WRITECOMBINE,
+                                limits, MEM_RANGE_GPU, 0) == reserved + MiB(1));
+        reserved[MiB(1) + 7] = 1;
+        CHECK(mem_release(reserved));
+    }
+    CHECK(mem_release(base));
+    CHECK(range_is_free(base, size));
+}
+
 void test_xapu_decode();
 void test_xapu_convert();
 void test_xdsp();
@@ -338,6 +379,7 @@ int main() {
     test_frames_zeroed_on_reuse();
     test_lazy_backing();
     test_lazy_commit();
+    test_gpu_section_ranges();
     test_xapu_decode();
     test_xapu_convert();
     test_xdsp();

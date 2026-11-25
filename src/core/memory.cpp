@@ -17,10 +17,12 @@ struct RangeSlot {
     MemRegion* regions; // placeholder ranges only; sorted by first_page, regions[0].first_page == 0
     u32 region_count;
     u32 region_capacity;
-    u32* anchors; // placeholder ranges: per slice of REGION_PAGES pages, the first real frame of the
-                  // region the slice prefers, or MEM_INVALID_PFN
-    u32* pending; // placeholder ranges, once frames are mapped: per page, the frame ID mapped there but
-                  // not backed yet (see "Lazy backing"), or MEM_INVALID_PFN
+    u32* anchors;   // placeholder ranges: per slice of REGION_PAGES pages, the first real frame of the
+                    // region the slice prefers, or MEM_INVALID_PFN
+    u32* pending;   // placeholder ranges, once frames are mapped: per page, the frame ID mapped there but
+                    // not backed yet (see "Lazy backing"), or MEM_INVALID_PFN
+    HANDLE section; // section ranges: the section and our own view of it, which the GPU sees
+    u8* host;
 };
 
 #define MAX_RANGES 8192
@@ -512,7 +514,10 @@ bool mem_backing_block(const void* addr, MemBlock* out) {
     bool ok = false;
     AcquireSRWLockShared(&g_mem.range_lock);
     RangeSlot* s = find_range_locked(addr);
-    if (s && !(s->info.flags & MEM_RANGE_PLACEHOLDER)) {
+    if (s && (s->info.flags & MEM_RANGE_SECTION)) {
+        *out = {s->info.base, s->info.size, s->host}; // the GPU sees the section through our view
+        ok = true;
+    } else if (s && !(s->info.flags & MEM_RANGE_PLACEHOLDER)) {
         *out = {s->info.base, s->info.size, s->info.base}; // one VirtualAlloc allocation
         ok = true;
     } else if (s) {
@@ -626,7 +631,7 @@ void mem_set_range_protect(const void* addr, u32 protect) {
 // Publishes a fully initialized range. `regions` and `anchors` (placeholder ranges only) are owned
 // by the range from here on.
 static void add_range(u8* base, u64 size, u32 flags, u32 protect, u64 xflags, MemRegion* regions,
-                      u32* anchors) {
+                      u32* anchors, HANDLE section = nullptr, u8* host = nullptr) {
     AcquireSRWLockExclusive(&g_mem.range_lock);
     if (g_mem.range_count >= MAX_RANGES) {
         ReleaseSRWLockExclusive(&g_mem.range_lock);
@@ -643,6 +648,8 @@ static void add_range(u8* base, u64 size, u32 flags, u32 protect, u64 xflags, Me
     s.region_capacity = regions ? 1 : 0;
     s.anchors = anchors;
     s.pending = nullptr;
+    s.section = section;
+    s.host = host;
     ReleaseSRWLockExclusive(&g_mem.range_lock);
 }
 
@@ -689,9 +696,63 @@ void* mem_reserve_placeholder(u64 size, const MemAddressLimits& limits, u32 rang
     return base;
 }
 
+// A GPU-visible range: a section viewed by the title where it asked, and by us elsewhere. Pages are
+// committed through the title's view, now or (lazy) as they are touched.
+static void* alloc_section_range(u64 size, bool commit, bool lazy, u32 protect,
+                                 const MemAddressLimits& limits, u32 range_flags, u64 xflags) {
+    size = ALIGN_UP(size, MEM_PAGE_SIZE);
+    HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_RESERVE,
+                                        (DWORD)(size >> 32), (DWORD)size, nullptr);
+    if (!section) {
+        LOG_E("memory", "cannot create a %llu MiB section for GPU memory (%lu)", size >> 20, GetLastError());
+        return nullptr;
+    }
+    MEM_ADDRESS_REQUIREMENTS req;
+    fill_address_requirements(limits, &req);
+    MEM_EXTENDED_PARAMETER param = {};
+    param.Type = MemExtendedParameterAddressRequirements;
+    param.Pointer = &req;
+    // Caching follows the section: plain write-back, which the GPU snoops.
+    u32 page_protect =
+        (protect & 0xFF) == PAGE_NOACCESS || !(protect & 0xFF) ? PAGE_READWRITE : protect & 0xFF;
+    // Views take only some placement requirements; a placeholder takes them all and the view replaces it.
+    u8* placeholder = (u8*)g_mem.virtual_alloc2(
+        GetCurrentProcess(), nullptr, size, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, &param, 1);
+    u8* title = placeholder ? (u8*)g_mem.map_view3(section, GetCurrentProcess(), placeholder, 0, size,
+                                                   MEM_REPLACE_PLACEHOLDER, page_protect, nullptr, 0)
+                            : nullptr;
+    if (placeholder && !title)
+        VirtualFree(placeholder, 0, MEM_RELEASE);
+    u8* host = title ? (u8*)g_mem.map_view3(section, GetCurrentProcess(), nullptr, 0, size, 0, PAGE_READWRITE,
+                                            nullptr, 0)
+                     : nullptr;
+    if (!host) {
+        LOG_E("memory", "cannot map a %llu MiB GPU memory section (%lu)", size >> 20, GetLastError());
+        if (title)
+            g_mem.unmap_view2(GetCurrentProcess(), title, 0);
+        CloseHandle(section);
+        return nullptr;
+    }
+    if (commit && !lazy && !VirtualAlloc(title, size, MEM_COMMIT, page_protect)) {
+        LOG_E("memory", "cannot commit %llu MiB of GPU memory (%lu)", size >> 20, GetLastError());
+        g_mem.unmap_view2(GetCurrentProcess(), host, 0);
+        g_mem.unmap_view2(GetCurrentProcess(), title, 0);
+        CloseHandle(section);
+        return nullptr;
+    }
+    add_range(title, size, range_flags | MEM_RANGE_SECTION | (lazy ? MEM_RANGE_LAZY : 0), page_protect,
+              xflags, nullptr, nullptr, section, host);
+    return title;
+}
+
 void* mem_alloc_virtual(void* base, u64 size, u32 alloc_type, u32 protect, const MemAddressLimits& limits,
                         u32 range_flags, u64 xflags) {
     void* p;
+    if (!base && (range_flags & MEM_RANGE_GPU) && (alloc_type & (MEM_RESERVE | MEM_COMMIT))) {
+        bool commit = (alloc_type & MEM_COMMIT) != 0;
+        return alloc_section_range(size, commit, commit && size >= LAZY_COMMIT_MIN, protect, limits,
+                                   range_flags, xflags);
+    }
     // A title's big commits are pools it fills over time: reserve them, commit as they're touched.
     bool lazy = !base && (alloc_type & MEM_COMMIT) && size >= LAZY_COMMIT_MIN;
     if (lazy) {
@@ -700,6 +761,10 @@ void* mem_alloc_virtual(void* base, u64 size, u32 alloc_type, u32 protect, const
     }
     if (base) {
         // Committing inside an existing reservation (or a fixed-address request): no constraints.
+        // Section views commit with the protection they were mapped with (caching is the section's).
+        MemRange r;
+        if (mem_query_range(base, &r) && (r.flags & MEM_RANGE_SECTION))
+            protect = r.protect;
         p = VirtualAlloc(base, size, alloc_type, protect);
     } else {
         MEM_ADDRESS_REQUIREMENTS req;
@@ -1038,6 +1103,13 @@ bool mem_release(void* base) {
         free(s->pending);
         free(s->regions);
         release_anchors(s);
+    } else if (s->info.flags & MEM_RANGE_SECTION) {
+        // GPU heaps over our view keep its pages until the GPU is done with them (windows are retired
+        // by the mapping notification below).
+        if (!g_mem.unmap_view2(GetCurrentProcess(), s->info.base, 0) ||
+            !g_mem.unmap_view2(GetCurrentProcess(), s->host, 0))
+            LOG_E("memory", "releasing GPU memory %p failed (%lu)", s->info.base, GetLastError());
+        CloseHandle(s->section);
     } else {
         VirtualFree(s->info.base, 0, MEM_RELEASE);
     }
