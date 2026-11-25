@@ -207,6 +207,13 @@ static volatile long g_watch_hits = 0;
 // bits 18-19).
 #define DR7_WATCH0_WRITE8 ((1ull << 0) | (1ull << 16) | (2ull << 18))
 
+// Execution traces use debug registers 1-3: local enable bits 2, 4, 6, with RW and LEN 0
+// (break on execution).
+#define TRACE_MAX 3
+static volatile u64 g_trace_addr[TRACE_MAX];
+static volatile long g_trace_hits[TRACE_MAX];
+#define TRACE_LOG_LIMIT 24
+
 static bool set_thread_watch(HANDLE thread, bool self) {
     CONTEXT ctx = {};
     ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
@@ -214,8 +221,18 @@ static bool set_thread_watch(HANDLE thread, bool self) {
         return false;
     bool ok = GetThreadContext(thread, &ctx) != 0;
     if (ok) {
-        ctx.Dr0 = g_watch_addr;
-        ctx.Dr7 = (ctx.Dr7 & ~0xF0003ull) | DR7_WATCH0_WRITE8;
+        if (g_watch_addr) {
+            ctx.Dr0 = g_watch_addr;
+            ctx.Dr7 = (ctx.Dr7 & ~0xF0003ull) | DR7_WATCH0_WRITE8;
+        }
+        DWORD64* regs[TRACE_MAX] = {&ctx.Dr1, &ctx.Dr2, &ctx.Dr3};
+        for (u32 i = 0; i < TRACE_MAX; i++) {
+            if (!g_trace_addr[i])
+                continue;
+            *regs[i] = g_trace_addr[i];
+            u32 n = i + 1;
+            ctx.Dr7 = (ctx.Dr7 & ~((3ull << (n * 2)) | (0xFull << (16 + n * 4)))) | (1ull << (n * 2));
+        }
         ok = SetThreadContext(thread, &ctx) != 0;
     }
     if (!self)
@@ -224,8 +241,89 @@ static bool set_thread_watch(HANDLE thread, bool self) {
 }
 
 void crash_watch_current_thread() {
-    if (g_watch_addr)
-        set_thread_watch(GetCurrentThread(), true);
+    if ((g_watch_addr || g_trace_addr[0]) && !set_thread_watch(GetCurrentThread(), true))
+        LOG_W("watch", "cannot arm thread %lu (%lu)", GetCurrentThreadId(), GetLastError());
+}
+
+// Applies the debug registers to every thread that exists; returns how many took them.
+static u32 arm_all_threads() {
+    u32 armed = 0;
+    DWORD self = GetCurrentThreadId(), pid = GetCurrentProcessId();
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE)
+        return 0;
+    THREADENTRY32 te = {sizeof(te)};
+    for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
+        if (te.th32OwnerProcessID != pid)
+            continue;
+        if (te.th32ThreadID == self) {
+            armed += set_thread_watch(GetCurrentThread(), true);
+            continue;
+        }
+        HANDLE th = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE,
+                               te.th32ThreadID);
+        if (th) {
+            armed += set_thread_watch(th, false);
+            CloseHandle(th);
+        }
+    }
+    CloseHandle(snap);
+    return armed;
+}
+
+static u64 parse_location(const char* spec) {
+    const char* plus = strchr(spec, '+');
+    if (!plus)
+        return strtoull(spec, nullptr, 16);
+    char mod[MAX_PATH];
+    usize n = (usize)(plus - spec);
+    if (n >= sizeof(mod))
+        return 0;
+    memcpy(mod, spec, n);
+    mod[n] = 0;
+    HMODULE h = GetModuleHandleA(mod);
+    PeImage* img = h ? nullptr : g_loader.find_by_name(mod);
+    u8* base = h ? (u8*)h : (img ? img->base : nullptr);
+    if (!base) {
+        LOG_E("watch", "module %s is not loaded", mod);
+        return 0;
+    }
+    return (u64)base + strtoull(plus + 1, nullptr, 16);
+}
+
+// Setting a thread's own debug registers doesn't reliably take, and some threads never pass
+// through the thread-attach hook, so a helper keeps every thread armed.
+static DWORD WINAPI rearm_thread(void*) {
+    for (;;) {
+        Sleep(20);
+        arm_all_threads();
+    }
+}
+
+static void start_rearming() {
+    static volatile long s_started = 0;
+    if (InterlockedExchange(&s_started, 1))
+        return;
+    HANDLE t = CreateThread(nullptr, 0, rearm_thread, nullptr, 0, nullptr);
+    if (t)
+        CloseHandle(t);
+}
+
+bool crash_arm_exec_trace(const char* spec) {
+    // Up to three comma-separated locations.
+    char buf[256];
+    str_copy(buf, sizeof(buf), spec);
+    u32 count = 0;
+    for (char* tok = strtok(buf, ","); tok && count < TRACE_MAX; tok = strtok(nullptr, ","))
+        if (u64 a = parse_location(tok))
+            g_trace_addr[count++] = a;
+    if (!count)
+        return false;
+    u32 armed = arm_all_threads();
+    start_rearming();
+    for (u32 i = 0; i < count; i++)
+        LOG_I("watch", "execution trace on 0x%llx, armed on %u threads", (u64)g_trace_addr[i], armed);
+    return armed != 0;
 }
 
 bool crash_arm_write_watch(const char* spec) {
@@ -273,28 +371,8 @@ bool crash_arm_write_watch(const char* spec) {
     }
     g_watch_addr = addr;
 
-    // Every existing thread, then new ones via crash_watch_current_thread().
-    u32 armed = 0;
-    DWORD self = GetCurrentThreadId(), pid = GetCurrentProcessId();
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-    if (snap != INVALID_HANDLE_VALUE) {
-        THREADENTRY32 te = {sizeof(te)};
-        for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
-            if (te.th32OwnerProcessID != pid)
-                continue;
-            if (te.th32ThreadID == self) {
-                armed += set_thread_watch(GetCurrentThread(), true);
-                continue;
-            }
-            HANDLE th = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE,
-                                   te.th32ThreadID);
-            if (th) {
-                armed += set_thread_watch(th, false);
-                CloseHandle(th);
-            }
-        }
-        CloseHandle(snap);
-    }
+    u32 armed = arm_all_threads();
+    start_rearming();
     // The location may not exist yet (memory the title maps later); the watch still applies.
     MEMORY_BASIC_INFORMATION mbi;
     bool readable = VirtualQuery((void*)addr, &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT &&
@@ -327,8 +405,63 @@ static void log_watch_hit(EXCEPTION_POINTERS* ep) {
     }
 }
 
+// Registers at a traced instruction: the arguments on entry to a function, the result after a call.
+static void log_trace_hit(EXCEPTION_POINTERS* ep, u32 i) {
+    long n = InterlockedIncrement(&g_trace_hits[i]);
+    // SLUDGE_TRACE_SKIP=<hits> starts logging after that many hits of each location.
+    static long s_skip = -1;
+    if (s_skip < 0) {
+        char env[16];
+        s_skip = GetEnvironmentVariableA("SLUDGE_TRACE_SKIP", env, sizeof(env)) ? atol(env) : 0;
+    }
+    if (n <= s_skip || n > s_skip + TRACE_LOG_LIMIT)
+        return;
+    const CONTEXT* c = ep->ContextRecord;
+    char where[200], from[200];
+    describe_address((void*)c->Rip, where, sizeof(where));
+    describe_address((void*)*(const u64*)c->Rsp, from, sizeof(from));
+    LOG_W("watch",
+          "exec #%ld at %s (return %s): rax=%llx rcx=%llx rdx=%llx r8=%llx r9=%llx rbx=%llx rsi=%llx "
+          "rdi=%llx r10=%llx r11=%llx r12=%llx r13=%llx r14=%llx r15=%llx",
+          n, where, from, c->Rax, c->Rcx, c->Rdx, c->R8, c->R9, c->Rbx, c->Rsi, c->Rdi, c->R10, c->R11,
+          c->R12, c->R13, c->R14, c->R15);
+    // The first arguments are often pointers to structures: show their start when readable.
+    const u64 args[6] = {c->Rcx, c->Rdx, c->R8, c->R9, c->Rsi, c->Rdi};
+    static const char* const k_names[6] = {"rcx", "rdx", "r8", "r9", "rsi", "rdi"};
+    for (u32 a = 0; a < 6; a++) {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (VirtualQuery((void*)args[a], &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT &&
+            (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) &&
+            !(mbi.Protect & PAGE_GUARD) && args[a] + 32 <= (u64)mbi.BaseAddress + mbi.RegionSize) {
+            const u64* q = (const u64*)args[a];
+            LOG_W("watch", "  [%s] %016llx %016llx %016llx %016llx", k_names[a], q[0], q[1], q[2], q[3]);
+            // SLUDGE_TRACE_DUMP=<bytes> writes more of it to the log, as far as it is readable.
+            char env[16];
+            if (GetEnvironmentVariableA("SLUDGE_TRACE_DUMP", env, sizeof(env))) {
+                u64 end = (u64)mbi.BaseAddress + mbi.RegionSize;
+                u64 bytes = strtoull(env, nullptr, 0);
+                if (bytes > end - args[a])
+                    bytes = end - args[a];
+                for (u64 off = 32; off + 32 <= bytes; off += 32) {
+                    const u64* r = (const u64*)(args[a] + off);
+                    LOG_W("watch", "  [%s+%03llx] %016llx %016llx %016llx %016llx", k_names[a], off, r[0],
+                          r[1], r[2], r[3]);
+                }
+            }
+        }
+    }
+}
+
 static LONG CALLBACK vectored_handler(EXCEPTION_POINTERS* ep) {
     DWORD code = ep->ExceptionRecord->ExceptionCode;
+    if (code == EXCEPTION_SINGLE_STEP && (ep->ContextRecord->Dr6 & 0xE)) {
+        for (u32 i = 0; i < TRACE_MAX; i++)
+            if (ep->ContextRecord->Dr6 & (2u << i))
+                log_trace_hit(ep, i);
+        ep->ContextRecord->Dr6 = 0;
+        ep->ContextRecord->EFlags |= 0x10000; // resume flag: run the instruction without breaking again
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
     if (code == EXCEPTION_SINGLE_STEP && g_watch_addr && (ep->ContextRecord->Dr6 & 1)) {
         log_watch_hit(ep);
         ep->ContextRecord->Dr6 = 0;

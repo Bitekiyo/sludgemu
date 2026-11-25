@@ -189,10 +189,13 @@ static void count_request(const ConsoleRequest& r) {
         InterlockedIncrement(&g_page_count);
 
     if (n <= DETAILED_REQUEST_LOGS) {
-        LOG_I("dstorage",
-              "request #%ld: options=0x%llx source=%u bytes%s dest=%u bytes intermediate=%u name=%s", n,
-              r.options, r.source_size, (r.options & OPT_SOURCE_MEMORY) ? " (memory)" : "",
-              r.destination_size, r.intermediate_size, r.name ? r.name : "");
+        LOG_I(
+            "dstorage",
+            "request #%ld: options=0x%llx source=%u bytes%s at 0x%llx, dest=%u bytes at %p, intermediate=%u "
+            "name=%s",
+            n, r.options, r.source_size, (r.options & OPT_SOURCE_MEMORY) ? " (memory)" : "",
+            (r.options & OPT_SOURCE_MEMORY) ? (u64)r.source : r.file_offset, r.destination_size,
+            r.destination, r.intermediate_size, r.name ? r.name : "");
     }
     if ((n & 4095) == 0) {
         LOG_I("dstorage", "%ld requests (%lld MiB): zlib %ld, bcpack %ld, swizzle %ld, physical pages %ld", n,

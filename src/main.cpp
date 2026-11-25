@@ -9,6 +9,9 @@
 //   --model=MODEL      console to present as: series-x (default) or series-s
 //   --dump-threads-after=N   log every thread's backtrace every N seconds (hang diagnosis)
 //   --watch-write=SPEC       log every write to an 8-byte location ("module.dll+0xRVA" or "0xADDR")
+//   --trace-exec=SPEC[,...]  log registers when up to three code locations run
+//                            (SLUDGE_TRACE_SKIP=N skips the first N hits, SLUDGE_TRACE_DUMP=BYTES
+//                            also dumps memory at pointer registers)
 
 #include <windows.h>
 #include <shellapi.h>
@@ -36,6 +39,7 @@ struct Options {
     ConsoleModel model;
     u32 dump_threads_after;
     char watch_write[128];
+    char trace_exec[256];
     LogLevel log_level;
     const wchar_t* title_path;
     wchar_t title_args[4096];
@@ -76,6 +80,8 @@ static bool parse_options(int argc, wchar_t** argv, Options* opt) {
             opt->dump_threads_after = (u32)_wtoi(a + 21);
         } else if (wcsncmp(a, L"--watch-write=", 14) == 0) {
             str_to_narrow(opt->watch_write, sizeof(opt->watch_write), a + 14);
+        } else if (wcsncmp(a, L"--trace-exec=", 13) == 0) {
+            str_to_narrow(opt->trace_exec, sizeof(opt->trace_exec), a + 13);
         } else if (wcsncmp(a, L"--log-level=", 12) == 0) {
             const wchar_t* l = a + 12;
             if (str_ieq_w(l, L"trace"))
@@ -184,6 +190,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
     LocalFree(argv);
     if (opt.watch_write[0] && !watch_early)
         crash_arm_write_watch(opt.watch_write);
+    if (opt.trace_exec[0])
+        crash_arm_exec_trace(opt.trace_exec);
 
     g_loader.run_main();
 }
