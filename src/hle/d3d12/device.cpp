@@ -139,8 +139,8 @@ static HRESULT WINAPI device_create_placed_resource_x1(ConsoleDevice* self, D3D1
 // Struct returns through a hidden pointer. Several resources are laid out one after another, each
 // at its own alignment; the 1/2 versions also report where each one goes.
 static D3D12_RESOURCE_ALLOCATION_INFO layout_resources(UINT count, const D3D12_RESOURCE_DESC1* descs1,
-                                                      const D3D12_RESOURCE_DESC* descs,
-                                                      D3D12_RESOURCE_ALLOCATION_INFO1* each) {
+                                                       const D3D12_RESOURCE_DESC* descs,
+                                                       D3D12_RESOURCE_ALLOCATION_INFO1* each) {
     u64 size = 0, alignment = 0;
     for (UINT i = 0; i < count; i++) {
         D3D12_RESOURCE_DESC1 d = descs1 ? descs1[i] : console_desc1_from_desc(descs[i]);
@@ -179,7 +179,8 @@ static D3D12_RESOURCE_ALLOCATION_INFO* WINAPI device_get_resource_allocation_inf
 
 static HRESULT WINAPI device_create_committed_resource(ConsoleDevice* self, const D3D12_HEAP_PROPERTIES* heap,
                                                        D3D12_HEAP_FLAGS heap_flags,
-                                                       const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES state,
+                                                       const D3D12_RESOURCE_DESC* desc,
+                                                       D3D12_RESOURCE_STATES state,
                                                        const D3D12_CLEAR_VALUE* clear, REFIID iid,
                                                        void** out) {
     if (!desc)

@@ -1,16 +1,24 @@
 // Console ID3D12GraphicsCommandList (direct, compute, copy and bundle lists share the class):
-// lifetime, barriers and pipeline state.
+// lifetime, splitting, barriers and state.
 //
 // The console class can write command packets inline, straight into its command buffer, when the
 // put buffer's limit pointers leave room. We keep every limit null, so the title's inlined methods
 // always take their fallback path through the function table, and the whole recording arrives
 // here at API level, where it's recorded onto a desktop command list as it comes.
+//
+// Console command lists can signal and wait on fences in GPU memory mid-list. Desktop queues only
+// signal and wait between command lists, so a console list is a series of desktop lists (segments)
+// with a fence operation between each two, run in order at submission. Every segment after the
+// first starts with the state the list had set (ListState).
 
 #include "hle/d3d12/command_list.h"
 
 #include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include "common/log.h"
+#include "gpu/gpu.h"
 #include "hle/d3d12/barriers.h"
 #include "hle/d3d12/console_iids.h"
 #include "hle/d3d12/d3d12_tables.h"
@@ -40,16 +48,18 @@ static const GUID* const k_list_iids[] = {
     &__uuidof(ID3D12GraphicsCommandList8),
 };
 
+static void list_destroy(void* object);
+
 static const ConsoleClass k_list_class = {"ID3D12GraphicsCommandList", k_list_iids, ARRAY_COUNT(k_list_iids),
-                                          nullptr};
+                                          list_destroy};
 
 static void* const* g_list_table = nullptr;
 
 // --- shared helpers ----------------------------------------------------------------------------------
 
 bool list_gpu_descriptor(const ConsoleCommandList* list, u64 handle, D3D12_GPU_DESCRIPTOR_HANDLE* out) {
-    for (u32 i = 0; i < ARRAY_COUNT(list->heaps); i++) {
-        const ConsoleDescriptorHeap* heap = list->heaps[i];
+    for (u32 i = 0; i < ARRAY_COUNT(list->state.heaps); i++) {
+        const ConsoleDescriptorHeap* heap = list->state.heaps[i];
         if (!heap || handle < (u64)heap->memory)
             continue;
         u64 index = (handle - (u64)heap->memory) / heap->stride;
@@ -85,13 +95,153 @@ static u64 desktop_address(u64 address, u64 size) {
     return out;
 }
 
+// --- state -------------------------------------------------------------------------------------------
+
+static void apply_root_args(ID3D12GraphicsCommandList8* l, const RootArgs& args, bool graphics) {
+    if (!args.signature)
+        return;
+    if (graphics)
+        l->SetGraphicsRootSignature(args.signature->desktop);
+    else
+        l->SetComputeRootSignature(args.signature->desktop);
+    const D3D12_ROOT_SIGNATURE_DESC1* desc = args.signature->desc;
+    for (u32 i = 0; i < desc->NumParameters && i < ROOT_MAX_PARAMETERS; i++) {
+        u64 v = args.value[i];
+        switch (args.kind[i]) {
+        case ROOT_ARG_NONE:
+            break;
+        case ROOT_ARG_TABLE:
+            graphics ? l->SetGraphicsRootDescriptorTable(i, {v}) : l->SetComputeRootDescriptorTable(i, {v});
+            break;
+        case ROOT_ARG_CONSTANTS: {
+            u32 count = desc->pParameters[i].Constants.Num32BitValues;
+            const u32* values = &args.constants[args.signature->constant_offset[i]];
+            graphics ? l->SetGraphicsRoot32BitConstants(i, count, values, 0)
+                     : l->SetComputeRoot32BitConstants(i, count, values, 0);
+            break;
+        }
+        case ROOT_ARG_CBV:
+            graphics ? l->SetGraphicsRootConstantBufferView(i, v) : l->SetComputeRootConstantBufferView(i, v);
+            break;
+        case ROOT_ARG_SRV:
+            graphics ? l->SetGraphicsRootShaderResourceView(i, v) : l->SetComputeRootShaderResourceView(i, v);
+            break;
+        case ROOT_ARG_UAV:
+            graphics ? l->SetGraphicsRootUnorderedAccessView(i, v)
+                     : l->SetComputeRootUnorderedAccessView(i, v);
+            break;
+        }
+    }
+}
+
+// Sets everything the list had set on a fresh desktop list.
+static void apply_state(ConsoleCommandList* self) {
+    const ListState& s = self->state;
+    ID3D12GraphicsCommandList8* l = self->desktop;
+    if (self->type == D3D12_COMMAND_LIST_TYPE_COPY)
+        return;
+    ID3D12DescriptorHeap* heaps[2];
+    u32 heap_count = 0;
+    for (u32 i = 0; i < 2; i++)
+        if (s.heaps[i])
+            heaps[heap_count++] = s.heaps[i]->visible;
+    if (heap_count)
+        l->SetDescriptorHeaps(heap_count, heaps);
+    if (s.pipeline)
+        l->SetPipelineState(s.pipeline);
+    apply_root_args(l, s.compute, false);
+    if (s.predication)
+        l->SetPredication(s.predication, s.predication_offset, s.predication_op);
+    if (self->type != D3D12_COMMAND_LIST_TYPE_DIRECT)
+        return;
+    apply_root_args(l, s.graphics, true);
+    if (s.topology != D3D_PRIMITIVE_TOPOLOGY_UNDEFINED)
+        l->IASetPrimitiveTopology(s.topology);
+    for (u32 i = 0; i < D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT; i++)
+        if (s.vertex_buffer_mask & (1u << i))
+            l->IASetVertexBuffers(i, 1, &s.vertex_buffers[i]);
+    if (s.has_index_buffer)
+        l->IASetIndexBuffer(&s.index_buffer);
+    if (s.viewport_count)
+        l->RSSetViewports(s.viewport_count, s.viewports);
+    if (s.scissor_count)
+        l->RSSetScissorRects(s.scissor_count, s.scissors);
+    if (s.has_targets)
+        l->OMSetRenderTargets(s.render_target_count, s.render_target_count ? s.render_targets : nullptr,
+                              FALSE, s.has_depth ? &s.depth : nullptr);
+    if (s.has_blend_factor)
+        l->OMSetBlendFactor(s.blend_factor);
+    if (s.has_stencil_ref)
+        l->OMSetFrontAndBackStencilRef(s.stencil_front, s.stencil_back);
+    if (s.has_depth_bounds)
+        l->OMSetDepthBounds(s.depth_min, s.depth_max);
+}
+
+// --- segments ----------------------------------------------------------------------------------------
+
+// Starts recording segment `index` on the list's allocator: a new desktop list, or a closed one
+// from an earlier recording reset onto the allocator.
+static HRESULT begin_segment(ConsoleCommandList* self, u32 index) {
+    if (index == self->segment_capacity) {
+        u32 capacity = self->segment_capacity ? self->segment_capacity * 2 : 2;
+        ListSegment* grown = (ListSegment*)realloc(self->segments, capacity * sizeof(ListSegment));
+        if (!grown)
+            return E_OUTOFMEMORY;
+        memset(grown + self->segment_capacity, 0, (capacity - self->segment_capacity) * sizeof(ListSegment));
+        self->segments = grown;
+        self->segment_capacity = capacity;
+    }
+    ListSegment& seg = self->segments[index];
+    HRESULT hr;
+    if (seg.list)
+        hr = seg.list->Reset(self->allocator->desktop, nullptr);
+    else
+        hr = self->device->CreateCommandList(0, self->type, self->allocator->desktop, nullptr,
+                                             IID_PPV_ARGS(&seg.list));
+    if (FAILED(hr)) {
+        LOG_E("d3d12", "cannot start part %u of a command list (0x%08lx)", index, (unsigned long)hr);
+        return hr;
+    }
+    seg.fence = nullptr;
+    self->desktop = seg.list;
+    self->segment_count = index + 1;
+    return S_OK;
+}
+
+static void release_segment_fences(ConsoleCommandList* self) {
+    for (u32 i = 0; i < self->segment_count; i++) {
+        if (self->segments[i].fence)
+            self->segments[i].fence->Release();
+        self->segments[i].fence = nullptr;
+    }
+}
+
+bool list_split(ConsoleCommandList* self, ListSyncKind sync, ID3D12Fence* fence, u64 value) {
+    if (!self->recording)
+        return false;
+    fence->AddRef();
+    self->desktop->Close();
+    ListSegment& seg = self->segments[self->segment_count - 1];
+    seg.sync = sync;
+    seg.fence = fence;
+    seg.value = value;
+    if (FAILED(begin_segment(self, self->segment_count))) {
+        // Keep recording somewhere: the rest of the list goes nowhere, as after a failed Reset.
+        self->recording = false;
+        return false;
+    }
+    apply_state(self);
+    return true;
+}
+
 // --- lifetime ----------------------------------------------------------------------------------------
 
-static void reset_state(ConsoleCommandList* self) {
-    self->recording = true;
-    self->pipeline_bound = false;
-    self->heaps[0] = nullptr;
-    self->heaps[1] = nullptr;
+static void list_destroy(void* object) {
+    ConsoleCommandList* self = (ConsoleCommandList*)object;
+    release_segment_fences(self);
+    for (u32 i = 0; i < self->segment_capacity; i++)
+        gpu_retire(self->segments[i].list);
+    free(self->segments);
 }
 
 static ID3D12PipelineState* desktop_pso(void* console_pso) {
@@ -105,6 +255,8 @@ static D3D12_COMMAND_LIST_TYPE WINAPI list_get_type(ConsoleCommandList* self) {
 }
 
 static HRESULT WINAPI list_close(ConsoleCommandList* self) {
+    if (!self->recording)
+        return E_FAIL;
     self->recording = false;
     HRESULT hr = self->desktop->Close();
     if (FAILED(hr))
@@ -120,14 +272,14 @@ static HRESULT WINAPI list_reset_x(ConsoleCommandList* self, ConsoleCommandAlloc
     // allows once it's closed.
     if (self->recording)
         self->desktop->Close();
-    HRESULT hr = self->desktop->Reset(allocator->desktop, desktop_pso(initial_state));
-    if (FAILED(hr)) {
-        LOG_E("d3d12", "command list Reset failed (0x%08lx)", (unsigned long)hr);
-        return hr;
-    }
-    reset_state(self);
+    release_segment_fences(self);
+    memset(&self->state, 0, sizeof(self->state));
+    self->allocator = allocator;
+    HRESULT hr = begin_segment(self, 0);
+    self->recording = SUCCEEDED(hr);
+    desktop_pso(initial_state);
     (void)flags; // sync and state-minimizing hints for the console command processor
-    return S_OK;
+    return hr;
 }
 
 static HRESULT WINAPI list_reset(ConsoleCommandList* self, ConsoleCommandAllocator* allocator,
@@ -137,9 +289,7 @@ static HRESULT WINAPI list_reset(ConsoleCommandList* self, ConsoleCommandAllocat
 
 static void WINAPI list_clear_state(ConsoleCommandList* self, void* pso) {
     self->desktop->ClearState(desktop_pso(pso));
-    self->pipeline_bound = false;
-    self->heaps[0] = nullptr;
-    self->heaps[1] = nullptr;
+    memset(&self->state, 0, sizeof(self->state));
 }
 
 // --- barriers and synchronization --------------------------------------------------------------------
@@ -170,177 +320,280 @@ static void WINAPI list_flush_pipeline_x(ConsoleCommandList* self, UINT, UINT64,
     console_record_full_barrier(self->desktop);
 }
 
+// The GPU waits until a value in memory compares as asked. Titles wait for counters (fences
+// included) to reach a value, which is a wait on the desktop fence following the counter; other
+// waits have no desktop equivalent.
+static void wait_value(ConsoleCommandList* self, u64 address, D3D12_COMPARISON_FUNC func, u64 value,
+                       u64 mask) {
+    ID3D12Fence* fence = mask == UINT64_MAX ? console_sync_fence(address) : nullptr;
+    if (!fence || (func != D3D12_COMPARISON_FUNC_GREATER_EQUAL && func != D3D12_COMPARISON_FUNC_GREATER)) {
+        LOG_W_ONCE("d3d12", "GPU wait on 0x%llx (comparison %d, mask 0x%llx) is not supported; skipped",
+                   address, func, mask);
+        return;
+    }
+    list_split(self, LIST_SYNC_WAIT, fence, func == D3D12_COMPARISON_FUNC_GREATER ? value + 1 : value);
+}
+
+static void WINAPI list_wait_32bit_value_x(ConsoleCommandList* self, UINT64 address,
+                                           D3D12_COMPARISON_FUNC func, UINT value, UINT mask, UINT) {
+    wait_value(self, address, func, value, mask == UINT32_MAX ? UINT64_MAX : mask);
+}
+
+static void WINAPI list_wait_64bit_value_x(ConsoleCommandList* self, UINT64 address,
+                                           D3D12_COMPARISON_FUNC func, UINT64 value, UINT) {
+    wait_value(self, address, func, value, UINT64_MAX);
+}
+
 // --- pipeline state and root arguments ---------------------------------------------------------------
 
 static void WINAPI list_set_pipeline_state(ConsoleCommandList* self, void* pso) {
     if (pso)
         LOG_W_ONCE("d3d12", "SetPipelineState: pipeline states are not translated yet; draws and dispatches "
                             "are skipped");
-    self->pipeline_bound = false;
+    self->state.pipeline = nullptr;
 }
 
 static void WINAPI list_set_descriptor_heaps(ConsoleCommandList* self, UINT count,
                                              ConsoleDescriptorHeap** heaps) {
     ID3D12DescriptorHeap* desktop[2];
     u32 n = 0;
-    self->heaps[0] = nullptr;
-    self->heaps[1] = nullptr;
+    self->state.heaps[0] = nullptr;
+    self->state.heaps[1] = nullptr;
     for (UINT i = 0; i < count && n < 2; i++) {
         ConsoleDescriptorHeap* heap = heaps[i];
         if (!heap || !heap->visible)
             continue;
-        self->heaps[heap->desktop_type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER ? 1 : 0] = heap;
+        self->state.heaps[heap->desktop_type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER ? 1 : 0] = heap;
         desktop[n++] = heap->visible;
     }
     self->desktop->SetDescriptorHeaps(n, desktop);
 }
 
-static ID3D12RootSignature* desktop_root_signature(void* root_signature) {
-    return root_signature ? ((ConsoleRootSignature*)root_signature)->desktop : nullptr;
+// A new root signature drops the arguments set for the old one.
+static void set_root_signature(RootArgs* args, ConsoleRootSignature* signature) {
+    if (args->signature != signature)
+        memset(args->kind, ROOT_ARG_NONE, sizeof(args->kind));
+    args->signature = signature;
 }
 
-static void WINAPI list_set_compute_root_signature(ConsoleCommandList* self, void* root_signature) {
-    self->desktop->SetComputeRootSignature(desktop_root_signature(root_signature));
+static void WINAPI list_set_compute_root_signature(ConsoleCommandList* self,
+                                                   ConsoleRootSignature* signature) {
+    set_root_signature(&self->state.compute, signature);
+    self->desktop->SetComputeRootSignature(signature ? signature->desktop : nullptr);
 }
 
-static void WINAPI list_set_graphics_root_signature(ConsoleCommandList* self, void* root_signature) {
-    self->desktop->SetGraphicsRootSignature(desktop_root_signature(root_signature));
+static void WINAPI list_set_graphics_root_signature(ConsoleCommandList* self,
+                                                    ConsoleRootSignature* signature) {
+    set_root_signature(&self->state.graphics, signature);
+    self->desktop->SetGraphicsRootSignature(signature ? signature->desktop : nullptr);
+}
+
+static bool record_root_arg(RootArgs* args, UINT index, RootArgKind kind, u64 value) {
+    if (index >= ROOT_MAX_PARAMETERS)
+        return false;
+    args->kind[index] = kind;
+    args->value[index] = value;
+    return true;
+}
+
+// Root constants are kept at their parameter's place among all of the signature's constants.
+static bool record_root_constants(RootArgs* args, UINT index, UINT count, const void* values, UINT offset) {
+    if (!args->signature || index >= ROOT_MAX_PARAMETERS)
+        return false;
+    u32 start = args->signature->constant_offset[index] + offset;
+    if (start + count > ARRAY_COUNT(args->constants))
+        return false;
+    memcpy(&args->constants[start], values, count * sizeof(u32));
+    args->kind[index] = ROOT_ARG_CONSTANTS;
+    return true;
 }
 
 static void WINAPI list_set_compute_root_descriptor_table(ConsoleCommandList* self, UINT index,
                                                           D3D12_GPU_DESCRIPTOR_HANDLE table) {
     D3D12_GPU_DESCRIPTOR_HANDLE d;
-    if (list_gpu_descriptor(self, table.ptr, &d))
+    if (list_gpu_descriptor(self, table.ptr, &d) &&
+        record_root_arg(&self->state.compute, index, ROOT_ARG_TABLE, d.ptr))
         self->desktop->SetComputeRootDescriptorTable(index, d);
 }
 
 static void WINAPI list_set_graphics_root_descriptor_table(ConsoleCommandList* self, UINT index,
                                                            D3D12_GPU_DESCRIPTOR_HANDLE table) {
     D3D12_GPU_DESCRIPTOR_HANDLE d;
-    if (list_gpu_descriptor(self, table.ptr, &d))
+    if (list_gpu_descriptor(self, table.ptr, &d) &&
+        record_root_arg(&self->state.graphics, index, ROOT_ARG_TABLE, d.ptr))
         self->desktop->SetGraphicsRootDescriptorTable(index, d);
 }
 
 static void WINAPI list_set_compute_root_32bit_constant(ConsoleCommandList* self, UINT index, UINT value,
                                                         UINT offset) {
-    self->desktop->SetComputeRoot32BitConstant(index, value, offset);
+    if (record_root_constants(&self->state.compute, index, 1, &value, offset))
+        self->desktop->SetComputeRoot32BitConstant(index, value, offset);
 }
 
 static void WINAPI list_set_graphics_root_32bit_constant(ConsoleCommandList* self, UINT index, UINT value,
                                                          UINT offset) {
-    self->desktop->SetGraphicsRoot32BitConstant(index, value, offset);
+    if (record_root_constants(&self->state.graphics, index, 1, &value, offset))
+        self->desktop->SetGraphicsRoot32BitConstant(index, value, offset);
 }
 
 static void WINAPI list_set_compute_root_32bit_constants(ConsoleCommandList* self, UINT index, UINT count,
                                                          const void* values, UINT offset) {
-    self->desktop->SetComputeRoot32BitConstants(index, count, values, offset);
+    if (record_root_constants(&self->state.compute, index, count, values, offset))
+        self->desktop->SetComputeRoot32BitConstants(index, count, values, offset);
 }
 
 static void WINAPI list_set_graphics_root_32bit_constants(ConsoleCommandList* self, UINT index, UINT count,
                                                           const void* values, UINT offset) {
-    self->desktop->SetGraphicsRoot32BitConstants(index, count, values, offset);
+    if (record_root_constants(&self->state.graphics, index, count, values, offset))
+        self->desktop->SetGraphicsRoot32BitConstants(index, count, values, offset);
 }
 
 static void WINAPI list_set_compute_root_cbv(ConsoleCommandList* self, UINT index, UINT64 address) {
-    self->desktop->SetComputeRootConstantBufferView(index, desktop_address(address, 0));
+    u64 a = desktop_address(address, 0);
+    if (record_root_arg(&self->state.compute, index, ROOT_ARG_CBV, a))
+        self->desktop->SetComputeRootConstantBufferView(index, a);
 }
 
 static void WINAPI list_set_graphics_root_cbv(ConsoleCommandList* self, UINT index, UINT64 address) {
-    self->desktop->SetGraphicsRootConstantBufferView(index, desktop_address(address, 0));
+    u64 a = desktop_address(address, 0);
+    if (record_root_arg(&self->state.graphics, index, ROOT_ARG_CBV, a))
+        self->desktop->SetGraphicsRootConstantBufferView(index, a);
 }
 
 static void WINAPI list_set_compute_root_srv(ConsoleCommandList* self, UINT index, UINT64 address) {
-    self->desktop->SetComputeRootShaderResourceView(index, desktop_address(address, 0));
+    u64 a = desktop_address(address, 0);
+    if (record_root_arg(&self->state.compute, index, ROOT_ARG_SRV, a))
+        self->desktop->SetComputeRootShaderResourceView(index, a);
 }
 
 static void WINAPI list_set_graphics_root_srv(ConsoleCommandList* self, UINT index, UINT64 address) {
-    self->desktop->SetGraphicsRootShaderResourceView(index, desktop_address(address, 0));
+    u64 a = desktop_address(address, 0);
+    if (record_root_arg(&self->state.graphics, index, ROOT_ARG_SRV, a))
+        self->desktop->SetGraphicsRootShaderResourceView(index, a);
 }
 
 static void WINAPI list_set_compute_root_uav(ConsoleCommandList* self, UINT index, UINT64 address) {
-    self->desktop->SetComputeRootUnorderedAccessView(index, desktop_address(address, 0));
+    u64 a = desktop_address(address, 0);
+    if (record_root_arg(&self->state.compute, index, ROOT_ARG_UAV, a))
+        self->desktop->SetComputeRootUnorderedAccessView(index, a);
 }
 
 static void WINAPI list_set_graphics_root_uav(ConsoleCommandList* self, UINT index, UINT64 address) {
-    self->desktop->SetGraphicsRootUnorderedAccessView(index, desktop_address(address, 0));
+    u64 a = desktop_address(address, 0);
+    if (record_root_arg(&self->state.graphics, index, ROOT_ARG_UAV, a))
+        self->desktop->SetGraphicsRootUnorderedAccessView(index, a);
 }
 
 // --- input assembly, rasterizer and output merger ----------------------------------------------------
 
 static void WINAPI list_ia_set_primitive_topology(ConsoleCommandList* self,
                                                   D3D12_PRIMITIVE_TOPOLOGY topology) {
+    self->state.topology = topology;
     self->desktop->IASetPrimitiveTopology(topology);
 }
 
 static void WINAPI list_ia_set_index_buffer(ConsoleCommandList* self, const D3D12_INDEX_BUFFER_VIEW* view) {
+    ListState& s = self->state;
+    s.has_index_buffer = view != nullptr;
     if (!view) {
         self->desktop->IASetIndexBuffer(nullptr);
         return;
     }
-    D3D12_INDEX_BUFFER_VIEW v = *view;
-    v.BufferLocation = desktop_address(v.BufferLocation, v.SizeInBytes);
-    self->desktop->IASetIndexBuffer(&v);
+    s.index_buffer = *view;
+    s.index_buffer.BufferLocation = desktop_address(view->BufferLocation, view->SizeInBytes);
+    self->desktop->IASetIndexBuffer(&s.index_buffer);
 }
 
 static void WINAPI list_ia_set_vertex_buffers(ConsoleCommandList* self, UINT start, UINT count,
                                               const D3D12_VERTEX_BUFFER_VIEW* views) {
-    D3D12_VERTEX_BUFFER_VIEW v[D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT];
-    if (!views || start >= ARRAY_COUNT(v)) {
-        self->desktop->IASetVertexBuffers(start, count, nullptr);
+    ListState& s = self->state;
+    if (start >= ARRAY_COUNT(s.vertex_buffers))
         return;
-    }
-    if (count > ARRAY_COUNT(v) - start)
-        count = ARRAY_COUNT(v) - start;
+    if (count > ARRAY_COUNT(s.vertex_buffers) - start)
+        count = ARRAY_COUNT(s.vertex_buffers) - start;
     for (UINT i = 0; i < count; i++) {
-        v[i] = views[i];
-        v[i].BufferLocation = desktop_address(v[i].BufferLocation, v[i].SizeInBytes);
+        D3D12_VERTEX_BUFFER_VIEW& v = s.vertex_buffers[start + i];
+        if (views) {
+            v = views[i];
+            v.BufferLocation = desktop_address(v.BufferLocation, v.SizeInBytes);
+            s.vertex_buffer_mask |= 1u << (start + i);
+        } else {
+            v = {};
+            s.vertex_buffer_mask &= ~(1u << (start + i));
+        }
     }
-    self->desktop->IASetVertexBuffers(start, count, v);
+    self->desktop->IASetVertexBuffers(start, count, views ? &s.vertex_buffers[start] : nullptr);
 }
 
 static void WINAPI list_rs_set_viewports(ConsoleCommandList* self, UINT count,
                                          const D3D12_VIEWPORT* viewports) {
-    self->desktop->RSSetViewports(count, viewports);
+    ListState& s = self->state;
+    s.viewport_count = count < ARRAY_COUNT(s.viewports) ? count : ARRAY_COUNT(s.viewports);
+    memcpy(s.viewports, viewports, s.viewport_count * sizeof(D3D12_VIEWPORT));
+    self->desktop->RSSetViewports(s.viewport_count, s.viewports);
 }
 
 static void WINAPI list_rs_set_scissor_rects(ConsoleCommandList* self, UINT count, const D3D12_RECT* rects) {
-    self->desktop->RSSetScissorRects(count, rects);
+    ListState& s = self->state;
+    s.scissor_count = count < ARRAY_COUNT(s.scissors) ? count : ARRAY_COUNT(s.scissors);
+    memcpy(s.scissors, rects, s.scissor_count * sizeof(D3D12_RECT));
+    self->desktop->RSSetScissorRects(s.scissor_count, s.scissors);
 }
 
 static void WINAPI list_om_set_blend_factor(ConsoleCommandList* self, const FLOAT factor[4]) {
-    self->desktop->OMSetBlendFactor(factor);
-}
-
-static void WINAPI list_om_set_stencil_ref(ConsoleCommandList* self, UINT ref) {
-    self->desktop->OMSetStencilRef(ref);
+    ListState& s = self->state;
+    static const f32 k_default[4] = {1.0f, 1.0f, 1.0f, 1.0f}; // what a null factor means
+    memcpy(s.blend_factor, factor ? factor : k_default, sizeof(s.blend_factor));
+    s.has_blend_factor = true;
+    self->desktop->OMSetBlendFactor(s.blend_factor);
 }
 
 static void WINAPI list_om_set_front_and_back_stencil_ref(ConsoleCommandList* self, UINT front, UINT back) {
+    ListState& s = self->state;
+    s.stencil_front = front;
+    s.stencil_back = back;
+    s.has_stencil_ref = true;
     self->desktop->OMSetFrontAndBackStencilRef(front, back);
 }
 
+static void WINAPI list_om_set_stencil_ref(ConsoleCommandList* self, UINT ref) {
+    list_om_set_front_and_back_stencil_ref(self, ref, ref);
+}
+
 static void WINAPI list_om_set_depth_bounds(ConsoleCommandList* self, FLOAT min, FLOAT max) {
+    ListState& s = self->state;
+    s.depth_min = min;
+    s.depth_max = max;
+    s.has_depth_bounds = true;
     self->desktop->OMSetDepthBounds(min, max);
 }
 
 static void WINAPI list_om_set_render_targets(ConsoleCommandList* self, UINT count,
                                               const D3D12_CPU_DESCRIPTOR_HANDLE* targets, BOOL single_range,
                                               const D3D12_CPU_DESCRIPTOR_HANDLE* depth) {
-    D3D12_CPU_DESCRIPTOR_HANDLE rt[D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT];
-    D3D12_CPU_DESCRIPTOR_HANDLE ds;
-    if (count > ARRAY_COUNT(rt))
-        count = ARRAY_COUNT(rt);
+    ListState& s = self->state;
+    if (count > ARRAY_COUNT(s.render_targets))
+        count = ARRAY_COUNT(s.render_targets);
+    // Console descriptors are 1:1 with desktop ones, so a range stays a range; each target is
+    // kept on its own for reapplying.
+    D3D12_CPU_DESCRIPTOR_HANDLE first;
     if (count && single_range) {
-        if (!list_cpu_descriptor(targets[0].ptr, count, &rt[0]))
+        DescriptorSlot slot;
+        if (!console_descriptor_slots(targets[0].ptr, count, &slot))
             return;
+        first = slot.cpu;
+        for (UINT i = 0; i < count; i++)
+            s.render_targets[i].ptr = first.ptr + i * slot.desktop_stride;
     } else {
         for (UINT i = 0; i < count; i++)
-            if (!list_cpu_descriptor(targets[i].ptr, 1, &rt[i]))
+            if (!list_cpu_descriptor(targets[i].ptr, 1, &s.render_targets[i]))
                 return;
     }
-    if (depth && !list_cpu_descriptor(depth->ptr, 1, &ds))
-        return;
-    self->desktop->OMSetRenderTargets(count, count ? rt : nullptr, single_range, depth ? &ds : nullptr);
+    s.has_depth = depth && list_cpu_descriptor(depth->ptr, 1, &s.depth);
+    s.render_target_count = count;
+    s.has_targets = true;
+    self->desktop->OMSetRenderTargets(count, count ? s.render_targets : nullptr, FALSE,
+                                      s.has_depth ? &s.depth : nullptr);
 }
 
 // --- debug markers -----------------------------------------------------------------------------------
@@ -393,6 +646,8 @@ static const ConsoleEntry k_list_impl[] = {
     CONSOLE_ENTRY(58, list_end_event),
     CONSOLE_ENTRY(69, list_flush_pipeline_x),
     CONSOLE_ENTRY(70, list_om_set_depth_bounds),
+    CONSOLE_ENTRY(73, list_wait_32bit_value_x),
+    CONSOLE_ENTRY(74, list_wait_64bit_value_x),
     CONSOLE_ENTRY(109, list_om_set_depth_bounds),
     CONSOLE_ENTRY(131, list_sync_x),
     CONSOLE_ENTRY(132, list_sync_x),
@@ -424,19 +679,21 @@ HRESULT console_create_command_list(ConsoleDevice* device, const ConsoleCommandL
         LOG_E("d3d12", "CreateCommandListX: list type %d not supported yet", desc->type);
         return E_NOTIMPL;
     }
+    desktop_pso(initial_state);
 
-    ID3D12GraphicsCommandList8* desktop = nullptr;
-    HRESULT hr = device->desktop->CreateCommandList(0, desc->type, allocator->desktop,
-                                                    desktop_pso(initial_state), IID_PPV_ARGS(&desktop));
+    // The segments own the desktop lists, so the object itself has no desktop counterpart.
+    ConsoleCommandList* list =
+        (ConsoleCommandList*)console_alloc(sizeof(ConsoleCommandList), &k_list_class, g_list_table, nullptr);
+    list->type = desc->type;
+    list->device = device->desktop;
+    list->allocator = allocator;
+    HRESULT hr = begin_segment(list, 0);
     LOG_D("d3d12", "CreateCommandListX(type %d, flags 0x%x, barrier batch %u) -> 0x%08lx", desc->type,
           desc->flags, desc->resource_barrier_batch_size, (unsigned long)hr);
-    if (FAILED(hr))
+    if (FAILED(hr)) {
+        console_release(list);
         return hr;
-
-    ConsoleCommandList* list =
-        (ConsoleCommandList*)console_alloc(sizeof(ConsoleCommandList), &k_list_class, g_list_table, desktop);
-    list->type = desc->type;
-    list->desktop = desktop;
-    reset_state(list);
+    }
+    list->recording = true;
     return console_return(list, iid, out);
 }

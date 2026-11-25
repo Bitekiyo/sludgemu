@@ -14,5 +14,9 @@ bool list_cpu_descriptor(u64 handle, u32 count, D3D12_CPU_DESCRIPTOR_HANDLE* out
 // The desktop resource behind a console resource and where the console resource starts in it.
 ID3D12Resource* list_resource(void* console_resource, u64* offset);
 
+// Ends the current desktop list and continues on a new one with the same state; `sync` happens
+// between the two on the queue. False (and the sync is lost) if the list can't be split.
+bool list_split(ConsoleCommandList* list, ListSyncKind sync, ID3D12Fence* fence, u64 value);
+
 extern const ConsoleEntry k_list_work_entries[];
 extern const u32 k_list_work_entry_count;

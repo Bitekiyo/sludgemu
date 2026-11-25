@@ -107,6 +107,13 @@ HRESULT console_create_root_signature(ConsoleDevice* device, const void* blob, u
     rs->desc = &desc->Desc_1_1;
     rs->deserializer = deserializer;
     rs->desktop = desktop;
+    u32 constants = 0;
+    for (u32 i = 0; i < rs->desc->NumParameters && i < ROOT_MAX_PARAMETERS; i++) {
+        const D3D12_ROOT_PARAMETER1& p = rs->desc->pParameters[i];
+        rs->constant_offset[i] = (u8)constants;
+        if (p.ParameterType == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS)
+            constants += p.Constants.Num32BitValues;
+    }
     LOG_D("d3d12", "root signature: %u parameters, %u static samplers, flags 0x%x", rs->desc->NumParameters,
           rs->desc->NumStaticSamplers, rs->desc->Flags);
     return console_return(rs, iid, out);

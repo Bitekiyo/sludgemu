@@ -20,29 +20,108 @@ static const ConsoleClass k_queue_class = {"ID3D12CommandQueue", k_queue_iids, A
 static void* const* g_queue_table = nullptr;
 
 static void queue_destroy(void* object) {
-    gpu_queue_unregister(((ConsoleCommandQueue*)object)->slot);
+    ConsoleCommandQueue* queue = (ConsoleCommandQueue*)object;
+    gpu_queue_unregister(queue->slot);
+    for (u32 i = 0; i < QUEUE_SIGNAL_WRITERS; i++) {
+        gpu_retire(queue->writers[i].list);
+        gpu_retire(queue->writers[i].allocator);
+    }
 }
 
 // Lists submitted per desktop call; longer submissions are split, which keeps their order.
 #define SUBMIT_BATCH 64
 
+struct SubmitBatch {
+    ID3D12CommandList* lists[SUBMIT_BATCH];
+    u32 count;
+};
+
+static void flush(ID3D12CommandQueue* queue, SubmitBatch* b) {
+    if (b->count)
+        queue->ExecuteCommandLists(b->count, b->lists);
+    b->count = 0;
+}
+
+// Each console list runs its parts in order, with the fence signals and waits between them.
 static void WINAPI queue_execute_command_lists(ConsoleCommandQueue* self, UINT count,
                                                ConsoleCommandList* const* lists) {
-    ID3D12CommandList* desktop[SUBMIT_BATCH];
-    u32 n = 0;
+    SubmitBatch b;
+    b.count = 0;
     for (UINT i = 0; i < count; i++) {
-        if (lists[i])
-            desktop[n++] = lists[i]->desktop;
-        if (n == SUBMIT_BATCH || (i + 1 == count && n)) {
-            self->desktop->ExecuteCommandLists(n, desktop);
-            n = 0;
+        ConsoleCommandList* list = lists[i];
+        if (!list)
+            continue;
+        for (u32 s = 0; s < list->segment_count; s++) {
+            const ListSegment& seg = list->segments[s];
+            if (b.count == SUBMIT_BATCH)
+                flush(self->desktop, &b);
+            b.lists[b.count++] = seg.list;
+            if (s + 1 == list->segment_count)
+                break;
+            flush(self->desktop, &b);
+            if (seg.sync == LIST_SYNC_SIGNAL)
+                self->desktop->Signal(seg.fence, seg.value);
+            else
+                self->desktop->Wait(seg.fence, seg.value);
         }
     }
+    flush(self->desktop, &b);
     gpu_queue_submitted(self->slot);
 }
 
+// The frame token and flags tie the work to console frame pacing.
+static void WINAPI queue_execute_command_lists_2x(ConsoleCommandQueue* self, UINT count,
+                                                  ConsoleCommandList* const* lists, UINT64, UINT) {
+    queue_execute_command_lists(self, count, lists);
+}
+
+// Title code polls fence values in memory, so a queue signal also writes the value there once the
+// queue's earlier work is done, from a small list run just before the desktop signal. Low half
+// first: a reader never sees a value ahead of its time.
+static void write_fence_value(ConsoleCommandQueue* self, ConsoleFence* fence, u64 value) {
+    if (!fence->value_desktop &&
+        !console_translate_gpu_address((u64)fence->value, sizeof(u64), &fence->value_desktop)) {
+        LOG_W_ONCE("d3d12", "fence value memory is not GPU-visible; queue signals won't update it");
+        return;
+    }
+    AcquireSRWLockExclusive(&self->writer_lock);
+    QueueSignalWriter& w = self->writers[self->next_writer];
+    self->next_writer = (self->next_writer + 1) % QUEUE_SIGNAL_WRITERS;
+    HRESULT hr;
+    if (!w.list) {
+        ID3D12Device13* device = gpu_device();
+        hr = device->CreateCommandAllocator(self->type, IID_PPV_ARGS(&w.allocator));
+        if (SUCCEEDED(hr))
+            hr = device->CreateCommandList(0, self->type, w.allocator, nullptr, IID_PPV_ARGS(&w.list));
+    } else {
+        gpu_queue_wait(self->slot, w.submission); // its allocator may still be in use
+        hr = w.allocator->Reset();
+        if (SUCCEEDED(hr))
+            hr = w.list->Reset(w.allocator, nullptr);
+    }
+    if (SUCCEEDED(hr)) {
+        D3D12_WRITEBUFFERIMMEDIATE_PARAMETER params[2] = {{fence->value_desktop, (u32)value},
+                                                          {fence->value_desktop + 4, (u32)(value >> 32)}};
+        D3D12_WRITEBUFFERIMMEDIATE_MODE modes[2] = {D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT,
+                                                    D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT};
+        w.list->WriteBufferImmediate(2, params, modes);
+        hr = w.list->Close();
+    }
+    if (SUCCEEDED(hr)) {
+        ID3D12CommandList* list = w.list;
+        self->desktop->ExecuteCommandLists(1, &list);
+        w.submission = gpu_queue_submitted(self->slot);
+    } else {
+        LOG_E("d3d12", "cannot write a fence value from the queue (0x%08lx)", (unsigned long)hr);
+    }
+    ReleaseSRWLockExclusive(&self->writer_lock);
+}
+
 static HRESULT WINAPI queue_signal(ConsoleCommandQueue* self, ConsoleFence* fence, UINT64 value) {
-    return fence ? self->desktop->Signal(fence->desktop, value) : E_INVALIDARG;
+    if (!fence)
+        return E_INVALIDARG;
+    write_fence_value(self, fence, value);
+    return self->desktop->Signal(fence->desktop, value);
 }
 
 // The flush flags pick which console caches to write back first; desktop signals see all
@@ -94,6 +173,7 @@ static const ConsoleEntry k_queue_impl[] = {
     CONSOLE_ENTRY(18, queue_get_timestamp_frequency),
     CONSOLE_ENTRY(19, queue_get_clock_calibration),
     CONSOLE_ENTRY(28, queue_get_desc),
+    CONSOLE_ENTRY(35, queue_execute_command_lists_2x),
 };
 
 void console_command_queue_init() {

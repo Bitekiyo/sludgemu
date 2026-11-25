@@ -25,7 +25,13 @@ IDXGIFactory6* gpu_factory();
 #define GPU_NO_QUEUE 0xffffffffu
 u32 gpu_queue_register(ID3D12CommandQueue* queue);
 void gpu_queue_unregister(u32 slot);
-void gpu_queue_submitted(u32 slot);
+u64 gpu_queue_submitted(u32 slot); // returns the submission's number
+
+// The number of the last submission the queue finished.
+u64 gpu_queue_completed(u32 slot);
+
+// Blocks until the queue finished submission `number`.
+void gpu_queue_wait(u32 slot, u64 number);
 
 // Releases a desktop object once no queue can still be using it: after every queue finished what
 // it had been given when the object was retired.

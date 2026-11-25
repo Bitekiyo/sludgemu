@@ -201,14 +201,40 @@ void gpu_queue_unregister(u32 slot) {
     q.fence->Release();
 }
 
-void gpu_queue_submitted(u32 slot) {
+u64 gpu_queue_submitted(u32 slot) {
     if (slot >= GPU_MAX_QUEUES)
-        return;
+        return 0;
     AcquireSRWLockExclusive(&g_submit_lock);
     GpuQueueSlot& q = g_queues[slot];
-    q.queue->Signal(q.fence, ++q.submitted);
+    u64 number = ++q.submitted;
+    q.queue->Signal(q.fence, number);
     collect_locked();
     ReleaseSRWLockExclusive(&g_submit_lock);
+    return number;
+}
+
+u64 gpu_queue_completed(u32 slot) {
+    if (slot >= GPU_MAX_QUEUES)
+        return 0;
+    AcquireSRWLockShared(&g_submit_lock);
+    u64 completed = g_queues[slot].fence ? g_queues[slot].fence->GetCompletedValue() : 0;
+    ReleaseSRWLockShared(&g_submit_lock);
+    return completed;
+}
+
+void gpu_queue_wait(u32 slot, u64 number) {
+    if (slot >= GPU_MAX_QUEUES)
+        return;
+    AcquireSRWLockShared(&g_submit_lock);
+    ID3D12Fence* fence = g_queues[slot].fence;
+    if (fence)
+        fence->AddRef();
+    ReleaseSRWLockShared(&g_submit_lock);
+    if (!fence)
+        return;
+    if (fence->GetCompletedValue() < number)
+        fence->SetEventOnCompletion(number, nullptr);
+    fence->Release();
 }
 
 void gpu_retire(IUnknown* object) {

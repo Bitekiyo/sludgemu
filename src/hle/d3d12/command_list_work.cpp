@@ -16,9 +16,9 @@ static D3D12_GPU_VIRTUAL_ADDRESS translate(u64 address, u64 size, GpuAddress* ou
 
 // Without a translated pipeline state there is nothing to run.
 static bool can_run(ConsoleCommandList* self) {
-    if (!self->pipeline_bound)
+    if (!self->state.pipeline)
         LOG_W_ONCE("d3d12", "draws and dispatches are skipped until pipeline states are translated");
-    return self->pipeline_bound;
+    return self->state.pipeline != nullptr;
 }
 
 static void WINAPI list_draw_instanced(ConsoleCommandList* self, UINT vertices, UINT instances,
@@ -209,15 +209,26 @@ static void write_values(ConsoleCommandList* self, u64 address, const u32* value
     self->desktop->WriteBufferImmediate(count, params, modes);
 }
 
+// A write once earlier work is done: how titles signal fences and counters from the GPU. The value
+// goes to memory for title code polling it, and 64-bit writes also signal the desktop fence
+// following the counter, for GPU waits on it: the list splits there and the queue signals in
+// between. The low half is written first, so a reader never sees a counter ahead of its value.
+static void write_bottom_of_pipe(ConsoleCommandList* self, u64 dst, u64 value, u32 words) {
+    u32 halves[2] = {(u32)value, (u32)(value >> 32)};
+    write_values(self, dst, halves, words, D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT);
+    ID3D12Fence* fence = words == 2 ? console_sync_fence(dst) : nullptr;
+    if (fence)
+        list_split(self, LIST_SYNC_SIGNAL, fence, value);
+}
+
 static void WINAPI list_write_32bit_bottom_of_pipe_x(ConsoleCommandList* self, UINT64 dst, UINT value, UINT,
                                                      UINT) {
-    write_values(self, dst, &value, 1, D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT);
+    write_bottom_of_pipe(self, dst, value, 1);
 }
 
 static void WINAPI list_write_64bit_bottom_of_pipe_x(ConsoleCommandList* self, UINT64 dst, UINT64 value, UINT,
                                                      UINT) {
-    u32 halves[2] = {(u32)value, (u32)(value >> 32)};
-    write_values(self, dst, halves, 2, D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT);
+    write_bottom_of_pipe(self, dst, value, 2);
 }
 
 static void WINAPI list_write_32bit_top_of_pipe_x(ConsoleCommandList* self, UINT64 dst, UINT value, UINT) {
@@ -285,9 +296,12 @@ static void WINAPI list_resolve_query_data(ConsoleCommandList* self, ConsoleQuer
 
 static void WINAPI list_set_predication(ConsoleCommandList* self, void* buffer, UINT64 offset,
                                         D3D12_PREDICATION_OP op) {
+    ListState& st = self->state;
     u64 base;
-    ID3D12Resource* b = list_resource(buffer, &base);
-    self->desktop->SetPredication(b, b ? base + offset : 0, op);
+    st.predication = list_resource(buffer, &base);
+    st.predication_offset = st.predication ? base + offset : 0;
+    st.predication_op = op;
+    self->desktop->SetPredication(st.predication, st.predication_offset, op);
 }
 
 const ConsoleEntry k_list_work_entries[] = {

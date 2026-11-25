@@ -33,24 +33,49 @@ struct ConsoleDevice {
     ID3D12Device13* desktop;
 };
 
+// Small desktop lists that write fence values to memory when the queue signals a fence.
+#define QUEUE_SIGNAL_WRITERS 4
+
+struct QueueSignalWriter {
+    ID3D12CommandAllocator* allocator;
+    ID3D12GraphicsCommandList8* list;
+    u64 submission; // the queue submission that last ran it
+};
+
 struct ConsoleCommandQueue {
     ConsoleObjectHeader header;
     D3D12_COMMAND_LIST_TYPE type;
 
     ID3D12CommandQueue* desktop;
     u32 slot; // submission tracking (gpu_queue_register)
+    SRWLOCK writer_lock;
+    u32 next_writer;
+    QueueSignalWriter writers[QUEUE_SIGNAL_WRITERS];
 };
 
+// Console fences also have a GPU address holding their value, which command lists write to signal
+// them and wait on. Command lists turn such writes and waits into desktop fence signals and waits
+// between the parts of a split list (see ConsoleCommandList).
 struct ConsoleFence {
     ConsoleObjectHeader header;
 
     ID3D12Fence1* desktop;
+    volatile u64* value; // GPU-visible title memory
+    u64 value_desktop;   // its desktop GPU address, once known
 };
+
+// The fence whose value lives at `address`, or nullptr.
+ConsoleFence* console_fence_at(u64 address);
+
+// The desktop fence that follows the 64-bit counter at title GPU address `address`: a console
+// fence's own, or one made on first use for memory the title writes and waits on from the GPU.
+// Borrowed; nullptr if the address isn't GPU-visible.
+ID3D12Fence* console_sync_fence(u64 address);
 
 // The allocation callback lets titles supply console command buffer memory. Recording goes to
 // desktop command lists instead, so it is kept but never called.
-typedef void* (*ConsoleAllocatorCallback)(void* allocator, void* list, u32 xmem_type, usize size, u32 alignment,
-                                          u32 flags, u64 context);
+typedef void* (*ConsoleAllocatorCallback)(void* allocator, void* list, u32 xmem_type, usize size,
+                                          u32 alignment, u32 flags, u64 context);
 
 struct ConsoleCommandAllocator {
     ConsoleObjectHeader header;
@@ -73,6 +98,72 @@ struct ConsolePutBuffer {
 };
 
 struct ConsoleDescriptorHeap;
+struct ConsoleRootSignature;
+struct ConsoleFence;
+
+// Root arguments as recorded on the desktop list (already translated).
+enum RootArgKind : u8 {
+    ROOT_ARG_NONE,
+    ROOT_ARG_TABLE,
+    ROOT_ARG_CONSTANTS,
+    ROOT_ARG_CBV,
+    ROOT_ARG_SRV,
+    ROOT_ARG_UAV,
+};
+
+struct RootArgs {
+    ConsoleRootSignature* signature;
+    RootArgKind kind[64];
+    u64 value[64];     // table handle or GPU address
+    u32 constants[64]; // root constants, at each parameter's constant_offset
+};
+
+// Everything a command list has set that later commands depend on. When a list is split, the new
+// desktop list starts from scratch and gets this state again.
+struct ListState {
+    ConsoleDescriptorHeap* heaps[2]; // bound shader-visible heaps: views, samplers
+    RootArgs graphics;
+    RootArgs compute;
+    ID3D12PipelineState* pipeline; // nullptr until pipeline states are translated
+    D3D12_PRIMITIVE_TOPOLOGY topology;
+    u32 vertex_buffer_mask;
+    D3D12_VERTEX_BUFFER_VIEW vertex_buffers[D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT];
+    bool has_index_buffer;
+    D3D12_INDEX_BUFFER_VIEW index_buffer;
+    u32 viewport_count;
+    D3D12_VIEWPORT viewports[D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+    u32 scissor_count;
+    D3D12_RECT scissors[D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+    bool has_targets;
+    u32 render_target_count;
+    D3D12_CPU_DESCRIPTOR_HANDLE render_targets[D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT];
+    bool has_depth;
+    D3D12_CPU_DESCRIPTOR_HANDLE depth;
+    bool has_blend_factor;
+    f32 blend_factor[4];
+    bool has_stencil_ref;
+    u32 stencil_front;
+    u32 stencil_back;
+    bool has_depth_bounds;
+    f32 depth_min;
+    f32 depth_max;
+    ID3D12Resource* predication;
+    u64 predication_offset;
+    D3D12_PREDICATION_OP predication_op;
+};
+
+// What happens on the queue between two parts of a split list.
+enum ListSyncKind : u8 {
+    LIST_SYNC_SIGNAL, // after the part before: signal the fence
+    LIST_SYNC_WAIT,   // before the part after: wait for the fence
+};
+
+struct ListSegment {
+    ID3D12GraphicsCommandList8* list;
+    ListSyncKind sync;  // between this part and the next (none after the last)
+    ID3D12Fence* fence; // referenced
+    u64 value;
+};
 
 struct ConsoleCommandList {
     ConsoleObjectHeader header;
@@ -83,10 +174,16 @@ struct ConsoleCommandList {
     u32 compute_root_packet_header[128];
     u32 graphics_pso_shadow[8]; // copy of the bound pipeline state's packet
 
+    // The desktop list recording goes to: the last segment's. Console lists split where the GPU
+    // signals or waits on a fence in memory, which desktop D3D12 only does between lists.
     ID3D12GraphicsCommandList8* desktop;
+    ListSegment* segments; // segment_capacity desktop lists, reused across resets
+    u32 segment_count;
+    u32 segment_capacity;
+    ConsoleCommandAllocator* allocator; // the allocator of the current recording
+    ID3D12Device13* device;
     bool recording;
-    bool pipeline_bound;                    // draws and dispatches have a desktop pipeline state
-    ConsoleDescriptorHeap* heaps[2]; // bound shader-visible heaps: views, samplers
+    ListState state;
 };
 
 struct ConsoleCommandListDesc {
@@ -239,6 +336,9 @@ HRESULT console_create_query_heap(ConsoleDevice* device, const D3D12_QUERY_HEAP_
 HRESULT console_create_command_signature(ConsoleDevice* device, const D3D12_COMMAND_SIGNATURE_DESC* desc,
                                          void* root_signature, REFIID iid, void** out);
 
+// Root signatures have at most 64 DWORDs of arguments, so at most 64 parameters.
+#define ROOT_MAX_PARAMETERS 64
+
 // A root signature, kept in its desktop form plus the description for translating root arguments.
 struct ConsoleRootSignature {
     ConsoleObjectHeader header;
@@ -246,6 +346,7 @@ struct ConsoleRootSignature {
     const D3D12_ROOT_SIGNATURE_DESC1* desc; // owned by `deserializer`
     ID3D12VersionedRootSignatureDeserializer* deserializer;
     ID3D12RootSignature* desktop;
+    u8 constant_offset[ROOT_MAX_PARAMETERS]; // root constants: where each parameter's values start
 };
 
 void console_root_signature_init();
