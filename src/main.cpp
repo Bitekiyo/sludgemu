@@ -7,7 +7,7 @@
 //   --break-on-stub    break into the debugger when an unimplemented import is called
 //   --gpu-debug        enable the D3D12 debug layer
 //   --gpu-warp         render with the software rasterizer (WARP) instead of the GPU
-//   --model=MODEL      console to present as: series-x (default) or series-s
+//   --model=MODEL      console to present as: series-x or series-s (default: what the host fits)
 //   --dump-threads-after=N   log every thread's backtrace every N seconds (hang diagnosis)
 //   --watch-write=SPEC       log every write to an 8-byte location ("module.dll+0xRVA" or "0xADDR")
 //   --trace-exec=SPEC[,...]  log registers when up to three code locations run
@@ -39,6 +39,7 @@ struct Options {
     bool gpu_debug;
     bool gpu_warp;
     ConsoleModel model;
+    bool model_given;
     u32 dump_threads_after;
     char watch_write[128];
     char trace_exec[256];
@@ -70,6 +71,7 @@ static bool parse_options(int argc, wchar_t** argv, Options* opt) {
         if (wcscmp(a, L"--console") == 0) {
             opt->console = true;
         } else if (wcsncmp(a, L"--model=", 8) == 0) {
+            opt->model_given = true;
             if (!console_model_parse(a + 8, &opt->model)) {
                 error_box(L"Unknown console model: %s\nUse series-x or series-s.", a + 8);
                 return false;
@@ -166,7 +168,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
     crash_install(dump_path);
     cpu_compat_init();
     stubs_init(opt.break_on_stub);
-    console_profile_select(opt.model);
+    console_profile_select(opt.model_given ? opt.model : console_model_for_host());
     LOG_I("main", "presenting as %s, title memory %llu MiB", console_profile().name,
           console_title_memory() >> 20);
     xmem_init();

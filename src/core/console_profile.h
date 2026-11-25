@@ -27,5 +27,9 @@ const ConsoleProfile& console_profile();
 // MicrosoftGame.Config (Standard unless it asks for Advanced).
 u64 console_title_memory();
 
+// The console a host can run titles for: a Series X title fills about 13 GB of memory and 10 GB of
+// it at full GPU bandwidth, so smaller machines get a Series S, whose titles budget about 8 GB in all.
+ConsoleModel console_model_for_host();
+
 // Accepts "series-x"/"x" and "series-s"/"s" (case-insensitive).
 bool console_model_parse(const wchar_t* name, ConsoleModel* out);
