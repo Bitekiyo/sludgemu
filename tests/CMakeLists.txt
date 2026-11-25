@@ -10,6 +10,7 @@ add_executable(sludgemu_tests
     ${PROJECT_SOURCE_DIR}/src/hle/audio/xapu.cpp
     ${PROJECT_SOURCE_DIR}/src/hle/audio/xdsp.cpp
     ${PROJECT_SOURCE_DIR}/src/hle/audio/xma.cpp
+    ${PROJECT_SOURCE_DIR}/src/hle/audio/xma_decoder.cpp
 )
 target_include_directories(sludgemu_tests PRIVATE ${PROJECT_SOURCE_DIR}/src)
 target_link_libraries(sludgemu_tests PRIVATE sludge_options opus)

@@ -36,6 +36,9 @@ add_executable(sludgemu WIN32
     hle/audio/apu.h
     hle/audio/acphal.cpp
     hle/audio/xma.cpp
+    hle/audio/xma_decoder.h
+    hle/audio/xma_decoder.cpp
+    hle/audio/xma_tables.h
     hle/audio/xapu.cpp
     hle/audio/xdsp.cpp
     hle/kernel/overrides.h
