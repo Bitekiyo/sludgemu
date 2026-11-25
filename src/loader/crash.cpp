@@ -540,11 +540,20 @@ void crash_dump_all_threads(const char* reason) {
             if (SuspendThread(th) != (DWORD)-1) {
                 CONTEXT ctx = {};
                 ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+                bool have_context = GetThreadContext(th, &ctx) != FALSE;
+                ResumeThread(th);
+                // Unwinding takes loader and function table locks, which the suspended thread may
+                // hold, so it happens after resuming. A blocked thread (what a hang dump is for)
+                // keeps its stack; a running one may change it under us, hence the guard.
                 ThreadDump& d = s_dumps[count];
                 d.tid = te.th32ThreadID;
-                d.frame_count =
-                    GetThreadContext(th, &ctx) ? capture_frames(&ctx, d.frames, DUMP_MAX_FRAMES) : 0;
-                ResumeThread(th);
+                d.frame_count = 0;
+                if (have_context) {
+                    __try {
+                        d.frame_count = capture_frames(&ctx, d.frames, DUMP_MAX_FRAMES);
+                    } __except (EXCEPTION_EXECUTE_HANDLER) {
+                    }
+                }
                 count++;
             }
             CloseHandle(th);

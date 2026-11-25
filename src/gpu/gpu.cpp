@@ -69,6 +69,81 @@ static void route_debug_messages(ID3D12Device* device) {
     queue->Release();
 }
 
+// --- device removal ---------------------------------------------------------------------------------
+//
+// A removed device completes every fence with UINT64_MAX. Waiting for that on a fence of our own
+// reports the removal once, from wherever it happened, with DRED's account of the GPU's last work
+// when the debug layer is on.
+
+static ID3D12Fence* g_removal_fence = nullptr;
+static HANDLE g_removal_event = nullptr;
+static HANDLE g_removal_wait = nullptr;
+
+// Unfinished command lists (with the operations around where each stopped) and the GPU page fault.
+static void log_dred(ID3D12Device* device) {
+    ID3D12DeviceRemovedExtendedData1* dred = nullptr;
+    if (FAILED(device->QueryInterface(IID_PPV_ARGS(&dred))))
+        return;
+    D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT1 crumbs = {};
+    if (SUCCEEDED(dred->GetAutoBreadcrumbsOutput1(&crumbs))) {
+        for (const D3D12_AUTO_BREADCRUMB_NODE1* n = crumbs.pHeadAutoBreadcrumbNode; n; n = n->pNext) {
+            u32 done = n->pLastBreadcrumbValue ? *n->pLastBreadcrumbValue : 0;
+            if (done >= n->BreadcrumbCount)
+                continue;
+            LOG_E("gpu", "  list %p on queue %p stopped after %u of %u operations:", n->pCommandList,
+                  n->pCommandQueue, done, n->BreadcrumbCount);
+            u32 from = done > 4 ? done - 4 : 0;
+            for (u32 i = from; i < n->BreadcrumbCount && i <= done + 2; i++)
+                LOG_E("gpu", "    %s operation %u: %d", i == done ? ">" : " ", i, (int)n->pCommandHistory[i]);
+        }
+    }
+    D3D12_DRED_PAGE_FAULT_OUTPUT1 fault = {};
+    if (SUCCEEDED(dred->GetPageFaultAllocationOutput1(&fault)) && fault.PageFaultVA) {
+        LOG_E("gpu", "  page fault at GPU address 0x%llx", fault.PageFaultVA);
+        for (const D3D12_DRED_ALLOCATION_NODE1* a = fault.pHeadExistingAllocationNode; a; a = a->pNext)
+            LOG_E("gpu", "    allocation there: type %d %p", (int)a->AllocationType, a->pObject);
+        for (const D3D12_DRED_ALLOCATION_NODE1* a = fault.pHeadRecentFreedAllocationNode; a; a = a->pNext)
+            LOG_E("gpu", "    allocation freed there recently: type %d %p", (int)a->AllocationType,
+                  a->pObject);
+    }
+    dred->Release();
+}
+
+// Asking for the reason can block until the driver has finished recovering.
+static void report_removal() {
+    static volatile long reported = 0;
+    if (InterlockedExchange(&reported, 1))
+        return;
+    LOG_E("gpu", "the D3D12 device was removed (reason 0x%08lx)",
+          (unsigned long)g_device->GetDeviceRemovedReason());
+    if (g_options.debug_layer)
+        log_dred(g_device);
+}
+
+static void CALLBACK on_device_removed(void*, BOOLEAN) {
+    report_removal();
+}
+
+bool gpu_device_lost(HRESULT hr) {
+    if (hr != DXGI_ERROR_DEVICE_REMOVED && hr != DXGI_ERROR_DEVICE_HUNG && hr != DXGI_ERROR_DEVICE_RESET &&
+        hr != DXGI_ERROR_DRIVER_INTERNAL_ERROR)
+        return false;
+    report_removal();
+    return true;
+}
+
+static void watch_for_removal(ID3D12Device* device) {
+    g_removal_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!g_removal_event ||
+        FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_removal_fence))) ||
+        FAILED(g_removal_fence->SetEventOnCompletion(UINT64_MAX, g_removal_event)) ||
+        !RegisterWaitForSingleObject(&g_removal_wait, g_removal_event, on_device_removed, nullptr, INFINITE,
+                                     WT_EXECUTEONLYONCE))
+        LOG_W("gpu", "cannot watch for device removal");
+}
+
+// --- device ------------------------------------------------------------------------------------------
+
 static BOOL CALLBACK create_device(PINIT_ONCE, void*, void**) {
     if (g_options.debug_layer) {
         ID3D12Debug* debug = nullptr;
@@ -79,6 +154,13 @@ static BOOL CALLBACK create_device(PINIT_ONCE, void*, void**) {
         } else {
             LOG_W("gpu", "D3D12 debug layer requested but unavailable");
         }
+        // Breadcrumbs and page fault reports, for explaining device removals.
+        ID3D12DeviceRemovedExtendedDataSettings1* dred = nullptr;
+        if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dred)))) {
+            dred->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+            dred->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+            dred->Release();
+        }
     }
 
     UINT factory_flags = g_options.debug_layer ? DXGI_CREATE_FACTORY_DEBUG : 0;
@@ -88,8 +170,26 @@ static BOOL CALLBACK create_device(PINIT_ONCE, void*, void**) {
     }
 
     IDXGIAdapter1* adapter = nullptr;
-    for (UINT i = 0; g_factory->EnumAdapterByGpuPreference(i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
-                                                           IID_PPV_ARGS(&adapter)) != DXGI_ERROR_NOT_FOUND;
+    if (g_options.warp) {
+        // The software rasterizer: slow, but it tells driver problems from ours.
+        ID3D12Device13* device = nullptr;
+        if (SUCCEEDED(g_factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter))) &&
+            SUCCEEDED(D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_1, IID_PPV_ARGS(&device)))) {
+            if (check_features(device)) {
+                LOG_I("gpu", "adapter: WARP (software)");
+                g_device = device;
+            } else {
+                device->Release();
+            }
+        }
+        if (adapter)
+            adapter->Release();
+        if (!g_device)
+            LOG_W("gpu", "WARP is unavailable or lacks required features; using the GPU");
+    }
+    for (UINT i = 0;
+         !g_device && g_factory->EnumAdapterByGpuPreference(i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+                                                            IID_PPV_ARGS(&adapter)) != DXGI_ERROR_NOT_FOUND;
          i++) {
         DXGI_ADAPTER_DESC1 desc;
         adapter->GetDesc1(&desc);
@@ -108,10 +208,13 @@ static BOOL CALLBACK create_device(PINIT_ONCE, void*, void**) {
         }
         adapter->Release();
     }
-    if (!g_device)
+    if (!g_device) {
         LOG_E("gpu", "no suitable D3D12 adapter found");
-    else if (g_options.debug_layer)
+        return TRUE;
+    }
+    if (g_options.debug_layer)
         route_debug_messages(g_device);
+    watch_for_removal(g_device);
     return TRUE;
 }
 

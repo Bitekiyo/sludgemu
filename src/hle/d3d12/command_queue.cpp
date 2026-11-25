@@ -114,7 +114,8 @@ static void write_fence_value(ConsoleCommandQueue* self, ConsoleFence* fence, u6
         self->desktop->ExecuteCommandLists(1, &list);
         w.submission = gpu_queue_submitted(self->slot);
     } else {
-        LOG_E("d3d12", "cannot write a fence value from the queue (0x%08lx)", (unsigned long)hr);
+        if (!gpu_device_lost(hr))
+            LOG_E("d3d12", "cannot write a fence value from the queue (0x%08lx)", (unsigned long)hr);
     }
     ReleaseSRWLockExclusive(&self->writer_lock);
 }

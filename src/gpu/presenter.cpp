@@ -302,7 +302,7 @@ bool presenter_present(ID3D12CommandQueue* queue, const PresentPlane* planes, u3
         ID3D12CommandList* list = p->list;
         queue->ExecuteCommandLists(1, &list);
         hr = p->swap_chain->Present(1, 0);
-        if (FAILED(hr))
+        if (FAILED(hr) && !gpu_device_lost(hr))
             LOG_E("present", "Present failed (0x%08lx)", (unsigned long)hr);
     } else {
         LOG_E("present", "presentation list failed to close (0x%08lx)", (unsigned long)hr);

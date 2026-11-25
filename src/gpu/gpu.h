@@ -10,6 +10,7 @@
 
 struct GpuOptions {
     bool debug_layer; // D3D12 debug layer + GPU-based validation off (too slow for a title)
+    bool warp;        // use the software rasterizer instead of the GPU
 };
 
 void gpu_set_options(const GpuOptions& options);
@@ -18,6 +19,10 @@ void gpu_set_options(const GpuOptions& options);
 // adapter exists.
 ID3D12Device13* gpu_device();
 IDXGIFactory6* gpu_factory();
+
+// True if `hr` says the device is lost. The first time, logs why (DRED details with the debug
+// layer). The removal is also reported on its own once the runtime notices it.
+bool gpu_device_lost(HRESULT hr);
 
 // Command queues running translated work. Registering gives a queue a slot whose fence counts its
 // submissions; call gpu_queue_submitted after every ExecuteCommandLists. Unregistering waits for

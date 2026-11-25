@@ -6,6 +6,7 @@
 //   --log-level=LEVEL  trace | debug | info | warn | error   (default: info)
 //   --break-on-stub    break into the debugger when an unimplemented import is called
 //   --gpu-debug        enable the D3D12 debug layer
+//   --gpu-warp         render with the software rasterizer (WARP) instead of the GPU
 //   --model=MODEL      console to present as: series-x (default) or series-s
 //   --dump-threads-after=N   log every thread's backtrace every N seconds (hang diagnosis)
 //   --watch-write=SPEC       log every write to an 8-byte location ("module.dll+0xRVA" or "0xADDR")
@@ -36,6 +37,7 @@ struct Options {
     bool console;
     bool break_on_stub;
     bool gpu_debug;
+    bool gpu_warp;
     ConsoleModel model;
     u32 dump_threads_after;
     char watch_write[128];
@@ -74,6 +76,8 @@ static bool parse_options(int argc, wchar_t** argv, Options* opt) {
             }
         } else if (wcscmp(a, L"--gpu-debug") == 0) {
             opt->gpu_debug = true;
+        } else if (wcscmp(a, L"--gpu-warp") == 0) {
+            opt->gpu_warp = true;
         } else if (wcscmp(a, L"--break-on-stub") == 0) {
             opt->break_on_stub = true;
         } else if (wcsncmp(a, L"--dump-threads-after=", 21) == 0) {
@@ -171,6 +175,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
     hle_init();
     GpuOptions gpu_options = {};
     gpu_options.debug_layer = opt.gpu_debug;
+    gpu_options.warp = opt.gpu_warp;
     gpu_set_options(gpu_options);
     window_init(title.display_name);
 

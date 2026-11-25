@@ -96,6 +96,7 @@ static ID3D12Resource* open_window(const MemBlock& block) {
     ID3D12Heap* heap = nullptr;
     HRESULT hr = device->OpenExistingHeapFromAddress1(block.host, block.size, IID_PPV_ARGS(&heap));
     if (FAILED(hr)) {
+        gpu_device_lost(hr);
         LOG_E("gpu", "cannot open a GPU heap over title memory %p+0x%llx (0x%08lx)", block.base, block.size,
               (unsigned long)hr);
         return nullptr;
