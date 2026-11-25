@@ -11,9 +11,11 @@
 struct GpuOptions {
     bool debug_layer; // D3D12 debug layer + GPU-based validation off (too slow for a title)
     bool warp;        // use the software rasterizer instead of the GPU
+    bool serialize;   // every title submission waits for the GPU to finish it (diagnostics)
 };
 
 void gpu_set_options(const GpuOptions& options);
+const GpuOptions& gpu_options();
 
 // Creates the desktop device on first use. Returns nullptr (and logs why) if no suitable
 // adapter exists.

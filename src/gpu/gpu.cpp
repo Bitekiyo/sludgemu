@@ -14,6 +14,10 @@ void gpu_set_options(const GpuOptions& options) {
     g_options = options;
 }
 
+const GpuOptions& gpu_options() {
+    return g_options;
+}
+
 // What the translation relies on. Console titles are written against RDNA2-class features:
 // shader model 6.6+ (wave intrinsics, 64-bit atomics, dynamic resources), enhanced barriers and
 // mesh shaders.

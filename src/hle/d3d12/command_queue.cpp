@@ -142,7 +142,9 @@ static void WINAPI queue_execute_command_lists(ConsoleCommandQueue* self, UINT c
         }
     }
     flush(self->desktop, &b);
-    gpu_queue_submitted(self->slot);
+    u64 submission = gpu_queue_submitted(self->slot);
+    if (gpu_options().serialize)
+        gpu_queue_wait(self->slot, submission);
 }
 
 // The frame token and flags tie the work to console frame pacing.
