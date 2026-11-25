@@ -25,6 +25,7 @@ static bool prepare(ConsoleCommandList* self, bool graphics) {
     ID3D12PipelineState* desktop =
         console_pipeline_desktop(s.pipeline, graphics ? &outputs : nullptr, &signature);
     if (!desktop) {
+        console_pipeline_report_skip(s.pipeline, graphics);
         self->skipped_draws++;
         return false;
     }

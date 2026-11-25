@@ -530,6 +530,7 @@ struct ConsolePipelineState {
     SRWLOCK lock;
     u32 variant_count;
     PipelineVariant variants[PIPELINE_MAX_VARIANTS];
+    volatile long skip_reported; // why its draws are skipped was logged
 };
 
 void console_pipeline_state_init();
@@ -551,6 +552,8 @@ HRESULT console_deserialize_pipeline_state(ConsoleDevice* device, bool compute,
 // being made or if it cannot be.
 ID3D12PipelineState* console_pipeline_desktop(ConsolePipelineState* pso, const PipelineOutputs* outputs,
                                               ID3D12RootSignature** signature);
+// Logs, once per pipeline, why draws with it are skipped for good (not while its programs build).
+void console_pipeline_report_skip(ConsolePipelineState* pso, bool graphics);
 
 // Page pools (page_pool.cpp): title memory registered as a source of GPU page mapping copies.
 HRESULT console_register_page_pool(u64 address, u32 page_count, u32 flags, HANDLE* handle);

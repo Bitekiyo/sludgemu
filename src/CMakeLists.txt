@@ -15,9 +15,11 @@ add_library(sludge_shader STATIC
     shader/translate_memory.cpp
     shader/console_pipeline.h
     shader/console_pipeline.cpp
+    shader/console_container.h
+    shader/console_container.cpp
 )
 target_include_directories(sludge_shader PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(sludge_shader PRIVATE sludge_options)
+target_link_libraries(sludge_shader PRIVATE sludge_options libdeflate::libdeflate_static)
 target_compile_options(sludge_shader PRIVATE /Zc:threadSafeInit-) # linked into sludgemu.exe (see below)
 
 add_executable(sludgemu WIN32

@@ -7,13 +7,16 @@
 // programs are built. Draws are skipped until then.
 
 #include <stddef.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "common/log.h"
+#include "gpu/formats.h"
 #include "gpu/gpu.h"
 #include "gpu/shader_programs.h"
 #include "hle/d3d12/d3d12_objects.h"
 #include "hle/d3d12/d3d12_tables.h"
+#include "shader/console_container.h"
 
 static_assert(offsetof(ConsolePipelineState, packet) == 0x10, "pipeline state layout");
 static_assert(offsetof(ConsolePipelineState, root_signature) == 0x30,
@@ -300,15 +303,219 @@ HRESULT console_deserialize_pipeline_state(ConsoleDevice*, bool compute, const C
     return console_return(pso, iid, out);
 }
 
+// --- pipeline state streams --------------------------------------------------------------------------
+
+// Stream subobjects: a type, then its description at its natural alignment; each subobject starts
+// pointer-aligned. Types through the mesh shader are desktop's (same descriptions); the console adds
+// its own after them, skipped by size.
+enum StreamSubobject : u32 {
+    STREAM_ROOT_SIGNATURE = 0,
+    STREAM_VS = 1,
+    STREAM_PS = 2,
+    STREAM_DS = 3,
+    STREAM_HS = 4,
+    STREAM_GS = 5,
+    STREAM_CS = 6,
+    STREAM_BLEND = 8,
+    STREAM_SAMPLE_MASK = 9,
+    STREAM_RASTERIZER = 10,
+    STREAM_DEPTH_STENCIL = 11,
+    STREAM_INPUT_LAYOUT = 12,
+    STREAM_STRIP_CUT = 13,
+    STREAM_TOPOLOGY_TYPE = 14,
+    STREAM_DEPTH_STENCIL1 = 21,
+    STREAM_AS = 23,
+    STREAM_MS = 24,
+};
+
+static const u16 k_subobject_size[30] = {8,  16, 16, 16, 16, 16, 16, 32, 328, 4,  44, 52, 16, 4,  4,
+                                         36, 4,  8,  4,  16, 4,  56, 24, 16,  16, 32, 24, 60, 12, 24};
+static const u8 k_subobject_align[30] = {8, 8, 8, 8, 8, 8, 8, 8, 4, 4, 4, 4, 8, 4, 4,
+                                         4, 4, 4, 4, 8, 4, 4, 8, 8, 8, 4, 4, 4, 4, 4};
+
+struct StreamPipeline {
+    ConsoleRootSignature* root_signature;
+    D3D12_SHADER_BYTECODE vs, ps;
+    PipelineFixedState fixed;
+};
+
+// D3D12's defaults for what a stream leaves out.
+static void default_fixed_state(PipelineFixedState* f) {
+    memset(f, 0, sizeof(*f));
+    for (u32 i = 0; i < 8; i++) {
+        D3D12_RENDER_TARGET_BLEND_DESC& rt = f->blend.RenderTarget[i];
+        rt.SrcBlend = rt.SrcBlendAlpha = D3D12_BLEND_ONE;
+        rt.DestBlend = rt.DestBlendAlpha = D3D12_BLEND_ZERO;
+        rt.BlendOp = rt.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+        rt.LogicOp = D3D12_LOGIC_OP_NOOP;
+        rt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    }
+    f->rasterizer.FillMode = D3D12_FILL_MODE_SOLID;
+    f->rasterizer.CullMode = D3D12_CULL_MODE_BACK;
+    f->rasterizer.DepthClipEnable = TRUE;
+    f->depth_stencil.DepthEnable = TRUE;
+    f->depth_stencil.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+    f->depth_stencil.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+    f->depth_stencil.StencilReadMask = f->depth_stencil.StencilWriteMask = 0xFF;
+    D3D12_DEPTH_STENCILOP_DESC op = {D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP,
+                                     D3D12_COMPARISON_FUNC_ALWAYS};
+    f->depth_stencil.FrontFace = f->depth_stencil.BackFace = op;
+    f->sample_mask = UINT_MAX;
+    f->topology_type = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+}
+
+static void input_layout(const D3D12_INPUT_LAYOUT_DESC& layout, PipelineFixedState* f) {
+    u32 next[D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT] = {};
+    for (u32 i = 0; i < layout.NumElements && f->element_count < SHADER_MAX_VERTEX_ELEMENTS; i++) {
+        const D3D12_INPUT_ELEMENT_DESC& e = layout.pInputElementDescs[i];
+        u32 slot = e.InputSlot % D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT;
+        u32 offset = e.AlignedByteOffset == D3D12_APPEND_ALIGNED_ELEMENT ? next[slot] : e.AlignedByteOffset;
+        next[slot] = offset + format_info(e.Format).bytes_per_element;
+        u32 n = f->element_count++;
+        f->elements[n] = {(u8)slot, offset, (u32)e.Format};
+        f->element_per_instance[n] = e.InputSlotClass == D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA;
+        f->element_step_rate[n] = e.InstanceDataStepRate;
+    }
+}
+
+// Reads the stream; false (with the reason) for what isn't translated.
+static bool read_stream(const D3D12_PIPELINE_STATE_STREAM_DESC* desc, StreamPipeline* out, const char** why) {
+    memset(out, 0, sizeof(*out));
+    default_fixed_state(&out->fixed);
+    const u8* base = (const u8*)desc->pPipelineStateSubobjectStream;
+    usize at = 0;
+    while (at + 4 <= desc->SizeInBytes) {
+        u32 type;
+        memcpy(&type, base + at, 4);
+        if (type >= ARRAY_COUNT(k_subobject_size)) {
+            *why = "a subobject of an unknown type";
+            return false;
+        }
+        usize inner = ALIGN_UP(at + 4, (usize)k_subobject_align[type]);
+        if (inner + k_subobject_size[type] > desc->SizeInBytes) {
+            *why = "a truncated subobject";
+            return false;
+        }
+        const void* p = base + inner;
+        switch (type) {
+        case STREAM_ROOT_SIGNATURE:
+            memcpy(&out->root_signature, p, sizeof(void*));
+            break;
+        case STREAM_VS:
+            memcpy(&out->vs, p, sizeof(out->vs));
+            break;
+        case STREAM_PS:
+            memcpy(&out->ps, p, sizeof(out->ps));
+            break;
+        case STREAM_DS:
+        case STREAM_HS:
+        case STREAM_GS:
+        case STREAM_CS:
+        case STREAM_AS:
+        case STREAM_MS: {
+            D3D12_SHADER_BYTECODE b;
+            memcpy(&b, p, sizeof(b));
+            if (b.BytecodeLength) {
+                *why = "tessellation, geometry, mesh or compute stages";
+                return false;
+            }
+            break;
+        }
+        case STREAM_BLEND:
+            memcpy(&out->fixed.blend, p, sizeof(out->fixed.blend));
+            break;
+        case STREAM_SAMPLE_MASK:
+            memcpy(&out->fixed.sample_mask, p, 4);
+            break;
+        case STREAM_RASTERIZER:
+            memcpy(&out->fixed.rasterizer, p, sizeof(out->fixed.rasterizer));
+            break;
+        case STREAM_DEPTH_STENCIL:
+            memcpy(&out->fixed.depth_stencil, p, sizeof(out->fixed.depth_stencil));
+            break;
+        case STREAM_DEPTH_STENCIL1: // the same description with depth bounds after it
+            memcpy(&out->fixed.depth_stencil, p, sizeof(out->fixed.depth_stencil));
+            break;
+        case STREAM_INPUT_LAYOUT: {
+            D3D12_INPUT_LAYOUT_DESC layout;
+            memcpy(&layout, p, sizeof(layout));
+            input_layout(layout, &out->fixed);
+            break;
+        }
+        case STREAM_STRIP_CUT:
+            memcpy(&out->fixed.strip_cut, p, 4);
+            break;
+        case STREAM_TOPOLOGY_TYPE:
+            memcpy(&out->fixed.topology_type, p, 4);
+            break;
+        default:
+            break; // formats, sample description, flags and console extensions: not needed here
+        }
+        at = ALIGN_UP(inner + k_subobject_size[type], (usize)8);
+    }
+    if (!out->vs.pShaderBytecode || !out->vs.BytecodeLength) {
+        *why = "no vertex shader";
+        return false;
+    }
+    return true;
+}
+
+// Programs from the stream's shader containers.
+static bool request_stream_programs(ConsolePipelineState* pso, const StreamPipeline& sp, const char** why) {
+    const ConsoleRootSignature* rs = pso->root_signature;
+    if (!rs) {
+        *why = "no root signature";
+        return false;
+    }
+    ConsoleContainerShader vs, ps;
+    if (!console_container_open(sp.vs.pShaderBytecode, sp.vs.BytecodeLength, SHADER_VERTEX, &vs, why))
+        return false;
+    ShaderInfo info;
+    memset(&info, 0, sizeof(info));
+    info.stage = SHADER_VERTEX;
+    console_user_data_layout(rs->layout, CONSOLE_FIRST_ROOT_SGPR_GRAPHICS, &info);
+    info.user_sgprs = vs.user_sgprs;
+    info.element_count = pso->fixed.element_count;
+    memcpy(info.elements, pso->fixed.elements, sizeof(info.elements));
+    pso->programs[0] = shader_program_get(vs.code, vs.code_size, info);
+    console_container_close(&vs);
+    if (sp.ps.pShaderBytecode && sp.ps.BytecodeLength) {
+        if (!console_container_open(sp.ps.pShaderBytecode, sp.ps.BytecodeLength, SHADER_PIXEL, &ps, why))
+            return false;
+        memset(&info, 0, sizeof(info));
+        info.stage = SHADER_PIXEL;
+        console_user_data_layout(rs->layout, CONSOLE_FIRST_ROOT_SGPR_GRAPHICS, &info);
+        info.user_sgprs = ps.user_sgprs;
+        info.ps_input_addr = ps.ps_input_addr;
+        info.ps_color_format = ps.ps_color_format;
+        pso->programs[1] = shader_program_get(ps.code, ps.code_size, info);
+        console_container_close(&ps);
+    }
+    return pso->programs[0] != nullptr;
+}
+
 HRESULT console_create_pipeline_state(ConsoleDevice*, const D3D12_PIPELINE_STATE_STREAM_DESC* desc,
                                       REFIID iid, void** out) {
     if (!desc || !desc->pPipelineStateSubobjectStream)
         return E_INVALIDARG;
     if (!out)
         return E_POINTER;
-    LOG_W_ONCE("d3d12",
-               "pipeline states from state streams are not translated yet; draws with them are skipped");
-    return console_return(new_pipeline_state(false, nullptr, nullptr, 0), iid, out);
+    StreamPipeline sp;
+    const char* why = nullptr;
+    bool readable = read_stream(desc, &sp, &why);
+    ConsolePipelineState* pso = new_pipeline_state(false, readable ? sp.root_signature : nullptr, nullptr, 0);
+    if (readable) {
+        pso->fixed = sp.fixed;
+        if (pso->fixed.topology_type >= D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH ||
+            pso->fixed.topology_type == D3D12_PRIMITIVE_TOPOLOGY_TYPE_UNDEFINED)
+            pso->fixed.topology_type = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        pso->translated = request_stream_programs(pso, sp, &why);
+    }
+    if (!pso->translated)
+        LOG_W("d3d12",
+              "pipeline state %p from a state stream is not translated (%s); draws with it are skipped",
+              (void*)pso, why ? why : "unknown");
+    return console_return(pso, iid, out);
 }
 
 HRESULT console_create_compute_pipeline_state(ConsoleDevice*, const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc,
@@ -401,6 +608,41 @@ static bool programs_failed(const ConsolePipelineState* pso) {
         if (pso->programs[i] && pso->programs[i]->state == PROGRAM_FAILED)
             return true;
     return false;
+}
+
+void console_pipeline_report_skip(ConsolePipelineState* pso, bool graphics) {
+    const char* what = graphics ? "draws" : "dispatches";
+    if (!pso) {
+        LOG_W_ONCE("d3d12", "%s without a pipeline state skipped", what);
+        return;
+    }
+    if (pso->skip_reported)
+        return;
+    char reason[160];
+    if (!pso->translated) {
+        snprintf(reason, sizeof(reason), "it is not translated (see the creation warning)");
+    } else if (!pso->root_signature || !pso->root_signature->desktop) {
+        snprintf(reason, sizeof(reason), "its root signature has no desktop signature");
+    } else if (programs_failed(pso)) {
+        const ShaderProgram* a = pso->programs[0];
+        const ShaderProgram* b = pso->programs[1];
+        snprintf(reason, sizeof(reason), "a program failed: %016llx %s, %016llx %s",
+                 a ? (unsigned long long)a->key : 0ull, a && a->state == PROGRAM_FAILED ? "failed" : "ok",
+                 b ? (unsigned long long)b->key : 0ull, b && b->state == PROGRAM_FAILED ? "failed" : "ok");
+    } else if (programs_ready(pso)) {
+        bool failed = false;
+        AcquireSRWLockShared(&pso->lock);
+        for (u32 i = 0; i < pso->variant_count; i++)
+            failed |= pso->variants[i].state == VARIANT_FAILED;
+        ReleaseSRWLockShared(&pso->lock);
+        if (!failed)
+            return; // still being made
+        snprintf(reason, sizeof(reason), "its desktop pipeline could not be made");
+    } else {
+        return; // programs still building
+    }
+    if (InterlockedExchange(&pso->skip_reported, 1) == 0)
+        LOG_W("d3d12", "%s with pipeline %p skipped: %s", what, (void*)pso, reason);
 }
 
 static ID3D12PipelineState* create_graphics(const ConsolePipelineState* pso, const PipelineOutputs& o,
@@ -502,8 +744,11 @@ ID3D12PipelineState* console_pipeline_desktop(ConsolePipelineState* pso, const P
                                               ID3D12RootSignature** signature) {
     if (!pso || !pso->translated || !pso->root_signature || !pso->root_signature->desktop)
         return nullptr;
-    if (!programs_ready(pso))
+    if (!programs_ready(pso)) {
+        for (u32 i = 0; i < 2; i++)
+            shader_program_hurry(pso->programs[i]);
         return nullptr;
+    }
     PipelineOutputs key = {};
     if (!pso->compute && outputs)
         key = *outputs;
