@@ -55,6 +55,19 @@ FetchContent_Declare(libdeflate
     GIT_SHALLOW TRUE)
 FetchContent_MakeAvailable(libdeflate)
 
+# libopus: Opus decoding for the console audio decoder (XApu). It picks its C runtime itself.
+set(OPUS_STATIC_RUNTIME ON CACHE BOOL "" FORCE)
+set(OPUS_BUILD_SHARED_LIBRARY OFF CACHE BOOL "" FORCE)
+set(OPUS_BUILD_TESTING OFF CACHE BOOL "" FORCE)
+set(OPUS_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
+set(OPUS_INSTALL_PKG_CONFIG_MODULE OFF CACHE BOOL "" FORCE)
+set(OPUS_INSTALL_CMAKE_CONFIG_MODULE OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(opus
+    GIT_REPOSITORY https://github.com/xiph/opus.git
+    GIT_TAG v1.5.2
+    GIT_SHALLOW TRUE)
+FetchContent_MakeAvailable(opus)
+
 include(cmake/addrlib.cmake)
 
 include(cmake/nuget.cmake)

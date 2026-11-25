@@ -121,7 +121,7 @@ sludge_shader(sludgemu gpu/shaders/present.hlsl vs_main vs_6_0 present_vs)
 sludge_shader(sludgemu gpu/shaders/present.hlsl ps_main ps_6_0 present_ps)
 target_include_directories(sludgemu PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 target_link_libraries(sludgemu PRIVATE agility sludge_options shell32 user32 synchronization delayimp
-    dstorage libdeflate::libdeflate_static addrlib d3d12 dxgi dxc)
+    dstorage libdeflate::libdeflate_static opus addrlib d3d12 dxgi dxc)
 
 # Loaded only when a title uses DirectStorage.
 target_link_options(sludgemu PRIVATE /DELAYLOAD:dstorage.dll)

@@ -1,20 +1,14 @@
-// Tests for the console memory model (core/memory). Run: sludgemu_tests.exe (exit code = failures).
+// Tests for the console memory model (core/memory), and the entry point of the unit tests. Run:
+// sludgemu_tests.exe (exit code = failures).
 
 #include <windows.h>
 #include <stdio.h>
 
 #include "common/log.h"
 #include "core/memory.h"
+#include "test.h"
 
-static int g_failures = 0;
-
-#define CHECK(cond)                                                                                          \
-    do {                                                                                                     \
-        if (!(cond)) {                                                                                       \
-            printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond);                                           \
-            g_failures++;                                                                                    \
-        }                                                                                                    \
-    } while (0)
+int g_failures = 0;
 
 #define PAGE MEM_PAGE_SIZE
 
@@ -325,6 +319,9 @@ static void test_lazy_commit() {
     CHECK(range_is_free(base, size));
 }
 
+void test_xapu_decode();
+void test_xapu_convert();
+
 int main() {
     log_init(nullptr, LOG_LEVEL_WARN);
     if (!mem_init(GiB(1))) {
@@ -339,6 +336,8 @@ int main() {
     test_frames_zeroed_on_reuse();
     test_lazy_backing();
     test_lazy_commit();
+    test_xapu_decode();
+    test_xapu_convert();
     printf("%s (%d failures)\n", g_failures ? "FAILED" : "passed", g_failures);
     return g_failures;
 }
