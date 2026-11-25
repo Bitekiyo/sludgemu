@@ -54,6 +54,33 @@ static TableRangeKind heap_kind(const Translator& t, u32 reg, TableRangeKind fal
     return kind;
 }
 
+static s32 register_pc_pool(Translator& t, u32 rsrc_reg) {
+    u32 base_off = 0;
+    if (!sgpr_constant(t.tags, rsrc_reg, &base_off))
+        return -1;
+    if (base_off >= t.code_size)
+        return -1;
+    u32 avail = (t.code_size - base_off) / 4u;
+    u32 dwords = avail;
+    u32 bytes = 0;
+    if (sgpr_constant(t.tags, rsrc_reg + 2, &bytes) && bytes > 0 && (bytes + 3u) / 4u <= avail)
+        dwords = (bytes + 3u) / 4u;
+    if (!dwords)
+        return -1;
+    for (u32 i = 0; i < t.pc_pool_count; i++) {
+        if (t.pc_pools[i].base_off == base_off) {
+            if (dwords > t.pc_pools[i].dwords)
+                t.pc_pools[i].dwords = dwords;
+            return (s32)i;
+        }
+    }
+    if (t.pc_pool_count >= SHADER_MAX_PC_POOLS)
+        return -1;
+    u32 idx = t.pc_pool_count++;
+    t.pc_pools[idx] = {base_off, dwords};
+    return (s32)idx;
+}
+
 static void write_loaded(Translator& t, const RdnaInst& in, u32 dwords, const char* value) {
     static const char k_comp[4] = {'x', 'y', 'z', 'w'};
     for (u32 i = 0; i < dwords; i++)
@@ -135,6 +162,18 @@ static bool emit_scalar_memory(Translator& t, const RdnaInst& in) {
         t.depth--;
         emit(t, "}");
         return true;
+    }
+    if (buffer && tag_kind(lo) == TAG_PC) {
+        s32 pid = register_pc_pool(t, base);
+        if (pid >= 0) {
+            emit(t, "{ uint wi_ = (0x%xu + %s) >> 2;", (u32)in.mem.offset, soffset(t, in, 1));
+            t.depth++;
+            for (u32 i = 0; i < dwords; i++)
+                write_sgpr(t, in.dst[0], i, fmt(t, "g_pc_%d[wi_ + %uu]", pid, i));
+            t.depth--;
+            emit(t, "}");
+            return true;
+        }
     }
     translator_fail(t, "%s at 0x%x from an address the translator cannot place", rdna_op_name(in.op),
                     in.offset);
@@ -804,6 +843,22 @@ static bool emit_buffer(Translator& t, const RdnaInst& in) {
         emit(t, "}");
         return true;
     }
+    if (!store && !atomic && !format && tag_kind(lo) == TAG_PC) {
+        s32 pid = register_pc_pool(t, rsrc);
+        if (pid >= 0) {
+            emit(t, "{ uint wi_ = (%s * ((%s >> 16) & 0x3fffu) + %s) >> 2;", index, sgpr(t, rsrc + 1), offset);
+            t.depth++;
+            if (dwords == 1) {
+                write_loaded(t, in, 1, fmt(t, "g_pc_%d[wi_]", pid));
+            } else {
+                for (u32 i = 0; i < dwords; i++)
+                    write_vgpr(t, in, in.dst[0].reg + i, fmt(t, "g_pc_%d[wi_ + %uu]", pid, i));
+            }
+            t.depth--;
+            emit(t, "}");
+            return true;
+        }
+    }
     translator_fail(t, "%s at 0x%x through a descriptor the translator cannot place", rdna_op_name(in.op),
                     in.offset);
     return false;
@@ -948,10 +1003,6 @@ static bool emit_image(Translator& t, const RdnaInst& in) {
         translator_fail(t, "cube sampling at 0x%x", in.offset);
         return false;
     }
-    if (form.offset) {
-        translator_fail(t, "%s with texel offsets at 0x%x", rdna_op_name(in.op), in.offset);
-        return false;
-    }
     u32 rsrc = in.src[1].reg;
     Tag tag = sgpr_tag(t, rsrc);
     if (tag_kind(tag) != TAG_HEAP || (tag_payload(tag) & 1) != HEAP_RESOURCES) {
@@ -959,30 +1010,48 @@ static bool emit_image(Translator& t, const RdnaInst& in) {
                         in.offset);
         return false;
     }
-    // Address components in order (packed two 16-bit components per VGPR when a16 is set).
+    // Address components in order (leading 32-bit offset dword for _o, then packed 16-bit when a16).
     u32 count = rdna_image_address_count(in.op, m.dim);
     if (count > 16) {
         translator_fail(t, "too many image address registers");
         return false;
     }
-    u32 addr_vgprs = m.a16 ? (count + 1) / 2 : count;
+    u32 coord_base = form.offset ? 1u : 0u;
+    u32 rem = count - coord_base;
+    u32 addr_vgprs = coord_base + (m.a16 ? (rem + 1) / 2 : rem);
     u32 regs[16];
     for (u32 i = 0; i < addr_vgprs; i++)
         regs[i] = m.nsa_count && i > 0 ? m.nsa_addr[i - 1] : in.src[0].reg + i;
+    const char* offset_expr = nullptr;
+    if (form.offset) {
+        if (!t.tags.vgpr_const[regs[0] & 255]) {
+            translator_fail(t, "%s at 0x%x with non-constant texel offsets", rdna_op_name(in.op), in.offset);
+            return false;
+        }
+        u32 ov = t.tags.vgpr_val[regs[0] & 255];
+        s32 ox = (s32)((ov & 0x3Fu) << 26) >> 26;
+        s32 oy = (s32)(((ov >> 8) & 0x3Fu) << 26) >> 26;
+        s32 oz = (s32)(((ov >> 16) & 0x3Fu) << 26) >> 26;
+        u32 odim = k_dim_grads[m.dim];
+        offset_expr = odim == 1   ? fmt(t, "%d", ox)
+                      : odim == 2 ? fmt(t, "int2(%d, %d)", ox, oy)
+                                  : fmt(t, "int3(%d, %d, %d)", ox, oy, oz);
+    }
     const char* addr_u[16];
     const char* addr_f[16];
-    for (u32 i = 0; i < count; i++) {
+    for (u32 k = 0; k < rem; k++) {
+        u32 dst_i = coord_base + k;
         if (m.a16) {
-            const char* r = vgpr(t, regs[i / 2]);
-            addr_u[i] = (i & 1) ? fmt(t, "(%s >> 16)", r) : fmt(t, "(%s & 0xffffu)", r);
-            addr_f[i] = (i & 1) ? fmt(t, "f16tof32(%s >> 16)", r) : fmt(t, "f16tof32(%s)", r);
+            const char* r = vgpr(t, regs[coord_base + k / 2]);
+            addr_u[dst_i] = (k & 1) ? fmt(t, "(%s >> 16)", r) : fmt(t, "(%s & 0xffffu)", r);
+            addr_f[dst_i] = (k & 1) ? fmt(t, "f16tof32(%s >> 16)", r) : fmt(t, "f16tof32(%s)", r);
         } else {
-            const char* r = vgpr(t, regs[i]);
-            addr_u[i] = r;
-            addr_f[i] = fmt(t, "asfloat(%s)", r);
+            const char* r = vgpr(t, regs[coord_base + k]);
+            addr_u[dst_i] = r;
+            addr_f[dst_i] = fmt(t, "asfloat(%s)", r);
         }
     }
-    u32 at = 0;
+    u32 at = coord_base;
     const char *bias_f = nullptr, *compare_f = nullptr, *lod_f = nullptr, *lod_u = nullptr, *clamp_f = nullptr;
     const char* grad_f[6] = {};
     if (form.bias)
@@ -1007,7 +1076,7 @@ static bool emit_image(Translator& t, const RdnaInst& in) {
         clamp_f = addr_f[at++];
 
     TableRangeKind kind = heap_kind(t, rsrc, form.store ? RANGE_UAV : RANGE_SRV);
-    bool uav = kind == RANGE_UAV || form.store;
+    bool uav = !form.sample && !form.gather && (kind == RANGE_UAV || form.store);
     const char* resource = fmt(t, "%s >> 5", sgpr(t, rsrc));
     emit(t, "{");
     t.depth++;
@@ -1055,32 +1124,52 @@ static bool emit_image(Translator& t, const RdnaInst& in) {
             static const char* const k_gather[4] = {"GatherRed", "GatherGreen", "GatherBlue", "GatherAlpha"};
             u32 c = m.dmask & 2 ? 1 : m.dmask & 4 ? 2 : m.dmask & 8 ? 3 : 0;
             if (form.compare)
-                value = fmt(t, "tex_.GatherCmpRed(smp_, %s, %s)", uv, compare_f);
+                value = offset_expr ? fmt(t, "tex_.GatherCmpRed(smp_, %s, %s, %s)", uv, compare_f, offset_expr)
+                                    : fmt(t, "tex_.GatherCmpRed(smp_, %s, %s)", uv, compare_f);
             else
-                value = fmt(t, "tex_.%s(smp_, %s)", k_gather[c], uv);
+                value = offset_expr ? fmt(t, "tex_.%s(smp_, %s, %s)", k_gather[c], uv, offset_expr)
+                                    : fmt(t, "tex_.%s(smp_, %s)", k_gather[c], uv);
             if (form.lod || form.bias || form.grad || form.clamp) {
                 translator_fail(t, "%s variant at 0x%x", rdna_op_name(in.op), in.offset);
                 return false;
             }
         } else if (form.compare) {
             if (form.lod_zero)
-                value = fmt(t, "tex_.SampleCmpLevelZero(smp_, %s, %s).xxxx", uv, compare_f);
-            else if (form.lod)
+                value = offset_expr
+                            ? fmt(t, "tex_.SampleCmpLevelZero(smp_, %s, %s, %s).xxxx", uv, compare_f, offset_expr)
+                            : fmt(t, "tex_.SampleCmpLevelZero(smp_, %s, %s).xxxx", uv, compare_f);
+            else if (form.lod && !offset_expr)
                 value = fmt(t, "tex_.SampleCmpLevel(smp_, %s, %s, %s).xxxx", uv, compare_f, lod_f);
-            else if (!form.bias && !form.grad && !form.clamp)
-                value = fmt(t, "tex_.SampleCmp(smp_, %s, %s).xxxx", uv, compare_f);
+            else if (!form.lod && !form.bias && !form.grad && !form.clamp)
+                value = offset_expr ? fmt(t, "tex_.SampleCmp(smp_, %s, %s, %s).xxxx", uv, compare_f, offset_expr)
+                                    : fmt(t, "tex_.SampleCmp(smp_, %s, %s).xxxx", uv, compare_f);
         } else if (form.lod_zero) {
-            value = fmt(t, "tex_.SampleLevel(smp_, %s, 0.0f)", uv);
+            value = offset_expr ? fmt(t, "tex_.SampleLevel(smp_, %s, 0.0f, %s)", uv, offset_expr)
+                                : fmt(t, "tex_.SampleLevel(smp_, %s, 0.0f)", uv);
         } else if (form.lod) {
-            value = fmt(t, "tex_.SampleLevel(smp_, %s, %s)", uv, lod_f);
+            value = offset_expr ? fmt(t, "tex_.SampleLevel(smp_, %s, %s, %s)", uv, lod_f, offset_expr)
+                                : fmt(t, "tex_.SampleLevel(smp_, %s, %s)", uv, lod_f);
         } else if (form.bias && !form.clamp) {
-            value = fmt(t, "tex_.SampleBias(smp_, %s, %s)", uv, bias_f);
+            value = offset_expr ? fmt(t, "tex_.SampleBias(smp_, %s, %s, %s)", uv, bias_f, offset_expr)
+                                : fmt(t, "tex_.SampleBias(smp_, %s, %s)", uv, bias_f);
         } else if (form.grad && !form.clamp) {
-            value = fmt(t, "tex_.SampleGrad(smp_, %s, %s, %s)", uv, join_exprs(t, "float", grad_f, grads),
-                        join_exprs(t, "float", grad_f + grads, grads));
+            const char* ddx = join_exprs(t, "float", grad_f, grads);
+            const char* ddy = join_exprs(t, "float", grad_f + grads, grads);
+            value = offset_expr ? fmt(t, "tex_.SampleGrad(smp_, %s, %s, %s, %s)", uv, ddx, ddy, offset_expr)
+                                : fmt(t, "tex_.SampleGrad(smp_, %s, %s, %s)", uv, ddx, ddy);
         } else if (!form.bias && !form.grad) {
-            value = form.clamp ? fmt(t, "tex_.Sample(smp_, %s, 0, %s)", uv, clamp_f)
-                               : fmt(t, "tex_.Sample(smp_, %s)", uv);
+            bool cs_no_derivs = t.info->stage == SHADER_COMPUTE &&
+                                !(t.info->threads[0] >= 4 && (t.info->threads[0] % 4) == 0 &&
+                                  t.info->threads[1] == 1 && t.info->threads[2] == 1) &&
+                                !((t.info->threads[0] % 2) == 0 && (t.info->threads[1] % 2) == 0);
+            if (cs_no_derivs && !form.clamp)
+                value = offset_expr ? fmt(t, "tex_.SampleLevel(smp_, %s, 0.0f, %s)", uv, offset_expr)
+                                    : fmt(t, "tex_.SampleLevel(smp_, %s, 0.0f)", uv);
+            else if (form.clamp)
+                value = fmt(t, "tex_.Sample(smp_, %s, %s, %s)", uv, offset_expr ? offset_expr : "0", clamp_f);
+            else
+                value = offset_expr ? fmt(t, "tex_.Sample(smp_, %s, %s)", uv, offset_expr)
+                                    : fmt(t, "tex_.Sample(smp_, %s)", uv);
         }
         if (!value) {
             translator_fail(t, "%s variant at 0x%x", rdna_op_name(in.op), in.offset);
