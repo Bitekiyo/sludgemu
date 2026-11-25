@@ -121,9 +121,14 @@ static HRESULT WINAPI ApuAlloc(void** virtual_address, ApuAddress* physical_addr
     ApuHeap* h = &g_apu.heaps[(flags & APU_ALLOC_NONCACHED) ? 1 : 0];
     u32 offset;
     bool ok = heap_alloc(h, size, alignment, &offset);
+    // The heap is only reserved: blocks commit their pages as they are handed out (and keep them).
+    if (ok && !VirtualAlloc(h->base + offset, size, MEM_COMMIT, PAGE_READWRITE)) {
+        heap_free(h, offset);
+        ok = false;
+    }
     ReleaseSRWLockExclusive(&g_apu.lock);
     if (!ok) {
-        LOG_W("apu", "ApuAlloc(%u bytes, alignment %u, flags 0x%x): heap exhausted", size, alignment, flags);
+        LOG_W("apu", "ApuAlloc(%u bytes, alignment %u, flags 0x%x): out of memory", size, alignment, flags);
         return E_OUTOFMEMORY;
     }
     memset(h->base + offset, 0, size);
@@ -256,7 +261,7 @@ static HRESULT WINAPI ApuCreateHeap(u32 cached_size, u32 noncached_size) {
     if (g_apu.memory) {
         hr = APU_E_HEAP_ALREADY_ALLOCATED;
     } else {
-        u8* memory = (u8*)VirtualAlloc(nullptr, cached + noncached, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        u8* memory = (u8*)VirtualAlloc(nullptr, cached + noncached, MEM_RESERVE, PAGE_READWRITE);
         if (!memory) {
             hr = E_OUTOFMEMORY;
         } else {
