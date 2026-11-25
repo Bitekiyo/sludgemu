@@ -14,7 +14,7 @@ struct SyncEntry {
     u64 end;
     ConsoleResource* resource; // registered while alive (texture_sync_remove before destruction)
     bool dirty;
-    bool linear; // laid out for CPU writes: uploaded every frame
+    bool linear; // laid out for CPU writes: copied by the GPU where the layout allows
 };
 
 static struct {
@@ -79,6 +79,7 @@ void texture_sync_add(ConsoleResource* r) {
 }
 
 void texture_sync_remove(ConsoleResource* r) {
+    u64 start = 0, size = 0;
     AcquireSRWLockExclusive(&g_sync.lock);
     for (u32 i = lower_bound(r->gpu_address); i < g_sync.count && g_sync.entries[i].start == r->gpu_address;
          i++) {
@@ -86,11 +87,15 @@ void texture_sync_remove(ConsoleResource* r) {
             continue;
         if (g_sync.entries[i].dirty)
             InterlockedDecrement(&g_sync.dirty);
+        start = g_sync.entries[i].start;
+        size = g_sync.entries[i].end - start;
         memmove(&g_sync.entries[i], &g_sync.entries[i + 1], (g_sync.count - i - 1) * sizeof(SyncEntry));
         g_sync.count--;
         break;
     }
     ReleaseSRWLockExclusive(&g_sync.lock);
+    // Its memory needn't stay protected; the report finds no texture there (or an alias to mark).
+    mem_end_write_watches((const void*)start, size);
 }
 
 void texture_sync_mark(u64 address, u64 size) {
@@ -119,18 +124,7 @@ static void on_mapping_changed(const u8* base, u64 size) {
 
 void texture_sync_init() {
     mem_add_mapping_listener(on_mapping_changed);
-}
-
-void texture_sync_new_frame() {
-    AcquireSRWLockExclusive(&g_sync.lock);
-    for (u32 i = 0; i < g_sync.count; i++) {
-        SyncEntry& e = g_sync.entries[i];
-        if (e.linear && !e.dirty) {
-            e.dirty = true;
-            InterlockedIncrement(&g_sync.dirty);
-        }
-    }
-    ReleaseSRWLockExclusive(&g_sync.lock);
+    mem_set_write_listener(texture_sync_mark);
 }
 
 bool texture_sync_pending() {
@@ -324,6 +318,9 @@ bool texture_sync_record(ID3D12GraphicsCommandList8* list, TextureUploadSources*
         if (!e.dirty)
             continue;
         bool mapped = mem_is_mapped((const void*)e.start, e.end - e.start);
+        // Watched before it is read: what the CPU writes from now on marks it again.
+        if (mapped && ((upload_count < MAX_UPLOADS && total < UPLOAD_BUDGET) || e.linear))
+            mem_watch_writes((const void*)e.start, e.end - e.start);
         if (mapped && e.linear && copy_from_title_memory(list, e.resource, e.end - e.start, sources))
             mapped = false, copied = true; // done
         else if (mapped && (upload_count == MAX_UPLOADS || total >= UPLOAD_BUDGET))
@@ -332,13 +329,6 @@ bool texture_sync_record(ID3D12GraphicsCommandList8* list, TextureUploadSources*
         InterlockedDecrement(&g_sync.dirty);
         if (!mapped)
             continue; // copied, or nothing to read yet (pages arrive with a later mapping)
-        if (e.linear)
-            LOG_W_ONCE(
-                "d3d12",
-                "linear textures the GPU can't copy from title memory (texture at 0x%llx, %llux%u x%u, "
-                "format %d) are uploaded by the CPU every frame",
-                e.start, e.resource->desc.Width, e.resource->desc.Height, e.resource->desc.DepthOrArraySize,
-                e.resource->desc.Format);
         u64 offset = total;
         u64 unused;
         ID3D12Resource* texture = console_resource_desktop(e.resource, &unused);

@@ -375,6 +375,12 @@ void ConsoleQueue::EnqueueRequest(const ConsoleRequest* r) {
         mem_prepare(destination, r->destination_size);
     d.Destination.Memory.Buffer = destination;
     d.Destination.Memory.Size = r->destination_size;
+    // The request writes title memory, possibly from the kernel, whose writes fail on write-protected
+    // pages: watches there end (and textures over it are marked). One armed again before the request
+    // completes, by an upload of a texture there, would fail it; titles load memory before making
+    // textures over it, so that has not been seen.
+    if (destination)
+        mem_end_write_watches(destination, r->destination_size);
 
     const void* source = nullptr;
     if (r->options & OPT_SOURCE_MEMORY) {

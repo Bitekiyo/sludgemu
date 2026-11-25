@@ -2,6 +2,7 @@
 // core/vfs.h). Opens are logged at debug level and failures at info, so missing files show up.
 
 #include <windows.h>
+#include <string.h>
 
 #include "common/log.h"
 #include "common/str.h"
@@ -109,9 +110,27 @@ static BOOL WINAPI hk_MoveFileExW(LPCWSTR from, LPCWSTR to, DWORD flags) {
 }
 
 // The kernel reads and writes title buffers without faulting them in, so their pages are backed
-// first (see mem_prepare).
+// first (see mem_prepare). Title memory may also be write-protected (see mem_watch_writes), which the
+// kernel's writes would fail on rather than fault: reads go through a buffer of ours and are copied
+// in, faulting as usual. Overlapped reads complete later, so their memory is unprotected instead.
 static BOOL WINAPI hk_ReadFile(HANDLE file, LPVOID buffer, DWORD size, LPDWORD read,
                                LPOVERLAPPED overlapped) {
+    if (!overlapped && size && mem_is_tracked(buffer)) {
+        // Page aligned, as unbuffered reads need sector-aligned buffers.
+        void* bounce = VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        if (bounce) {
+            DWORD got = 0;
+            BOOL ok = ReadFile(file, bounce, size, &got, nullptr);
+            DWORD error = GetLastError();
+            memcpy(buffer, bounce, got);
+            VirtualFree(bounce, 0, MEM_RELEASE);
+            if (read)
+                *read = got;
+            SetLastError(error);
+            return ok;
+        }
+    }
+    mem_end_write_watches(buffer, size);
     mem_prepare(buffer, size);
     return ReadFile(file, buffer, size, read, overlapped);
 }

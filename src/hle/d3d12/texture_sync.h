@@ -8,10 +8,10 @@
 // GPU only reads (no render target, depth or unordered access use) gets its contents uploaded from
 // title memory, detiled from the console layout, whenever that memory gets new contents: when the
 // texture is created (titles create textures over data they loaded), when pages are mapped into it
-// (physical page mappings, GPU page mapping copies), and for linear textures (the layout titles write
-// with the CPU, glyph caches and video frames) every frame. Writes to title memory can't be caught
-// cheaply (memory the GPU sees through windows is locked by the driver, so pages can't be protected),
-// but linear textures are few and small, and the GPU copies them straight from title memory.
+// (physical page mappings, GPU page mapping copies), and when the CPU writes it (glyph caches, video
+// frames). Uploading a texture write-protects its memory (see mem_watch_writes): the first write after
+// that marks it again, so the next submission uploads what the CPU wrote before it, as the console's
+// GPU would read it. Linear textures are copied by the GPU straight from title memory.
 //
 // On desktop such textures stay in the common layout: title barriers keep their synchronization but
 // change no layouts, so uploads can run between any two submissions.
@@ -26,9 +26,6 @@ void texture_sync_remove(ConsoleResource* r);
 
 // Title memory [address, address + size) has new contents. Mapping changes call this themselves.
 void texture_sync_mark(u64 address, u64 size);
-
-// Linear textures become waiting uploads. Once per frame.
-void texture_sync_new_frame();
 
 // Whether uploads are waiting; cheap.
 bool texture_sync_pending();

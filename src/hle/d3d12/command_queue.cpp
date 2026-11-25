@@ -249,7 +249,6 @@ static HRESULT WINAPI queue_present_x(ConsoleCommandQueue* self, UINT plane_coun
     (void)parameters; // immediate flips, tearing and VRR preferences
     if (plane_count > PRESENT_MAX_PLANES || (plane_count && !planes))
         return E_INVALIDARG;
-    texture_sync_new_frame(); // linear textures are uploaded with the next frame's first submission
     PresentPlane out[PRESENT_MAX_PLANES] = {};
     for (UINT i = 0; i < plane_count; i++) {
         const ConsolePresentPlane& in = planes[i];
