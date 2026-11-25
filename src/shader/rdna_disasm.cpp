@@ -5,7 +5,7 @@
 
 #include "shader/rdna.h"
 
-struct Text {
+struct Line {
     char* out;
     usize size;
     usize len;
@@ -15,7 +15,7 @@ struct Text {
 
 #include <stdarg.h>
 
-void Text::put(const char* fmt, ...) {
+void Line::put(const char* fmt, ...) {
     if (len >= size)
         return;
     va_list args;
@@ -29,14 +29,14 @@ void Text::put(const char* fmt, ...) {
 static const char* const k_inline_floats[] = {"0.5",  "-0.5", "1.0",  "-1.0",      "2.0",
                                               "-2.0", "4.0",  "-4.0", "0.15915494"};
 
-static void put_register(Text& t, char file, u32 reg, u32 count) {
+static void put_register(Line& t, char file, u32 reg, u32 count) {
     if (count <= 1)
         t.put("%c%u", file, reg);
     else
         t.put("%c[%u:%u]", file, reg, reg + count - 1);
 }
 
-static void put_special(Text& t, u32 code, u32 count) {
+static void put_special(Line& t, u32 code, u32 count) {
     switch (code) {
     case SRC_VCC_LO:
         t.put(count == 2 ? "vcc" : "vcc_lo");
@@ -89,7 +89,7 @@ static void put_special(Text& t, u32 code, u32 count) {
     }
 }
 
-static void put_operand(Text& t, const RdnaOperand& o) {
+static void put_operand(Line& t, const RdnaOperand& o) {
     if (o.neg)
         t.put("-");
     if (o.abs)
@@ -126,7 +126,7 @@ static void put_operand(Text& t, const RdnaOperand& o) {
         t.put("|");
 }
 
-static void put_mnemonic(Text& t, const RdnaInst& in) {
+static void put_mnemonic(Line& t, const RdnaInst& in) {
     const char* name = rdna_op_name(in.op);
     if (in.enc == ENC_VOP3 && in.op == OP_V_NOP && in.src[0].kind == OPND_NONE)
         name = "v_nop";
@@ -171,7 +171,7 @@ static const char* const k_dims[8] = {
     "SQ_RSRC_IMG_1D",       "SQ_RSRC_IMG_2D",       "SQ_RSRC_IMG_3D",      "SQ_RSRC_IMG_CUBE",
     "SQ_RSRC_IMG_1D_ARRAY", "SQ_RSRC_IMG_2D_ARRAY", "SQ_RSRC_IMG_2D_MSAA", "SQ_RSRC_IMG_2D_MSAA_ARRAY"};
 
-static void put_sopp(Text& t, const RdnaInst& in) {
+static void put_sopp(Line& t, const RdnaInst& in) {
     switch (in.op) {
     case OP_S_ENDPGM:
     case OP_S_CODE_END:
@@ -210,7 +210,7 @@ static void put_sopp(Text& t, const RdnaInst& in) {
         t.put("0x%04x", (u32)(u16)in.simm16);
 }
 
-static void put_dpp(Text& t, const RdnaInst& in) {
+static void put_dpp(Line& t, const RdnaInst& in) {
     if (in.dpp.dpp8) {
         t.put(" dpp8:[%u,%u,%u,%u,%u,%u,%u,%u]", in.dpp.sel8[0], in.dpp.sel8[1], in.dpp.sel8[2],
               in.dpp.sel8[3], in.dpp.sel8[4], in.dpp.sel8[5], in.dpp.sel8[6], in.dpp.sel8[7]);
@@ -242,7 +242,7 @@ static void put_dpp(Text& t, const RdnaInst& in) {
         t.put(" fi:1");
 }
 
-static void put_sdwa(Text& t, const RdnaInst& in) {
+static void put_sdwa(Line& t, const RdnaInst& in) {
     static const char* const k_sel[8] = {"BYTE_0", "BYTE_1", "BYTE_2", "BYTE_3",
                                          "WORD_0", "WORD_1", "DWORD",  "?"};
     if (in.enc != ENC_VOPC)
@@ -252,7 +252,7 @@ static void put_sdwa(Text& t, const RdnaInst& in) {
         t.put(" src1_sel:%s", k_sel[in.sdwa.src_sel[1] & 7]);
 }
 
-static void put_export(Text& t, const RdnaInst& in) {
+static void put_export(Line& t, const RdnaInst& in) {
     u32 target = in.exp.target;
     if (target < 8)
         t.put("mrt%u", target);
@@ -286,7 +286,7 @@ static void put_export(Text& t, const RdnaInst& in) {
 }
 
 usize rdna_disassemble(const RdnaInst& in, char* out, usize size) {
-    Text t = {out, size, 0};
+    Line t = {out, size, 0};
     if (size)
         out[0] = 0;
     if (in.enc == ENC_VOP3 && in.op == OP_V_NOP && in.src[0].kind == OPND_LITERAL) {

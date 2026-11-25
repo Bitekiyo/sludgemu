@@ -3,13 +3,21 @@
 //   shader_tool disasm <code.bin>          disassemble raw GPU code
 //   shader_tool stats <dir> [name filter]  instruction statistics over the unique programs in a dump
 //                                          directory; lists instructions that fail to decode
+//   shader_tool translate <dir> <pipeline> <vs|ps>   translate one stage of a dumped pipeline to HLSL
+//   shader_tool translate-all <dir> <out dir>        translate every unique program of a dump, write
+//                                                    the HLSL and a summary of failures
+//
+// Dumps hold, per pipeline pNNNNN: _g_packet.bin, _g_meta.bin, _rs.txt (root signature as text) and
+// _vs_code.bin / _ps_code.bin.
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <windows.h>
 
+#include "shader/console_pipeline.h"
 #include "shader/rdna.h"
+#include "shader/translate.h"
 
 static u8* read_file(const char* path, u32* size) {
     FILE* f = fopen(path, "rb");
@@ -142,12 +150,226 @@ static int stats(const char* dir, const char* filter) {
     return 0;
 }
 
+// --- translation -------------------------------------------------------------------------------------
+
+// The root signature dump: "flags F params N ..." then "param i type T vis V [constants N ...] [range
+// type count reg space offset]...".
+static bool read_root_layout(const char* path, ConsoleRootLayout* layout) {
+    memset(layout, 0, sizeof(*layout));
+    FILE* f = fopen(path, "r");
+    if (!f)
+        return false;
+    char line[2048];
+    unsigned flags = 0, params = 0;
+    if (!fgets(line, sizeof(line), f) || sscanf(line, "flags %x params %u", &flags, &params) != 2) {
+        fclose(f);
+        return false;
+    }
+    layout->flags = flags;
+    layout->parameter_count = (u8)params;
+    for (u32 i = 0; i < params && fgets(line, sizeof(line), f); i++) {
+        unsigned index = 0, type = 0, vis = 0;
+        int used = 0;
+        if (sscanf(line, "param %u type %u vis %u%n", &index, &type, &vis, &used) != 3 ||
+            index >= SHADER_MAX_ROOT_PARAMETERS)
+            break;
+        ConsoleRootParameter& p = layout->parameters[index];
+        const char* rest = line + used;
+        switch (type) {
+        case 0: { // table
+            p.type = ROOT_TABLE;
+            int n = 0;
+            unsigned rt, count, reg, space, offset;
+            while (sscanf(rest, " range %u %u %u %u %u%n", &rt, &count, &reg, &space, &offset, &n) == 5 &&
+                   p.range_count < SHADER_MAX_TABLE_RANGES) {
+                if (rt == 3)
+                    p.sampler_table = true;
+                TableRange& r = p.ranges[p.range_count++];
+                r.kind = rt == 0 ? RANGE_SRV : rt == 1 ? RANGE_UAV : RANGE_CBV;
+                r.count = count;
+                r.offset = offset;
+                rest += n;
+            }
+            break;
+        }
+        case 1: {
+            unsigned n = 0;
+            sscanf(rest, " constants %u", &n);
+            p.type = ROOT_CONSTANTS;
+            p.constants = (u8)n;
+            break;
+        }
+        case 2:
+            p.type = ROOT_CBV;
+            break;
+        case 3:
+            p.type = ROOT_SRV;
+            break;
+        default:
+            p.type = ROOT_UAV;
+            break;
+        }
+    }
+    fclose(f);
+    return true;
+}
+
+// ShaderInfo for one stage of a dumped graphics pipeline.
+static bool pipeline_info(const char* dir, const char* name, bool pixel, ShaderInfo* info) {
+    char path[MAX_PATH];
+    u32 packet_size = 0, meta_size = 0;
+    snprintf(path, sizeof(path), "%s\\%s_g_packet.bin", dir, name);
+    u8* packet = read_file(path, &packet_size);
+    snprintf(path, sizeof(path), "%s\\%s_g_meta.bin", dir, name);
+    u8* meta = read_file(path, &meta_size);
+    ConsoleRootLayout layout;
+    snprintf(path, sizeof(path), "%s\\%s_rs.txt", dir, name);
+    bool ok = packet && meta && read_root_layout(path, &layout);
+    ConsoleGraphicsShaders g = {};
+    ok = ok && console_parse_graphics(packet, packet_size, meta, meta_size, &g);
+    if (ok) {
+        memset(info, 0, sizeof(*info));
+        info->stage = pixel ? SHADER_PIXEL : SHADER_VERTEX;
+        console_user_data_layout(layout, CONSOLE_FIRST_ROOT_SGPR_GRAPHICS, info);
+        info->user_sgprs = pixel ? g.ps_user_sgprs : g.vs_user_sgprs;
+        info->ps_input_addr = g.ps_input_ena;
+        info->ps_color_format = g.ps_color_format;
+        info->element_count = g.element_count;
+        memcpy(info->elements, g.elements, sizeof(g.elements));
+    }
+    free(packet);
+    free(meta);
+    return ok;
+}
+
+static int translate_one(const char* dir, const char* name, const char* stage) {
+    bool pixel = strcmp(stage, "ps") == 0;
+    ShaderInfo info;
+    if (!pipeline_info(dir, name, pixel, &info)) {
+        fprintf(stderr, "cannot read pipeline %s\n", name);
+        return 1;
+    }
+    char path[MAX_PATH];
+    snprintf(path, sizeof(path), "%s\\%s_%s_code.bin", dir, name, stage);
+    u32 size = 0;
+    u8* code = read_file(path, &size);
+    if (!code) {
+        fprintf(stderr, "cannot read %s\n", path);
+        return 1;
+    }
+    TranslatedShader out = {};
+    bool ok = shader_translate(code, size, info, &out);
+    if (out.hlsl.data)
+        fputs(out.hlsl.data, stdout);
+    if (!ok)
+        fprintf(stderr, "translation failed: %s\n", out.error);
+    out.hlsl.release();
+    free(code);
+    return ok ? 0 : 1;
+}
+
+struct FailureCount {
+    char reason[160];
+    u32 count;
+    char example[64];
+};
+
+static int translate_all(const char* dir, const char* out_dir) {
+    static u64 seen[1 << 16];
+    static FailureCount failures[512];
+    u32 failure_kinds = 0, programs = 0, translated = 0;
+    char pattern[MAX_PATH];
+    snprintf(pattern, sizeof(pattern), "%s\\p*_g_packet.bin", dir);
+    WIN32_FIND_DATAA fd;
+    HANDLE find = FindFirstFileA(pattern, &fd);
+    if (find == INVALID_HANDLE_VALUE)
+        return 1;
+    CreateDirectoryA(out_dir, nullptr);
+    TranslatedShader out = {};
+    do {
+        char name[16] = {};
+        memcpy(name, fd.cFileName, 6);
+        for (u32 stage = 0; stage < 2; stage++) {
+            const char* stage_name = stage ? "ps" : "vs";
+            char path[MAX_PATH];
+            snprintf(path, sizeof(path), "%s\\%s_%s_code.bin", dir, name, stage_name);
+            u32 size = 0;
+            u8* code = read_file(path, &size);
+            if (!code)
+                continue;
+            u64 h = hash_bytes(code, size) ^ (stage ? 0x9e3779b97f4a7c15ull : 0) | 1;
+            u32 slot = (u32)h & 0xFFFF;
+            bool fresh = true;
+            while (seen[slot]) {
+                if (seen[slot] == h) {
+                    fresh = false;
+                    break;
+                }
+                slot = (slot + 1) & 0xFFFF;
+            }
+            ShaderInfo info;
+            if (!fresh || !pipeline_info(dir, name, stage == 1, &info)) {
+                free(code);
+                continue;
+            }
+            seen[slot] = h;
+            programs++;
+            if (shader_translate(code, size, info, &out)) {
+                translated++;
+                snprintf(path, sizeof(path), "%s\\%s_%s.hlsl", out_dir, name, stage_name);
+                FILE* f = fopen(path, "w");
+                if (f) {
+                    fputs(out.hlsl.data, f);
+                    fclose(f);
+                }
+            } else {
+                // Group by reason, ignoring offsets.
+                char reason[160];
+                snprintf(reason, sizeof(reason), "%s", out.error);
+                char* at = strstr(reason, " at 0x");
+                if (at)
+                    *at = 0;
+                u32 k = 0;
+                while (k < failure_kinds && strcmp(failures[k].reason, reason) != 0)
+                    k++;
+                if (k == failure_kinds && failure_kinds < 512) {
+                    snprintf(failures[k].reason, sizeof(failures[k].reason), "%s", reason);
+                    snprintf(failures[k].example, sizeof(failures[k].example), "%s_%s", name, stage_name);
+                    failure_kinds++;
+                }
+                if (k < failure_kinds)
+                    failures[k].count++;
+            }
+            free(code);
+        }
+    } while (FindNextFileA(find, &fd));
+    FindClose(find);
+    out.hlsl.release();
+    printf("%u unique programs, %u translated\n", programs, translated);
+    for (;;) {
+        u32 best = ~0u;
+        for (u32 k = 0; k < failure_kinds; k++)
+            if (failures[k].count && (best == ~0u || failures[k].count > failures[best].count))
+                best = k;
+        if (best == ~0u)
+            break;
+        printf("%6u  %-90s %s\n", failures[best].count, failures[best].reason, failures[best].example);
+        failures[best].count = 0;
+    }
+    return 0;
+}
+
 int main(int argc, char** argv) {
     rdna_init();
     if (argc >= 3 && strcmp(argv[1], "disasm") == 0)
         return disasm(argv[2]);
+    if (argc >= 5 && strcmp(argv[1], "translate") == 0)
+        return translate_one(argv[2], argv[3], argv[4]);
+    if (argc >= 4 && strcmp(argv[1], "translate-all") == 0)
+        return translate_all(argv[2], argv[3]);
     if (argc >= 3 && strcmp(argv[1], "stats") == 0)
         return stats(argv[2], argc >= 4 ? argv[3] : nullptr);
-    fprintf(stderr, "usage: shader_tool disasm <code.bin> | stats <dir> [filter]\n");
+    fprintf(stderr, "usage: shader_tool disasm <code.bin> | stats <dir> [filter] | translate <dir> "
+                    "<pipeline> <vs|ps> | translate-all <dir> <out>\n");
     return 1;
 }

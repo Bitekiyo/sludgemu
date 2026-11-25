@@ -430,7 +430,8 @@ static void vop_extension(Reader& r, RdnaInst* in, u32 src0_field) {
     } else {
         in->has_sdwa = true;
         bool s0_sgpr = bits(x, 23, 1);
-        s0 = s0_sgpr ? sgpr(bits(x, 0, 8), s0.count) : vgpr(bits(x, 0, 8), s0.count);
+        s0 = s0_sgpr ? source(r, bits(x, 0, 8), s0.count)
+                     : vgpr(bits(x, 0, 8), s0.count); // scalar: SGPR or constant
         if (in->enc == ENC_VOPC) {
             if (bits(x, 15, 1))
                 in->dst[0] = sgpr(bits(x, 8, 7), 2);
@@ -450,7 +451,7 @@ static void vop_extension(Reader& r, RdnaInst* in, u32 src0_field) {
         in->src[1].abs = bits(x, 29, 1);
         if (bits(x, 31, 1) && in->src[1].kind == OPND_VGPR) {
             u16 reg = in->src[1].reg;
-            in->src[1] = sgpr(reg, in->src[1].count);
+            in->src[1] = source(r, reg, in->src[1].count);
         }
     }
 }

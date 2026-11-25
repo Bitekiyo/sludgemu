@@ -5,6 +5,16 @@ add_library(sludge_shader STATIC
     shader/rdna_ops.inc
     shader/rdna_decode.cpp
     shader/rdna_disasm.cpp
+    shader/text.h
+    shader/text.cpp
+    shader/translate.h
+    shader/translate_internal.h
+    shader/translate.cpp
+    shader/translate_emit.cpp
+    shader/translate_alu.cpp
+    shader/translate_memory.cpp
+    shader/console_pipeline.h
+    shader/console_pipeline.cpp
 )
 target_include_directories(sludge_shader PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(sludge_shader PRIVATE sludge_options)
