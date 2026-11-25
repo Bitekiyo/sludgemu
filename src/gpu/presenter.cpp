@@ -155,31 +155,49 @@ static bool setup(Presenter* p, ID3D12CommandQueue* queue) {
     return true;
 }
 
-// RenderDoc: under renderdoccmd, SLUDGE_RENDERDOC_FRAME=<n> captures the frame after the n-th
-// present. Title rendering runs on its own queues, so the capture spans the whole frame.
+// RenderDoc: under renderdoccmd, SLUDGE_RENDERDOC_FRAME=<n>[,<n>...] captures the frames after those
+// presents (up to 16, ascending). Title rendering runs on its own queues, so a capture spans the
+// whole frame.
 typedef int(__cdecl* RenderDocGetApi)(int version, void** api);
 #define RENDERDOC_API_VERSION_1_1_2 10102
 #define RENDERDOC_TRIGGER_CAPTURE   15 // entry of the API function table
+#define RENDERDOC_MAX_FRAMES        16
 
 static void renderdoc_frame() {
     static void** s_api = nullptr;
-    static u64 s_capture_frame = 0;
+    static u64 s_frames[RENDERDOC_MAX_FRAMES];
+    static u32 s_frame_count = 0, s_next = 0;
     static u64 s_frame = 0;
     static bool s_checked = false;
     if (!s_checked) {
         s_checked = true;
-        char value[32];
+        char value[256];
         HMODULE renderdoc = GetModuleHandleW(L"renderdoc.dll");
         RenderDocGetApi get_api =
             renderdoc ? (RenderDocGetApi)GetProcAddress(renderdoc, "RENDERDOC_GetAPI") : nullptr;
         if (get_api && GetEnvironmentVariableA("SLUDGE_RENDERDOC_FRAME", value, sizeof(value)) &&
             get_api(RENDERDOC_API_VERSION_1_1_2, (void**)&s_api) == 1) {
-            s_capture_frame = strtoull(value, nullptr, 10);
-            LOG_I("present", "RenderDoc: capturing frame %llu", (unsigned long long)s_capture_frame);
+            for (const char* p = value; *p && s_frame_count < RENDERDOC_MAX_FRAMES;) {
+                char* end = nullptr;
+                u64 frame = strtoull(p, &end, 10);
+                if (end == p)
+                    break;
+                s_frames[s_frame_count++] = frame;
+                p = *end == ',' ? end + 1 : end;
+            }
+            LOG_I("present", "RenderDoc: capturing %u frames from %llu", s_frame_count,
+                  s_frame_count ? (unsigned long long)s_frames[0] : 0ull);
         }
     }
-    if (s_api && ++s_frame == s_capture_frame)
+    if (!s_api)
+        return;
+    ++s_frame;
+    while (s_next < s_frame_count && s_frames[s_next] < s_frame)
+        s_next++; // passed (not ascending)
+    if (s_next < s_frame_count && s_frames[s_next] == s_frame) {
         ((void(__cdecl*)())s_api[RENDERDOC_TRIGGER_CAPTURE])();
+        s_next++;
+    }
 }
 
 static void wait_frame(Presenter* p, u64 value) {

@@ -21,29 +21,42 @@ struct Job {
     void* context;
 };
 
+// Two lanes: work a draw is waiting for, served first, and programs titles merely created (often
+// thousands at once, at startup).
 #define JOB_CAPACITY 65536
 
-static Job* g_jobs;
-static u32 g_job_head, g_job_count;
+struct JobLane {
+    Job* jobs;
+    u32 head, count;
+};
+
+static JobLane g_lanes[2]; // urgent, background
 static SRWLOCK g_job_lock = SRWLOCK_INIT;
 static CONDITION_VARIABLE g_job_ready = CONDITION_VARIABLE_INIT;
 static bool g_ready;
 
-static void queue(const Job& job) {
+static bool queue(const Job& job, bool urgent) {
     AcquireSRWLockExclusive(&g_job_lock);
-    if (g_job_count == JOB_CAPACITY) {
+    JobLane& lane = g_lanes[urgent ? 0 : 1];
+    if (lane.count == JOB_CAPACITY) {
         ReleaseSRWLockExclusive(&g_job_lock);
         LOG_E("gpu", "GPU job queue full; job dropped");
-        return;
+        return false;
     }
-    g_jobs[(g_job_head + g_job_count) % JOB_CAPACITY] = job;
-    g_job_count++;
+    lane.jobs[(lane.head + lane.count) % JOB_CAPACITY] = job;
+    lane.count++;
     ReleaseSRWLockExclusive(&g_job_lock);
     WakeConditionVariable(&g_job_ready);
+    return true;
 }
 
 void gpu_job_queue(void (*run)(void* context), void* context) {
-    queue({nullptr, run, context});
+    queue({nullptr, run, context}, true);
+}
+
+void shader_program_hurry(ShaderProgram* p) {
+    if (p && p->state == PROGRAM_PENDING && InterlockedExchange(&p->urgent, 1) == 0)
+        queue({p, nullptr, nullptr}, true);
 }
 
 // --- compiler ----------------------------------------------------------------------------------------
@@ -91,6 +104,10 @@ static void dump(const ShaderProgram* p, const char* hlsl, const char* reason) {
 }
 
 static void build_program(Worker& w, ShaderProgram* p) {
+    // Programs can be queued in both lanes; the first worker to get one builds it.
+    if (InterlockedCompareExchange((volatile LONG*)&p->state, PROGRAM_BUILDING, PROGRAM_PENDING) !=
+        PROGRAM_PENDING)
+        return;
     TranslatedShader t = {};
     u32 state = PROGRAM_FAILED;
     if (!shader_translate(p->code, p->code_size, p->info, &t)) {
@@ -161,11 +178,12 @@ static DWORD WINAPI worker_main(void* param) {
     }
     for (;;) {
         AcquireSRWLockExclusive(&g_job_lock);
-        while (g_job_count == 0)
+        while (g_lanes[0].count == 0 && g_lanes[1].count == 0)
             SleepConditionVariableSRW(&g_job_ready, &g_job_lock, INFINITE, 0);
-        Job job = g_jobs[g_job_head];
-        g_job_head = (g_job_head + 1) % JOB_CAPACITY;
-        g_job_count--;
+        JobLane& lane = g_lanes[g_lanes[0].count ? 0 : 1];
+        Job job = lane.jobs[lane.head];
+        lane.head = (lane.head + 1) % JOB_CAPACITY;
+        lane.count--;
         ReleaseSRWLockExclusive(&g_job_lock);
         if (job.program)
             build_program(w, job.program);
@@ -289,9 +307,10 @@ bool shader_programs_init() {
         LOG_E("gpu", "dxcompiler.dll is missing: shaders cannot be translated");
         return false;
     }
-    g_jobs = (Job*)calloc(JOB_CAPACITY, sizeof(Job));
+    for (JobLane& lane : g_lanes)
+        lane.jobs = (Job*)calloc(JOB_CAPACITY, sizeof(Job));
     g_programs = (ShaderProgram**)calloc(PROGRAM_TABLE_SIZE, sizeof(ShaderProgram*));
-    if (!g_jobs || !g_programs)
+    if (!g_lanes[0].jobs || !g_lanes[1].jobs || !g_programs)
         return false;
     SYSTEM_INFO si;
     GetSystemInfo(&si);
@@ -348,6 +367,6 @@ ShaderProgram* shader_program_get(const void* code, u32 code_size, const ShaderI
     }
     ReleaseSRWLockExclusive(&g_program_lock);
     if (p)
-        queue({p, nullptr, nullptr});
+        queue({p, nullptr, nullptr}, false);
     return p;
 }

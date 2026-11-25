@@ -15,10 +15,12 @@ enum ShaderProgramState : u32 {
     PROGRAM_PENDING,
     PROGRAM_READY,
     PROGRAM_FAILED,
+    PROGRAM_BUILDING,
 };
 
 struct ShaderProgram {
-    volatile u32 state; // ShaderProgramState; READY/FAILED are final
+    volatile u32 state;   // ShaderProgramState; READY/FAILED are final
+    volatile long urgent; // queued again in the urgent lane
     ShaderStage stage;
     u64 key;
 
@@ -51,5 +53,8 @@ ShaderProgram* shader_program_get(const void* code, u32 code_size, const ShaderI
 // kept; nullptr (logged) if it can't be.
 const D3D12_SHADER_BYTECODE* shader_rect_list_gs(u32 param_mask);
 
-// Runs `job(context)` on a worker thread.
+// A draw is waiting for `program`: build it before the programs merely created.
+void shader_program_hurry(ShaderProgram* program);
+
+// Runs `job(context)` on a worker thread, before queued programs (jobs are for draws waiting).
 void gpu_job_queue(void (*job)(void* context), void* context);
