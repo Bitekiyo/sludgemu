@@ -206,6 +206,36 @@ static void layout_ps_inputs(Translator& t) {
     }
 }
 
+static bool covers(const RdnaOperand& o, u32 reg) {
+    return o.kind == OPND_VGPR && reg - o.reg < (o.count ? o.count : 1u);
+}
+
+// Whether the program reads `reg` before writing it, taken in program order: input VGPRs are read
+// where the program starts, before their registers are reused.
+static bool vgpr_live_in(const Translator& t, u32 reg) {
+    const Program& p = t.program;
+    for (u32 i = 0; i < p.count; i++) {
+        const RdnaInst& in = p.insts[i];
+        for (u32 j = 0; j < in.num_src; j++)
+            if (covers(in.src[j], reg))
+                return true;
+        if (covers(in.dst[0], reg) || covers(in.dst[1], reg))
+            return false;
+    }
+    return false;
+}
+
+// Whether the program reads a pixel shader input: any of its VGPRs before they are written.
+static bool ps_input_read(const Translator& t, PsInput input) {
+    u32 first = t.ps_input_vgpr[input];
+    if (first == ~0u)
+        return false;
+    for (u32 r = first; r < first + k_ps_input_vgprs[input] && r < 256; r++)
+        if (t.vgpr_used[r] && vgpr_live_in(t, r))
+            return true;
+    return false;
+}
+
 // The interpolation an I/J VGPR pair stands for.
 static Interpolation interpolation_of(const Translator& t, u32 reg) {
     static const Interpolation k_modes[7] = {
@@ -555,6 +585,16 @@ static u32 raw_element_format(u32 components) {
 // shaders may also read some components flat and others interpolated (the hardware interpolates
 // per instruction); such attributes are declared flat and interpolated with the barycentrics.
 static bool write_attribute_declarations(Translator& t, Text& h) {
+    static const PsInput k_untranslated[] = {PS_PERSP_PULL_MODEL, PS_LINE_STIPPLE, PS_ANCILLARY};
+    static const char* const k_untranslated_names[] = {"pull-model interpolation", "line stipple",
+                                                       "ancillary"};
+    for (u32 i = 0; i < ARRAY_COUNT(k_untranslated); i++) {
+        if (ps_input_read(t, k_untranslated[i])) {
+            translator_fail(t, "pixel shader reads the %s input, which is not translated",
+                            k_untranslated_names[i]);
+            return false;
+        }
+    }
     u8 interpolated_modes = 0; // modes mixed attributes need barycentrics for
     for (u32 i = 0; i < 32; i++) {
         u8 modes = t.attribute_modes[i];
@@ -583,6 +623,8 @@ static bool write_attribute_declarations(Translator& t, Text& h) {
     }
     if (bary_mode != INTERP_NONE)
         h.put("    %sfloat3 barycentrics : SV_Barycentrics;\n", interpolation_keyword(bary_mode));
+    if (ps_input_read(t, PS_SAMPLE_COVERAGE))
+        h.put("    uint coverage : SV_Coverage;\n");
     h.put("    bool front_face : SV_IsFrontFace;\n};\n");
     for (u32 i = 0; i < 32; i++) {
         u8 modes = t.attribute_modes[i];
@@ -723,6 +765,11 @@ static void write_declarations(Translator& t, Text& h) {
                     init = k_pos[i - PS_POS_X];
             if (t.ps_input_vgpr[PS_FRONT_FACE] == r)
                 init = "(input.front_face ? 0x3f800000u : 0xbf800000u)";
+            // The pixel's integer position, x in the low half and y in the high half.
+            if (t.ps_input_vgpr[PS_POS_FIXED_PT] == r)
+                init = "((uint)input.position.x | ((uint)input.position.y << 16))";
+            if (t.ps_input_vgpr[PS_SAMPLE_COVERAGE] == r)
+                init = "input.coverage";
         }
         h.put("    uint v%u = %s;\n", r, init);
     }
