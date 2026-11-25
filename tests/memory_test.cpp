@@ -321,6 +321,7 @@ static void test_lazy_commit() {
 
 void test_xapu_decode();
 void test_xapu_convert();
+void test_xdsp();
 
 int main() {
     log_init(nullptr, LOG_LEVEL_WARN);
@@ -338,6 +339,7 @@ int main() {
     test_lazy_commit();
     test_xapu_decode();
     test_xapu_convert();
+    test_xdsp();
     printf("%s (%d failures)\n", g_failures ? "FAILED" : "passed", g_failures);
     return g_failures;
 }
