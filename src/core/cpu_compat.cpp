@@ -227,7 +227,7 @@ static u32 emulate_sse4a(const u8* ip, const u8* end, CONTEXT* ctx) {
         return 0;
     u32 reg = ((modrm >> 3) & 7) | ((rex & 4) ? 8 : 0);
     u32 rm = (modrm & 7) | ((rex & 1) ? 8 : 0);
-    u32 len, idx;
+    u32 len = 0, idx = 0; // from the immediate here, or from the source register below
     if (immediate) {
         if (ip + at + 2 > end)
             return 0;
