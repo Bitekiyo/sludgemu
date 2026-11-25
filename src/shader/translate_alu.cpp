@@ -1624,6 +1624,9 @@ static bool begin_dpp(Translator& t, const RdnaInst& in) {
     } else if (c >= 0x121 && c <= 0x12F) {
         u32 k = c - 0x120;
         addr = fmt(t, "uint sl_ = (l_ & ~15u) | ((l_ + %uu) & 15u); bool b_ = true;", 16u - k);
+    } else if (c == 0x140 || c == 0x141) {
+        // Mirrors within the row or half-row: lane i reads lane 15 - i (7 - i).
+        addr = fmt(t, "uint sl_ = l_ ^ %uu; bool b_ = true;", c == 0x140 ? 15u : 7u);
     } else if (c >= 0x150 && c <= 0x15F) {
         addr = fmt(t, "uint sl_ = (l_ & ~15u) | %uu; bool b_ = true;", c - 0x150);
     } else if (c >= 0x160 && c <= 0x16F) {
