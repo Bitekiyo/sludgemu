@@ -20,7 +20,7 @@ static char g_names[OP_COUNT][32];
 // Opcode -> op, per encoding. VOP3 covers the promoted VOPC, VOP2 and VOP1 forms as well.
 static RdnaOp g_sop2[128], g_sopk[32], g_sop1[256], g_sopc[128], g_sopp[128], g_smem[256];
 static RdnaOp g_vop2[64], g_vop1[256], g_vopc[256], g_vop3[1024], g_vop3p[128], g_vintrp[4];
-static RdnaOp g_ds[256], g_mubuf[128], g_mtbuf[16], g_mimg[256], g_global[128];
+static RdnaOp g_ds[256], g_mubuf[256], g_mtbuf[16], g_mimg[256], g_global[128];
 
 static const struct {
     const char* name;
@@ -717,11 +717,19 @@ static void decode_buffer(Reader& r, u32 w, u32 w1, RdnaInst* in, bool typed) {
         in->op = g_mtbuf[bits(w, 16, 3) | (bits(w1, 21, 1) << 3)];
         m.format = (u8)bits(w, 19, 7);
         data = (u8)((in->op - OP_TBUFFER_LOAD_FORMAT_X) % 4 + 1);
+        if (in->op >= OP_TBUFFER_LOAD_FORMAT_D16_X)
+            data = (u8)((data + 1) / 2); // two 16-bit components per register
     } else {
         in->enc = ENC_MUBUF;
-        in->op = g_mubuf[bits(w, 18, 7)];
+        in->op = g_mubuf[bits(w, 18, 7) | (bits(w, 25, 1) << 7)]; // bit 25 extends the opcode
         m.lds = bits(w, 16, 1);
         switch (in->op) {
+        case OP_BUFFER_LOAD_FORMAT_D16_XYZ:
+        case OP_BUFFER_LOAD_FORMAT_D16_XYZW:
+        case OP_BUFFER_STORE_FORMAT_D16_XYZ:
+        case OP_BUFFER_STORE_FORMAT_D16_XYZW:
+            data = 2; // two 16-bit components per register
+            break;
         case OP_BUFFER_LOAD_FORMAT_XY:
         case OP_BUFFER_STORE_FORMAT_XY:
         case OP_BUFFER_LOAD_DWORDX2:

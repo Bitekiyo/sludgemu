@@ -142,6 +142,12 @@ static bool is_format_access(RdnaOp op) {
            (op >= OP_TBUFFER_LOAD_FORMAT_X && op <= OP_TBUFFER_STORE_FORMAT_XYZW);
 }
 
+// Formatted accesses with two 16-bit components per register.
+static bool is_d16_format(RdnaOp op) {
+    return (op >= OP_BUFFER_LOAD_FORMAT_D16_X && op <= OP_BUFFER_STORE_FORMAT_D16_XYZW) ||
+           (op >= OP_TBUFFER_LOAD_FORMAT_D16_X && op <= OP_TBUFFER_STORE_FORMAT_D16_XYZW);
+}
+
 // Vertex element formats: components and bytes per component (0 for packed formats), and which
 // input assembler component each component in memory becomes.
 struct FormatLayout {
@@ -276,7 +282,7 @@ static bool vertex_format_layout(u32 format, FormatLayout* out) {
 }
 
 static bool emit_vertex_fetch(Translator& t, const RdnaInst& in, u32 slot) {
-    if (t.info->stage != SHADER_VERTEX || is_store(in.op) || in.mem.offen) {
+    if (t.info->stage != SHADER_VERTEX || is_store(in.op) || in.mem.offen || is_d16_format(in.op)) {
         translator_fail(t, "unexpected access through a vertex buffer descriptor at 0x%x", in.offset);
         return false;
     }
@@ -362,7 +368,8 @@ static bool emit_buffer(Translator& t, const RdnaInst& in) {
     bool sub_dword = (in.op >= OP_BUFFER_LOAD_UBYTE && in.op <= OP_BUFFER_LOAD_SSHORT) ||
                      (in.op >= OP_BUFFER_STORE_BYTE && in.op <= OP_BUFFER_STORE_SHORT_D16_HI) ||
                      in.op >= OP_BUFFER_LOAD_UBYTE_D16 && in.op <= OP_BUFFER_LOAD_SHORT_D16_HI;
-    if (sub_dword || (in.op >= OP_BUFFER_ATOMIC_SWAP && in.op <= OP_BUFFER_ATOMIC_FMAX)) {
+    if (sub_dword || is_d16_format(in.op) ||
+        (in.op >= OP_BUFFER_ATOMIC_SWAP && in.op <= OP_BUFFER_ATOMIC_FMAX)) {
         translator_fail(t, "unsupported %s", rdna_op_name(in.op));
         return false;
     }
@@ -540,6 +547,10 @@ static const char* uint_vector(Translator& t, const u32* regs, u32 count) {
 static bool emit_image(Translator& t, const RdnaInst& in) {
     const RdnaMemory& m = in.mem;
     ImageForm form = image_form(in.op);
+    if (in.op == OP_IMAGE_BVH_INTERSECT_RAY || in.op == OP_IMAGE_BVH64_INTERSECT_RAY) {
+        translator_fail(t, "unsupported %s", rdna_op_name(in.op));
+        return false;
+    }
     if (m.a16 || m.d16 || m.tfe || m.lwe) {
         translator_fail(t, "%s with 16-bit data or addresses at 0x%x", rdna_op_name(in.op), in.offset);
         return false;

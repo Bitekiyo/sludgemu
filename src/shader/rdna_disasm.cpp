@@ -142,6 +142,12 @@ u32 rdna_image_address_count(RdnaOp op, u8 dim) {
     u32 coords = k_coords[dim & 7];
     if (op == OP_IMAGE_GET_RESINFO)
         return 1;
+    // Node pointer (two registers for 64-bit), ray extent, origin, direction, inverse direction
+    // (counted with 32-bit addresses).
+    if (op == OP_IMAGE_BVH_INTERSECT_RAY)
+        return 11;
+    if (op == OP_IMAGE_BVH64_INTERSECT_RAY)
+        return 12;
     if (op <= OP_IMAGE_ATOMIC_DEC || op == OP_IMAGE_MSAA_LOAD) {
         bool mip = op == OP_IMAGE_LOAD_MIP || op == OP_IMAGE_LOAD_MIP_PCK ||
                    op == OP_IMAGE_LOAD_MIP_PCK_SGN || op == OP_IMAGE_STORE_MIP ||

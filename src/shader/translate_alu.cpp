@@ -901,6 +901,9 @@ static bool emit_vector(Translator& t, const RdnaInst& in) {
     case OP_V_OR3_B32:
         vwrite(t, in, fmt(t, "(%s | %s | %s)", u(t, in, 0), u(t, in, 1), u(t, in, 2)));
         return true;
+    case OP_V_XOR3_B32:
+        vwrite(t, in, fmt(t, "(%s ^ %s ^ %s)", u(t, in, 0), u(t, in, 1), u(t, in, 2)));
+        return true;
     case OP_V_MUL_U32_U24:
         vwrite(t, in, fmt(t, "((%s & 0xffffffu) * (%s & 0xffffffu))", u(t, in, 0), u(t, in, 1)));
         return true;
