@@ -97,6 +97,53 @@ static u64 desktop_address(u64 address, u64 size) {
 
 // --- state -------------------------------------------------------------------------------------------
 
+// Console topologies desktop D3D12 lacks (the triangle fan only on some GPUs).
+#define CONSOLE_TOPOLOGY_TRIANGLE_FAN 6
+#define CONSOLE_TOPOLOGY_RECT_LIST    17
+#define CONSOLE_TOPOLOGY_LINE_LOOP    18
+#define CONSOLE_TOPOLOGY_QUAD_LIST    19
+#define CONSOLE_TOPOLOGY_QUAD_STRIP   20
+
+static bool g_triangle_fans; // the desktop GPU draws triangle fans
+
+static bool is_desktop_topology(u32 t) {
+    return t <= D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP ||
+           (t >= D3D_PRIMITIVE_TOPOLOGY_LINELIST_ADJ && t <= D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ) ||
+           (t >= D3D_PRIMITIVE_TOPOLOGY_1_CONTROL_POINT_PATCHLIST &&
+            t <= D3D_PRIMITIVE_TOPOLOGY_32_CONTROL_POINT_PATCHLIST);
+}
+
+// The topology the desktop list gets. Drivers program the value as given, and the GPU faults on one
+// it doesn't know as soon as the list runs, so console-only values never reach them. A quad strip
+// covers what a triangle strip does. Rectangle lists, line loops, quad lists and unsupported fans
+// have no desktop form; they stand in as the list or strip of the same primitive type, and draws
+// with them need expanding (the list state keeps the console topology for that).
+static D3D12_PRIMITIVE_TOPOLOGY desktop_topology(D3D12_PRIMITIVE_TOPOLOGY topology) {
+    u32 t = (u32)topology;
+    if (is_desktop_topology(t) || (t == CONSOLE_TOPOLOGY_TRIANGLE_FAN && g_triangle_fans))
+        return topology;
+    if (t == CONSOLE_TOPOLOGY_QUAD_STRIP)
+        return D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP;
+    D3D12_PRIMITIVE_TOPOLOGY stand_in;
+    switch (t) {
+    case CONSOLE_TOPOLOGY_TRIANGLE_FAN:
+    case CONSOLE_TOPOLOGY_RECT_LIST:
+    case CONSOLE_TOPOLOGY_QUAD_LIST:
+        stand_in = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+        break;
+    case CONSOLE_TOPOLOGY_LINE_LOOP:
+        stand_in = D3D_PRIMITIVE_TOPOLOGY_LINESTRIP;
+        break;
+    default:
+        LOG_W_ONCE("d3d12", "IASetPrimitiveTopology: unknown topology %u; left undefined", t);
+        return D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    }
+    LOG_W_ONCE("d3d12",
+               "primitive topology %u has no desktop equivalent; recorded as %d until draws expand it", t,
+               stand_in);
+    return stand_in;
+}
+
 static void apply_root_args(ID3D12GraphicsCommandList8* l, const RootArgs& args, bool graphics) {
     if (!args.signature)
         return;
@@ -156,7 +203,7 @@ static void apply_state(ConsoleCommandList* self) {
         return;
     apply_root_args(l, s.graphics, true);
     if (s.topology != D3D_PRIMITIVE_TOPOLOGY_UNDEFINED)
-        l->IASetPrimitiveTopology(s.topology);
+        l->IASetPrimitiveTopology(desktop_topology(s.topology));
     for (u32 i = 0; i < D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT; i++)
         if (s.vertex_buffer_mask & (1u << i))
             l->IASetVertexBuffers(i, 1, &s.vertex_buffers[i]);
@@ -489,7 +536,7 @@ static void WINAPI list_set_graphics_root_uav(ConsoleCommandList* self, UINT ind
 static void WINAPI list_ia_set_primitive_topology(ConsoleCommandList* self,
                                                   D3D12_PRIMITIVE_TOPOLOGY topology) {
     self->state.topology = topology;
-    self->desktop->IASetPrimitiveTopology(topology);
+    self->desktop->IASetPrimitiveTopology(desktop_topology(topology));
 }
 
 static void WINAPI list_ia_set_index_buffer(ConsoleCommandList* self, const D3D12_INDEX_BUFFER_VIEW* view) {
@@ -668,6 +715,10 @@ void console_command_list_init() {
         s_entries[n++] = k_list_work_entries[i];
     g_list_table = console_build_table("ID3D12GraphicsCommandList", k_command_list_entries,
                                        ARRAY_COUNT(k_command_list_entries), s_entries, n);
+    D3D12_FEATURE_DATA_D3D12_OPTIONS15 o15 = {};
+    g_triangle_fans =
+        SUCCEEDED(gpu_device()->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS15, &o15, sizeof(o15))) &&
+        o15.TriangleFanSupported;
 }
 
 HRESULT console_create_command_list(ConsoleDevice* device, const ConsoleCommandListDesc* desc,
