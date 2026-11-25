@@ -1,4 +1,9 @@
-// Console CPU instructions on hosts without them: CLZERO, MONITORX and MWAITX (all AMD only).
+// Console CPU instructions on hosts without them: CLZERO, MONITORX, MWAITX and SSE4a's EXTRQ and
+// INSERTQ (all AMD only).
+//
+// EXTRQ and INSERTQ extract or insert a bit field in the low 64 bits of an XMM register. Compilers
+// emit them for packing (half floats, for one). The handler carries out each one on the registers in
+// the exception context and resumes after it.
 //
 // MONITORX/MWAITX wait for a store to a watched address, but may also return early for any reason,
 // so callers always re-check what they wait for. A MONITORX becomes a no-op and an MWAITX a PAUSE:
@@ -50,7 +55,10 @@
 #define MAX_INSTRUCTION_BYTES 4
 
 static volatile long g_reported = 0;
+static volatile long g_reported_sse4a = 0;
+static volatile LONG64 g_sse4a_traps = 0;
 static bool g_emulate_clzero = false;
+static bool g_emulate_sse4a = false;
 static bool g_patch_monitorx = false;
 static SRWLOCK g_patch_lock = SRWLOCK_INIT;
 
@@ -62,6 +70,16 @@ static bool host_has_clzero() {
         return false;
     __cpuid(r, 0x80000008);
     return (r[1] & 1) != 0;
+}
+
+// SSE4a: extended leaf 0x80000001 ECX bit 6.
+static bool host_has_sse4a() {
+    int r[4];
+    __cpuid(r, 0x80000000);
+    if ((u32)r[0] < 0x80000001u)
+        return false;
+    __cpuid(r, 0x80000001);
+    return (r[2] & (1 << 6)) != 0;
 }
 
 static bool host_has_monitorx() {
@@ -177,6 +195,69 @@ static LONG run_clzero_loop(EXCEPTION_POINTERS* ep, const PeImage* image) {
     return EXCEPTION_CONTINUE_EXECUTION;
 }
 
+// --- SSE4a ---------------------------------------------------------------------------------------------
+
+// Bits [len-1:0]; a length of 0 means all 64.
+static u64 field_mask(u32 len) {
+    return len == 0 || len >= 64 ? ~0ull : (1ull << len) - 1;
+}
+
+// EXTRQ   66 [REX] 0F 78 /0 ib ib    dst = dst >> idx, masked to len bits
+//         66 [REX] 0F 79 /r          the same with len and idx in bits 5:0 and 13:8 of src
+// INSERTQ F2 [REX] 0F 78 /r ib ib    the low len bits of src replace bits idx.. of dst
+//         F2 [REX] 0F 79 /r          the same with len and idx in bits 69:64 and 77:72 of src
+// Register operands only (mod = 3). Both leave the upper half of dst undefined; it is kept. Returns
+// the instruction's length, or 0 if `ip` holds neither.
+static u32 emulate_sse4a(const u8* ip, const u8* end, CONTEXT* ctx) {
+    if (ip + 4 > end)
+        return 0;
+    u8 prefix = ip[0];
+    if (prefix != 0x66 && prefix != 0xf2)
+        return 0;
+    u32 at = 1;
+    u8 rex = 0;
+    if ((ip[at] & 0xf0) == 0x40)
+        rex = ip[at++];
+    if (ip + at + 3 > end || ip[at] != 0x0f || (ip[at + 1] != 0x78 && ip[at + 1] != 0x79))
+        return 0;
+    bool immediate = ip[at + 1] == 0x78;
+    u8 modrm = ip[at + 2];
+    at += 3;
+    if ((modrm >> 6) != 3)
+        return 0;
+    u32 reg = ((modrm >> 3) & 7) | ((rex & 4) ? 8 : 0);
+    u32 rm = (modrm & 7) | ((rex & 1) ? 8 : 0);
+    u32 len, idx;
+    if (immediate) {
+        if (ip + at + 2 > end)
+            return 0;
+        len = ip[at] & 63;
+        idx = ip[at + 1] & 63;
+        at += 2;
+    }
+    M128A* xmm = &ctx->Xmm0;
+    if (prefix == 0x66) { // EXTRQ: the destination is the r/m register (and the source, for the reg form)
+        if (immediate && ((modrm >> 3) & 7) != 0)
+            return 0;
+        M128A& dst = xmm[immediate ? rm : reg];
+        if (!immediate) {
+            len = xmm[rm].Low & 63;
+            idx = (xmm[rm].Low >> 8) & 63;
+        }
+        dst.Low = (dst.Low >> idx) & field_mask(len);
+    } else { // INSERTQ: destination reg, source rm
+        M128A& dst = xmm[reg];
+        const M128A& src = xmm[rm];
+        if (!immediate) {
+            len = (u32)src.High & 63;
+            idx = (u32)(src.High >> 8) & 63;
+        }
+        u64 mask = field_mask(len) << idx;
+        dst.Low = (dst.Low & ~mask) | ((src.Low << idx) & mask);
+    }
+    return at;
+}
+
 // MONITORX (0F 01 FA) becomes a 3-byte NOP, MWAITX (0F 01 FB) a PAUSE and a NOP.
 static const u8 k_monitorx_patch[3] = {0x0f, 0x1f, 0x00};
 static const u8 k_mwaitx_patch[3] = {0xf3, 0x90, 0x90};
@@ -209,6 +290,18 @@ static LONG CALLBACK compat_handler(EXCEPTION_POINTERS* ep) {
     const PeImage* image = g_loader.find_containing(ip);
     if (!image || ip + 3 > image->base + image->size)
         return EXCEPTION_CONTINUE_SEARCH;
+    if (g_emulate_sse4a) {
+        if (u32 length = emulate_sse4a(ip, image->base + image->size, ep->ContextRecord)) {
+            LONG64 traps = InterlockedIncrement64(&g_sse4a_traps);
+            if (!InterlockedExchange(&g_reported_sse4a, 1))
+                LOG_I("cpu", "host CPU lacks SSE4a: emulating it, first at %s+0x%x", image->name,
+                      image->rva_of(ip));
+            if ((traps & (traps - 1)) == 0 && traps >= 4096) // how hot it is, at powers of two
+                LOG_I("cpu", "%lld SSE4a instructions emulated so far", traps);
+            ep->ContextRecord->Rip += length;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
     if (g_emulate_clzero && is_clzero(ip)) {
         if (!InterlockedExchange(&g_reported, 1))
             LOG_I("cpu", "host CPU lacks CLZERO: emulating it, first at %s+0x%x", image->name,
@@ -223,10 +316,11 @@ static LONG CALLBACK compat_handler(EXCEPTION_POINTERS* ep) {
 void cpu_compat_init() {
     g_emulate_clzero = !host_has_clzero();
     g_patch_monitorx = !host_has_monitorx();
-    if (!g_emulate_clzero && !g_patch_monitorx)
+    g_emulate_sse4a = !host_has_sse4a();
+    if (!g_emulate_clzero && !g_patch_monitorx && !g_emulate_sse4a)
         return;
-    LOG_I("cpu", "host CPU lacks%s%s; handling them for console code", g_emulate_clzero ? " CLZERO" : "",
-          g_patch_monitorx ? " MONITORX/MWAITX" : "");
+    LOG_I("cpu", "host CPU lacks%s%s%s; handling them for console code", g_emulate_clzero ? " CLZERO" : "",
+          g_patch_monitorx ? " MONITORX/MWAITX" : "", g_emulate_sse4a ? " SSE4a" : "");
     if (!AddVectoredExceptionHandler(1, compat_handler))
         LOG_E("cpu", "could not install the CPU compatibility handler");
 }
