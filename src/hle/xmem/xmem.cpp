@@ -70,8 +70,8 @@ void* xmem_virtual_alloc(void* base, usize size, u32 alloc_type, u64 xflags, u32
         // Titles carve placeholders up themselves: reserve one, split it with VirtualFree
         // (MEM_PRESERVE_PLACEHOLDER), then turn each piece into a mapping range. Our placeholder
         // ranges split per page on demand, so a piece only needs its protection recorded.
-        const MemRange* r = mem_find_range(base);
-        if (r && (r->flags & MEM_RANGE_PLACEHOLDER)) {
+        MemRange r;
+        if (mem_query_range(base, &r) && (r.flags & MEM_RANGE_PLACEHOLDER)) {
             if ((cpu_prot & 0xFF) != PAGE_NOACCESS)
                 mem_set_range_protect(base, cpu_prot);
             p = base;

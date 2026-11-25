@@ -21,8 +21,9 @@ static LPVOID WINAPI hk_VirtualAlloc(LPVOID base, SIZE_T size, DWORD type, DWORD
 
 static BOOL WINAPI hk_VirtualFree(LPVOID base, SIZE_T size, DWORD type) {
     if (base && mem_is_tracked(base)) {
-        const MemRange* r = mem_find_range(base);
-        if ((type & MEM_PRESERVE_PLACEHOLDER) && r && (r->flags & MEM_RANGE_PLACEHOLDER)) {
+        MemRange r;
+        bool placeholder = mem_query_range(base, &r) && (r.flags & MEM_RANGE_PLACEHOLDER);
+        if ((type & MEM_PRESERVE_PLACEHOLDER) && placeholder) {
             // Splitting a placeholder: our placeholder ranges split per page when mapped.
             return TRUE;
         }
@@ -31,7 +32,7 @@ static BOOL WINAPI hk_VirtualFree(LPVOID base, SIZE_T size, DWORD type) {
             LOG_D("kernel", "VirtualFree(%p, MEM_RELEASE) on tracked range -> %d", base, ok);
             return ok;
         }
-        if (r && (r->flags & MEM_RANGE_PLACEHOLDER)) {
+        if (placeholder) {
             LOG_W("kernel", "VirtualFree(%p, 0x%llx, 0x%lx) on a physical-mapping range ignored", base,
                   (u64)size, type);
             return TRUE;

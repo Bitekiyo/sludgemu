@@ -66,6 +66,10 @@ scheduler places threads better on hybrid CPUs than a fixed mapping would.
 title actually uses. Freed frames give their RAM back to the OS and are zeroed on reuse. Ranges
 reserved for physical mapping are Win32 placeholders, and frames are mapped into them with
 `MapViewOfFile3`, which gives real aliasing: the same frame at several addresses, as on console.
+Mapping is 64 KiB granular (the console page size, which matches Windows' view granularity), but a
+run of consecutive frames is mapped as one view. Each range keeps a list of regions that mirrors
+the address space exactly (one placeholder or one view per entry), and every change updates both
+together.
 Graphics allocations are placed inside the graphics address window reported by
 `D3D12ConfigureVirtualMemoryX` and recorded in a GPU range registry for the graphics layer.
 
