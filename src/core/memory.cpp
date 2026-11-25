@@ -128,6 +128,11 @@ bool mem_init(u64 physical_bytes) {
     g_mem.id_to_real = (u32*)(g_mem.dirty_bitmap + words);
     g_mem.real_to_id = g_mem.id_to_real + g_mem.total_pages;
     memset(g_mem.id_to_real, 0xFF, g_mem.total_pages * 4);
+    // Frame 0 is never handed out. Titles map page number 0 where they have no page (console
+    // mapping calls accept it), so it stays a spare frame instead of naming a live one.
+    bit_set(g_mem.id_bitmap, 0);
+    g_mem.used_pages = 1;
+    g_mem.id_hint = 1;
 
     g_mem.gpu_lowest = GiB(2);
     g_mem.gpu_highest = (1ull << 40) - 1;
@@ -236,11 +241,20 @@ static u32 bind_frame(u32 id, u32 preferred) {
     return real;
 }
 
+// The frame ID behind page number `pfn`, or MEM_INVALID_PFN unless that's an allocated frame.
+// phys_lock held (shared is enough).
+static u32 frame_of_locked(u64 pfn) {
+    u64 id = pfn >> MEM_PAGE_NUMBER_SHIFT;
+    if ((pfn & ((1u << MEM_PAGE_NUMBER_SHIFT) - 1)) || id >= g_mem.total_pages ||
+        !bit_get(g_mem.id_bitmap, id))
+        return MEM_INVALID_PFN;
+    return (u32)id;
+}
+
 u8* mem_physical_ptr(u64 pfn) {
-    if (pfn >= g_mem.total_pages)
-        return nullptr;
     AcquireSRWLockExclusive(&g_mem.phys_lock);
-    u32 real = bit_get(g_mem.id_bitmap, pfn) ? bind_frame((u32)pfn, MEM_INVALID_PFN) : MEM_INVALID_PFN;
+    u32 id = frame_of_locked(pfn);
+    u32 real = id != MEM_INVALID_PFN ? bind_frame(id, MEM_INVALID_PFN) : MEM_INVALID_PFN;
     ReleaseSRWLockExclusive(&g_mem.phys_lock);
     return real != MEM_INVALID_PFN ? real_ptr(real) : nullptr;
 }
@@ -260,7 +274,7 @@ bool mem_physical_alloc(u64 count, u64* pfns) {
             i = 0;
         if (!bit_get(g_mem.id_bitmap, i)) {
             bit_set(g_mem.id_bitmap, i);
-            pfns[found++] = i;
+            pfns[found++] = i << MEM_PAGE_NUMBER_SHIFT;
         }
     }
     SLUDGE_ASSERT(found == count);
@@ -273,9 +287,9 @@ bool mem_physical_alloc(u64 count, u64* pfns) {
 void mem_physical_free(u64 count, const u64* pfns) {
     AcquireSRWLockExclusive(&g_mem.phys_lock);
     for (u64 k = 0; k < count; k++) {
-        u64 id = pfns[k];
-        if (id >= g_mem.total_pages || !bit_get(g_mem.id_bitmap, id)) {
-            LOG_W("memory", "freeing invalid/unallocated page frame 0x%llx", id);
+        u32 id = frame_of_locked(pfns[k]);
+        if (id == MEM_INVALID_PFN || id == 0) {
+            LOG_W("memory", "freeing invalid/unallocated page frame 0x%llx", pfns[k]);
             continue;
         }
         bit_clear(g_mem.id_bitmap, id);
@@ -602,11 +616,9 @@ void* mem_alloc_virtual(void* base, u64 size, u32 alloc_type, u32 protect, const
     return p;
 }
 
-static bool frame_allocated(u64 id) {
-    if (id >= g_mem.total_pages)
-        return false;
+static bool frame_allocated(u64 pfn) {
     AcquireSRWLockShared(&g_mem.phys_lock);
-    bool ok = bit_get(g_mem.id_bitmap, id);
+    bool ok = frame_of_locked(pfn) != MEM_INVALID_PFN;
     ReleaseSRWLockShared(&g_mem.phys_lock);
     return ok;
 }
@@ -644,9 +656,9 @@ static void release_anchors(RangeSlot* s) {
     s->anchors = nullptr;
 }
 
-// Maps (or unmaps, for MEM_INVALID_PFN entries or ids == nullptr) `count` consecutive pages at
+// Maps (or unmaps, for MEM_INVALID_PFN entries or pfns == nullptr) `count` consecutive pages at
 // `va`, one view per run of consecutive real frames within a chunk. Range lock held exclusively.
-static bool map_span_locked(void* va, u64 count, const u64* ids) {
+static bool map_span_locked(void* va, u64 count, const u64* pfns) {
     RangeSlot* s = find_range_locked(va);
     if (!s || !(s->info.flags & MEM_RANGE_PLACEHOLDER) || ((uptr)va & (MEM_PAGE_SIZE - 1))) {
         LOG_E("memory", "physical map target %p is not a page in a placeholder range", va);
@@ -658,26 +670,27 @@ static bool map_span_locked(void* va, u64 count, const u64* ids) {
         return false;
     }
     // Validate everything before changing anything.
-    for (u64 i = 0; ids && i < count; i++) {
-        if (ids[i] != MEM_INVALID_PFN && !frame_allocated(ids[i])) {
-            LOG_E("memory", "frame 0x%llx mapped at %p is not an allocated page frame", ids[i],
+    for (u64 i = 0; pfns && i < count; i++) {
+        if (pfns[i] != MEM_INVALID_PFN && !frame_allocated(pfns[i])) {
+            LOG_E("memory", "page 0x%llx mapped at %p is not an allocated page frame", pfns[i],
                   (u8*)va + (i << MEM_PAGE_SHIFT));
             return false;
         }
     }
     u32* reals = nullptr;
-    if (ids) {
+    if (pfns) {
         reals = (u32*)malloc(count * sizeof(u32));
         if (!reals)
             FATAL("out of memory mapping %llu pages", count);
         AcquireSRWLockExclusive(&g_mem.phys_lock);
         for (u64 i = 0; i < count; i++) {
-            if (ids[i] == MEM_INVALID_PFN) {
+            if (pfns[i] == MEM_INVALID_PFN) {
                 reals[i] = MEM_INVALID_PFN;
                 continue;
             }
             u32 previous = i > 0 ? reals[i - 1] : MEM_INVALID_PFN;
-            reals[i] = bind_frame((u32)ids[i], preferred_real(s, (u32)(first + i), previous));
+            u32 id = (u32)(pfns[i] >> MEM_PAGE_NUMBER_SHIFT);
+            reals[i] = bind_frame(id, preferred_real(s, (u32)(first + i), previous));
         }
         ReleaseSRWLockExclusive(&g_mem.phys_lock);
     }
@@ -776,8 +789,8 @@ bool mem_release(void* base) {
                 ok = g_mem.unmap_view2(GetCurrentProcess(), va, 0) != FALSE;
                 if (owns) {
                     for (u32 p = 0; p < region_end(s, i) - r.first_page; p++) {
-                        u64 id = g_mem.real_to_id[r.pfn + p];
-                        mem_physical_free(1, &id);
+                        u64 pfn = (u64)g_mem.real_to_id[r.pfn + p] << MEM_PAGE_NUMBER_SHIFT;
+                        mem_physical_free(1, &pfn);
                     }
                 }
             }

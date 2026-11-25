@@ -24,6 +24,11 @@
 #define MEM_CHUNK_PAGES (MEM_CHUNK_SIZE / MEM_PAGE_SIZE)
 #define MEM_INVALID_PFN 0xFFFFFFFFu
 
+// Page numbers exchanged with titles count 4 KiB units, like console page numbers: a page frame's
+// number is its index shifted left by this, so it is a multiple of 16 and the next frame's number
+// is 16 higher. Titles depend on that (some store page numbers without their low four bits).
+#define MEM_PAGE_NUMBER_SHIFT 4
+
 enum MemRangeFlags : u32 {
     MEM_RANGE_GPU = 1u << 0,         // GPU visible
     MEM_RANGE_PLACEHOLDER = 1u << 1, // reserved for physical page mapping
@@ -48,12 +53,13 @@ bool mem_init(u64 physical_bytes);
 u64 mem_physical_total_pages();
 u64 mem_physical_used_pages();
 
-// Allocates `count` page frames (not necessarily contiguous) into `pfns`. Pages are committed and
-// zeroed. Returns false (allocating nothing) if not enough are free.
+// Allocates `count` page frames (not necessarily contiguous) and stores their page numbers in
+// `pfns`. Pages are committed and zeroed. Returns false (allocating nothing) if not enough are free.
 bool mem_physical_alloc(u64 count, u64* pfns);
 void mem_physical_free(u64 count, const u64* pfns);
 
-// Host pointer to a page frame through the linear view.
+// Host pointer to the page frame with page number `pfn`, through the linear view; nullptr if it
+// isn't an allocated frame.
 u8* mem_physical_ptr(u64 pfn);
 
 // Physical memory chunks (committed sections, nullptr until first used). Chunk i holds frames
@@ -85,8 +91,9 @@ void* mem_alloc_physical_backed(u64 size, const MemAddressLimits& limits, u32 ra
 void* mem_alloc_virtual(void* base, u64 size, u32 alloc_type, u32 protect, const MemAddressLimits& limits,
                         u32 range_flags, u64 xflags);
 
-// Maps page frames into a placeholder range. pfns == nullptr unmaps. Each page may be at a
-// different address (scatter) when `vas` is given; otherwise pages are consecutive from `va`.
+// Maps page frames (by page number) into a placeholder range. pfns == nullptr unmaps. Each page
+// may be at a different address (scatter) when `vas` is given; otherwise pages are consecutive from
+// `va`.
 bool mem_map_physical(void* va, u64 count, const u64* pfns);
 bool mem_map_physical_scatter(void* const* vas, u64 count, const u64* pfns);
 

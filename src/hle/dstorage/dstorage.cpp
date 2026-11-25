@@ -22,7 +22,7 @@
 
 // --- console ABI ---------------------------------------------------------------------------------
 
-#define CONSOLE_PAGE_SIZE 0x10000ull // physical page arrays use 64 KiB page numbers
+#define CONSOLE_PAGE_SIZE 0x10000ull // physical page arrays list 64 KiB pages
 
 // Request option bits.
 #define OPT_ZLIB              (1ull << 0)
@@ -205,15 +205,16 @@ static void count_request(const ConsoleRequest& r) {
 
 // --- physical pages ------------------------------------------------------------------------------
 
-// Pointer to a byte range described by a 64 KiB page array, if the pages are contiguous in our
-// physical memory (then they are contiguous in its linear view).
+// Pointer to a byte range described by an array of 64 KiB pages (by page number), if those pages
+// follow each other in the linear view of physical memory.
 static u8* contiguous_pages(const ULONG_PTR* pages, u16 offset, u32 size) {
     u64 count = (offset + (u64)size + CONSOLE_PAGE_SIZE - 1) / CONSOLE_PAGE_SIZE;
-    for (u64 i = 1; i < count; i++) {
-        if (pages[i] != pages[0] + i)
+    u8* base = mem_physical_ptr(pages[0]);
+    for (u64 i = 1; base && i < count; i++) {
+        if (mem_physical_ptr(pages[i]) != base + i * CONSOLE_PAGE_SIZE)
             return nullptr;
     }
-    return mem_physical_ptr(pages[0]) + offset;
+    return base ? base + offset : nullptr;
 }
 
 // --- objects -------------------------------------------------------------------------------------
