@@ -68,6 +68,10 @@ u8* mem_physical_ptr(u64 pfn);
 u32 mem_physical_chunk_count();
 void* mem_physical_chunk(u32 index); // section HANDLE
 
+// Where a host pointer into the linear view lies: its chunk and the offset in it. False for any
+// other memory.
+bool mem_linear_location(const void* host, u32* chunk, u64* offset);
+
 // Virtual ranges ------------------------------------------------------------------------------
 
 // Address constraints for new reservations (0 = no constraint).

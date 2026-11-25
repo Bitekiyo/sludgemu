@@ -91,16 +91,59 @@ static MemBlock window_extent(const MemBlock& block, u64 address, u64 size) {
     return {(u8*)lo, hi - lo, block.host + (lo - (u64)block.base)};
 }
 
-static ID3D12Resource* open_window(const MemBlock& block) {
-    ID3D12Device13* device = gpu_device();
+// Physical memory chunks are sections, which the GPU sees through heaps opened over the section
+// itself (heaps over addresses are for VirtualAlloc memory only). Each chunk's heap is opened once
+// and kept: chunks live as long as the process.
+static ID3D12Heap** g_chunk_heaps = nullptr;
+static SRWLOCK g_chunk_lock = SRWLOCK_INIT;
+
+static ID3D12Heap* chunk_heap(u32 chunk) {
+    AcquireSRWLockExclusive(&g_chunk_lock);
+    if (!g_chunk_heaps)
+        g_chunk_heaps = (ID3D12Heap**)calloc(mem_physical_chunk_count(), sizeof(ID3D12Heap*));
+    ID3D12Heap* heap = g_chunk_heaps ? g_chunk_heaps[chunk] : nullptr;
+    if (g_chunk_heaps && !heap) {
+        HRESULT hr = gpu_device()->OpenExistingHeapFromFileMapping((HANDLE)mem_physical_chunk(chunk),
+                                                                   IID_PPV_ARGS(&heap));
+        if (FAILED(hr)) {
+            gpu_device_lost(hr);
+            LOG_E("gpu", "cannot open a GPU heap over physical memory chunk %u (0x%08lx)", chunk,
+                  (unsigned long)hr);
+            heap = nullptr;
+        }
+        g_chunk_heaps[chunk] = heap;
+    }
+    ReleaseSRWLockExclusive(&g_chunk_lock);
+    return heap;
+}
+
+// The heap behind a block and the block's offset in it. The caller owns a reference.
+static ID3D12Heap* block_heap(const MemBlock& block, u64* offset) {
+    u32 chunk;
+    if (mem_linear_location(block.host, &chunk, offset)) {
+        ID3D12Heap* heap = chunk_heap(chunk);
+        if (heap)
+            heap->AddRef();
+        return heap;
+    }
+    *offset = 0;
     ID3D12Heap* heap = nullptr;
-    HRESULT hr = device->OpenExistingHeapFromAddress1(block.host, block.size, IID_PPV_ARGS(&heap));
+    HRESULT hr = gpu_device()->OpenExistingHeapFromAddress1(block.host, block.size, IID_PPV_ARGS(&heap));
     if (FAILED(hr)) {
         gpu_device_lost(hr);
         LOG_E("gpu", "cannot open a GPU heap over title memory %p+0x%llx (0x%08lx)", block.base, block.size,
               (unsigned long)hr);
         return nullptr;
     }
+    return heap;
+}
+
+static ID3D12Resource* open_window(const MemBlock& block) {
+    ID3D12Device13* device = gpu_device();
+    u64 heap_offset;
+    ID3D12Heap* heap = block_heap(block, &heap_offset);
+    if (!heap)
+        return nullptr;
     D3D12_RESOURCE_DESC1 desc = {};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
     desc.Width = block.size;
@@ -111,8 +154,8 @@ static ID3D12Resource* open_window(const MemBlock& block) {
     desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     ID3D12Resource* buffer = nullptr;
-    hr = device->CreatePlacedResource2(heap, 0, &desc, D3D12_BARRIER_LAYOUT_UNDEFINED, nullptr, 0, nullptr,
-                                       IID_PPV_ARGS(&buffer));
+    HRESULT hr = device->CreatePlacedResource2(heap, heap_offset, &desc, D3D12_BARRIER_LAYOUT_UNDEFINED,
+                                               nullptr, 0, nullptr, IID_PPV_ARGS(&buffer));
     heap->Release(); // the buffer keeps it alive
     if (FAILED(hr)) {
         LOG_E("gpu", "cannot place a window buffer over title memory %p+0x%llx (0x%08lx)", block.base,

@@ -159,6 +159,15 @@ void* mem_physical_chunk(u32 index) {
     return index < g_mem.chunk_count ? g_mem.chunks[index] : nullptr;
 }
 
+bool mem_linear_location(const void* host, u32* chunk, u64* offset) {
+    u64 at = (u64)((const u8*)host - g_mem.linear);
+    if ((const u8*)host < g_mem.linear || at >= g_mem.total_pages << MEM_PAGE_SHIFT)
+        return false;
+    *chunk = (u32)(at / MEM_CHUNK_SIZE);
+    *offset = at % MEM_CHUNK_SIZE;
+    return true;
+}
+
 static u8* real_ptr(u32 real) {
     return g_mem.linear + ((u64)real << MEM_PAGE_SHIFT);
 }
