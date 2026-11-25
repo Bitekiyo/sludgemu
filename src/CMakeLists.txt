@@ -33,6 +33,7 @@ add_executable(sludgemu WIN32
     hle/hle.h
     hle/hle.cpp
     hle/xbox_modules.cpp
+    hle/audio/acphal.cpp
     hle/kernel/overrides.h
     hle/kernel/module_overrides.cpp
     hle/kernel/memory_overrides.cpp
