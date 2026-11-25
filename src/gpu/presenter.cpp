@@ -277,7 +277,13 @@ static void plane_barriers(ID3D12GraphicsCommandList7* list, const PresentPlane*
     list->Barrier(1, &g);
 }
 
-bool presenter_present(ID3D12CommandQueue* queue, const PresentPlane* planes, u32 count) {
+u64 presenter_completed() {
+    // Created once with the swap chain and kept, so it can be read without the lock.
+    ID3D12Fence* fence = g_presenter.fence;
+    return fence ? fence->GetCompletedValue() : UINT64_MAX;
+}
+
+u64 presenter_present(ID3D12CommandQueue* queue, const PresentPlane* planes, u32 count) {
     Presenter* p = &g_presenter;
     AcquireSRWLockExclusive(&p->lock);
     if (!p->swap_chain && !p->failed && !setup(p, queue)) {
@@ -286,7 +292,7 @@ bool presenter_present(ID3D12CommandQueue* queue, const PresentPlane* planes, u3
     }
     if (p->failed) {
         ReleaseSRWLockExclusive(&p->lock);
-        return false;
+        return 0;
     }
     if (queue != p->queue)
         LOG_W_ONCE("present", "presents from a second queue go through the first one's swap chain");
@@ -339,6 +345,7 @@ bool presenter_present(ID3D12CommandQueue* queue, const PresentPlane* planes, u3
     }
     queue->Signal(p->fence, ++p->fence_value);
     p->frame_fence[frame] = p->fence_value;
+    u64 value = p->fence_value;
     ReleaseSRWLockExclusive(&p->lock);
-    return SUCCEEDED(hr);
+    return value;
 }

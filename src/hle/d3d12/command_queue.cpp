@@ -188,9 +188,9 @@ static HRESULT WINAPI queue_present_x(ConsoleCommandQueue* self, UINT plane_coun
         for (u32 c = 0; c < 4; c++)
             out[i].dest[c] = dest[c];
     }
-    presenter_present(self->desktop, out, plane_count);
+    u64 done = presenter_present(self->desktop, out, plane_count);
     if (plane_count)
-        frame_on_flip(planes[0].token);
+        frame_on_present(planes[0].token, done);
     return S_OK;
 }
 

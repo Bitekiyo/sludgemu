@@ -1,9 +1,12 @@
 #include "hle/d3d12/frame_pacing.h"
 
 #include "common/log.h"
+#include "gpu/presenter.h"
 
 #define MAX_SIGNALS      7
 #define MAX_WAIT_HANDLES 63
+#define MAX_PENDING      16 // presented frames waiting to flip; titles keep at most a period's worth
+#define MAX_FLIP_WAITERS 8  // threads blocked on flips at once
 
 #define SCHEDULE_FLAG_DISABLE_SIGNAL       0x1
 #define WAIT_FLAG_ALL                      0x1
@@ -13,6 +16,19 @@ struct EventSchedule {
     bool enabled;
     u32 signal_count;
     HANDLE signals[MAX_SIGNALS];
+};
+
+struct PendingFlip {
+    FrameToken token;
+    u64 present_done; // presenter_completed() value at which the GPU is done with it
+};
+
+// A thread waiting for a frame to reach the display (or, without a token, for the next flip).
+struct FlipWaiter {
+    HANDLE event; // auto-reset, owned by the pacer
+    bool used;
+    FrameToken token;
+    u64 flips_before; // frames_flipped when the wait began
 };
 
 struct FramePacer {
@@ -39,6 +55,12 @@ struct FramePacer {
     u64 origins_fired;
     u64 tokens_issued;
     u64 frames_flipped;
+    FrameToken last_flipped; // the frame on the display
+
+    PendingFlip pending[MAX_PENDING];
+    u32 pending_first;
+    u32 pending_count;
+    FlipWaiter flip_waiters[MAX_FLIP_WAITERS];
 };
 
 static FramePacer g_pacer;
@@ -58,6 +80,42 @@ static void signal_event(FrameEventType type) {
     EventSchedule& e = g_pacer.events[type];
     for (u32 i = 0; i < e.signal_count; i++)
         SetEvent(e.signals[i]);
+}
+
+static bool flip_wait_satisfied(const FlipWaiter& w) {
+    return w.token ? g_pacer.last_flipped >= w.token : g_pacer.frames_flipped > w.flips_before;
+}
+
+// Puts a frame on the display (lock held).
+static void flip_locked(FrameToken token) {
+    g_pacer.frames_flipped++;
+    if (token > g_pacer.last_flipped)
+        g_pacer.last_flipped = token;
+    for (u32 i = 0; i < MAX_FLIP_WAITERS; i++) {
+        FlipWaiter& w = g_pacer.flip_waiters[i];
+        if (w.used && flip_wait_satisfied(w))
+            SetEvent(w.event);
+    }
+    if (g_pacer.events[FRAME_EVENT_FLIP].enabled)
+        signal_event(FRAME_EVENT_FLIP);
+}
+
+// Takes the oldest presented frame off the queue (lock held).
+static FrameToken pop_pending_locked() {
+    FrameToken token = g_pacer.pending[g_pacer.pending_first].token;
+    g_pacer.pending_first = (g_pacer.pending_first + 1) % MAX_PENDING;
+    g_pacer.pending_count--;
+    return token;
+}
+
+// At a vblank: the oldest presented frame flips if the GPU has finished it (lock held).
+static void flip_pending_locked() {
+    if (!g_pacer.pending_count)
+        return;
+    const PendingFlip& f = g_pacer.pending[g_pacer.pending_first];
+    if (f.present_done && presenter_completed() < f.present_done)
+        return;
+    flip_locked(pop_pending_locked());
 }
 
 // Origins may fire while fewer than `period` frames are between their start and the display.
@@ -86,6 +144,7 @@ static DWORD WINAPI scheduler_thread(void*) {
             SetEvent(g_pacer.ready[FRAME_EVENT_VBLANK]);
             if (g_pacer.events[FRAME_EVENT_VBLANK].enabled)
                 signal_event(FRAME_EVENT_VBLANK);
+            flip_pending_locked();
             // The origin of the new interval is due at boundary + offset; a pending one from the
             // previous interval that was withheld stays pending.
         } else if (now >= origin && g_pacer.last_origin_interval < g_pacer.intervals_done &&
@@ -120,9 +179,16 @@ static BOOL CALLBACK init_pacer(PINIT_ONCE, void*, void**) {
     g_pacer.wakeup = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     g_pacer.timer =
         CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-    for (u32 i = 0; i < FRAME_EVENT_COUNT; i++)
+    bool ok = g_pacer.wakeup && g_pacer.timer;
+    for (u32 i = 0; i < FRAME_EVENT_COUNT; i++) {
         g_pacer.ready[i] = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (!g_pacer.wakeup || !g_pacer.timer || !g_pacer.ready[0] || !g_pacer.ready[1] || !g_pacer.ready[2])
+        ok = ok && g_pacer.ready[i];
+    }
+    for (u32 i = 0; i < MAX_FLIP_WAITERS; i++) {
+        g_pacer.flip_waiters[i].event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        ok = ok && g_pacer.flip_waiters[i].event;
+    }
+    if (!ok)
         FATAL("cannot create frame pacing objects (%lu)", GetLastError());
     g_pacer.thread = CreateThread(nullptr, 0, scheduler_thread, nullptr, 0, nullptr);
     if (!g_pacer.thread)
@@ -188,6 +254,51 @@ static FrameToken take_origin_locked() {
     return g_pacer.tokens_issued; // tokens are 1-based frame numbers
 }
 
+// Flip waits are for the caller's frame: they return at once if it's already on the display.
+static HRESULT wait_flip(u32 timeout_ms, const FrameWaitList* extra, u32 flags, FrameToken token) {
+    AcquireSRWLockExclusive(&g_pacer.lock);
+    FlipWaiter probe = {nullptr, true, token, g_pacer.frames_flipped};
+    if (flip_wait_satisfied(probe)) {
+        ReleaseSRWLockExclusive(&g_pacer.lock);
+        if (extra && extra->signaled_index)
+            *extra->signaled_index = FRAME_SIGNALED_PRIMARY;
+        return S_OK;
+    }
+    FlipWaiter* w = nullptr;
+    for (u32 i = 0; i < MAX_FLIP_WAITERS && !w; i++)
+        if (!g_pacer.flip_waiters[i].used)
+            w = &g_pacer.flip_waiters[i];
+    if (!w) {
+        ReleaseSRWLockExclusive(&g_pacer.lock);
+        LOG_E("d3d12", "more than %u threads wait for flips at once", MAX_FLIP_WAITERS);
+        return E_FAIL;
+    }
+    ResetEvent(w->event);
+    w->used = true;
+    w->token = token;
+    w->flips_before = probe.flips_before;
+    ReleaseSRWLockExclusive(&g_pacer.lock);
+
+    HANDLE handles[1 + MAX_WAIT_HANDLES];
+    u32 count = 0;
+    handles[count++] = w->event;
+    for (u32 i = 0; extra && i < extra->count; i++)
+        handles[count++] = extra->objects[i];
+    DWORD r = WaitForMultipleObjects(count, handles, (flags & WAIT_FLAG_ALL) != 0, timeout_ms);
+
+    AcquireSRWLockExclusive(&g_pacer.lock);
+    w->used = false;
+    ReleaseSRWLockExclusive(&g_pacer.lock);
+    if (r == WAIT_FAILED)
+        return HRESULT_FROM_WIN32(GetLastError());
+    u32 signaled = FRAME_SIGNALED_NONE;
+    if (r < WAIT_OBJECT_0 + count)
+        signaled = r == WAIT_OBJECT_0 ? FRAME_SIGNALED_PRIMARY : (u32)(r - WAIT_OBJECT_0 - 1);
+    if (extra && extra->signaled_index)
+        *extra->signaled_index = signaled;
+    return r == WAIT_TIMEOUT ? S_FALSE : S_OK;
+}
+
 HRESULT frame_wait_event(FrameEventType type, u32 timeout_ms, const FrameWaitList* extra, u32 flags,
                          FrameToken* token) {
     ensure_init();
@@ -195,6 +306,8 @@ HRESULT frame_wait_event(FrameEventType type, u32 timeout_ms, const FrameWaitLis
         return E_INVALIDARG;
     if (type == FRAME_EVENT_ORIGIN && !g_pacer.events[FRAME_EVENT_ORIGIN].enabled)
         return E_INVALIDARG;
+    if (type == FRAME_EVENT_FLIP)
+        return wait_flip(timeout_ms, extra, flags, token ? *token : 0);
 
     HANDLE handles[1 + MAX_WAIT_HANDLES];
     u32 count = 0;
@@ -202,8 +315,8 @@ HRESULT frame_wait_event(FrameEventType type, u32 timeout_ms, const FrameWaitLis
     for (u32 i = 0; extra && i < extra->count; i++)
         handles[count++] = extra->objects[i];
 
-    // VBLANK and FLIP waits are for the next occurrence.
-    if (type != FRAME_EVENT_ORIGIN)
+    // VBLANK waits are for the next one.
+    if (type == FRAME_EVENT_VBLANK)
         ResetEvent(g_pacer.ready[type]);
 
     for (;;) {
@@ -236,14 +349,21 @@ HRESULT frame_wait_event(FrameEventType type, u32 timeout_ms, const FrameWaitLis
     }
 }
 
-void frame_on_flip(FrameToken token) {
+void frame_on_present(FrameToken token, u64 present_done) {
     ensure_init();
     AcquireSRWLockExclusive(&g_pacer.lock);
-    if (g_pacer.frames_flipped < g_pacer.tokens_issued)
-        g_pacer.frames_flipped++;
-    SetEvent(g_pacer.ready[FRAME_EVENT_FLIP]);
-    if (g_pacer.events[FRAME_EVENT_FLIP].enabled)
-        signal_event(FRAME_EVENT_FLIP);
+    if (!g_pacer.timeline_running) {
+        flip_locked(token); // no display timeline to wait for
+    } else {
+        if (g_pacer.pending_count == MAX_PENDING) {
+            LOG_W_ONCE("d3d12", "more than %u presented frames wait to flip; flipping the oldest early",
+                       MAX_PENDING);
+            flip_locked(pop_pending_locked());
+        }
+        PendingFlip& f = g_pacer.pending[(g_pacer.pending_first + g_pacer.pending_count) % MAX_PENDING];
+        f.token = token;
+        f.present_done = present_done;
+        g_pacer.pending_count++;
+    }
     ReleaseSRWLockExclusive(&g_pacer.lock);
-    SetEvent(g_pacer.wakeup); // a withheld origin may be allowed now
 }

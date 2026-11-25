@@ -20,5 +20,9 @@ struct PresentPlane {
 #define PRESENT_MAX_PLANES 2
 
 // Draws `count` planes (bottom first) on `queue` after its earlier work and presents. The swap chain
-// is created on the first call's queue, which must be a direct queue.
-bool presenter_present(ID3D12CommandQueue* queue, const PresentPlane* planes, u32 count);
+// is created on the first call's queue, which must be a direct queue. Returns the value
+// presenter_completed() reaches once the GPU is done with the present, 0 if nothing was submitted.
+u64 presenter_present(ID3D12CommandQueue* queue, const PresentPlane* planes, u32 count);
+
+// How far the GPU has got through presents (see presenter_present); UINT64_MAX before the first.
+u64 presenter_completed();

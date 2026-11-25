@@ -11,7 +11,8 @@
 // fixed offset into each interval, but only while fewer than `period` frames are in flight, which
 // throttles the title to the display.
 //
-// We keep a virtual display timeline at the title's interval on a scheduler thread.
+// We keep a virtual display timeline at the title's interval on a scheduler thread. Presented
+// frames flip at its vblanks, one per vblank, once the GPU has finished them.
 
 enum FrameEventType : u32 {
     FRAME_EVENT_ORIGIN = 0,
@@ -41,5 +42,6 @@ HRESULT frame_schedule_event(FrameEventType type, u32 offset_us, const FrameSign
 HRESULT frame_wait_event(FrameEventType type, u32 timeout_ms, const FrameWaitList* extra, u32 flags,
                          FrameToken* token);
 
-// Called once a presented frame is on screen.
-void frame_on_flip(FrameToken token);
+// A frame was presented; it flips to the display at the first vblank after the GPU has finished
+// it, i.e. once presenter_completed() reaches `present_done` (0: nothing to wait for).
+void frame_on_present(FrameToken token, u64 present_done);
