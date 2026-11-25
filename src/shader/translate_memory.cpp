@@ -164,6 +164,278 @@ static bool is_d16_format(RdnaOp op) {
            (op >= OP_TBUFFER_LOAD_FORMAT_D16_X && op <= OP_TBUFFER_STORE_FORMAT_D16_XYZW);
 }
 
+static bool is_buffer_atomic(RdnaOp op) {
+    return op >= OP_BUFFER_ATOMIC_SWAP && op <= OP_BUFFER_ATOMIC_DEC;
+}
+
+enum MtbufNum : u8 {
+    MTBUF_UNORM,
+    MTBUF_SNORM,
+    MTBUF_USCALED,
+    MTBUF_SSCALED,
+    MTBUF_UINT,
+    MTBUF_SINT,
+    MTBUF_FLOAT,
+};
+
+struct MtbufFmt {
+    u8 channels;
+    u8 bits[4];
+    MtbufNum num;
+};
+
+// RDNA 2 (gfx10) unified buffer formats (LLVM UfmtSymbolicGFX10).
+static bool mtbuf_format_info(u32 fmt_id, MtbufFmt* out) {
+    static const MtbufNum k_6[6] = {MTBUF_UNORM,   MTBUF_SNORM, MTBUF_USCALED,
+                                    MTBUF_SSCALED, MTBUF_UINT,  MTBUF_SINT};
+    static const MtbufNum k_7[7] = {MTBUF_UNORM, MTBUF_SNORM, MTBUF_USCALED, MTBUF_SSCALED,
+                                    MTBUF_UINT,  MTBUF_SINT,  MTBUF_FLOAT};
+    static const MtbufNum k_3[3] = {MTBUF_UINT, MTBUF_SINT, MTBUF_FLOAT};
+    auto set = [&](u8 ch, u8 b0, u8 b1, u8 b2, u8 b3, MtbufNum n) {
+        out->channels = ch;
+        out->bits[0] = b0;
+        out->bits[1] = b1;
+        out->bits[2] = b2;
+        out->bits[3] = b3;
+        out->num = n;
+        return true;
+    };
+    if (fmt_id >= 1 && fmt_id <= 6)
+        return set(1, 8, 0, 0, 0, k_6[fmt_id - 1]);
+    if (fmt_id >= 7 && fmt_id <= 13)
+        return set(1, 16, 0, 0, 0, k_7[fmt_id - 7]);
+    if (fmt_id >= 14 && fmt_id <= 19)
+        return set(2, 8, 8, 0, 0, k_6[fmt_id - 14]);
+    if (fmt_id >= 20 && fmt_id <= 22)
+        return set(1, 32, 0, 0, 0, k_3[fmt_id - 20]);
+    if (fmt_id >= 23 && fmt_id <= 29)
+        return set(2, 16, 16, 0, 0, k_7[fmt_id - 23]);
+    if (fmt_id >= 30 && fmt_id <= 36)
+        return set(3, 11, 11, 10, 0, k_7[fmt_id - 30]);
+    if (fmt_id >= 37 && fmt_id <= 43)
+        return set(3, 10, 11, 11, 0, k_7[fmt_id - 37]);
+    if (fmt_id >= 44 && fmt_id <= 49)
+        return set(4, 10, 10, 10, 2, k_6[fmt_id - 44]);
+    if (fmt_id >= 50 && fmt_id <= 55)
+        return set(4, 2, 10, 10, 10, k_6[fmt_id - 50]);
+    if (fmt_id >= 56 && fmt_id <= 61)
+        return set(4, 8, 8, 8, 8, k_6[fmt_id - 56]);
+    if (fmt_id >= 62 && fmt_id <= 64)
+        return set(2, 32, 32, 0, 0, k_3[fmt_id - 62]);
+    if (fmt_id >= 65 && fmt_id <= 71)
+        return set(4, 16, 16, 16, 16, k_7[fmt_id - 65]);
+    if (fmt_id >= 72 && fmt_id <= 74)
+        return set(3, 32, 32, 32, 0, k_3[fmt_id - 72]);
+    if (fmt_id >= 75 && fmt_id <= 77)
+        return set(4, 32, 32, 32, 32, k_3[fmt_id - 75]);
+    return false;
+}
+
+static bool emit_buffer_atomic(Translator& t, const RdnaInst& in, const char* buf, const char* addr) {
+    bool rtn = in.mem.glc;
+    const char* d0 = vgpr(t, in.dst[0].reg);
+    bool is_signed = in.op == OP_BUFFER_ATOMIC_SMIN || in.op == OP_BUFFER_ATOMIC_SMAX;
+    if (in.op == OP_BUFFER_ATOMIC_CMPSWAP) {
+        const char* d1 = vgpr(t, in.dst[0].reg + 1);
+        if (rtn)
+            emit(t, "uint o_ = 0u; if (EXEC) %s.InterlockedCompareExchange(%s, %s, %s, o_);", buf, addr,
+                 d1, d0);
+        else
+            emit(t, "if (EXEC) %s.InterlockedCompareStore(%s, %s, %s);", buf, addr, d1, d0);
+    } else if (in.op == OP_BUFFER_ATOMIC_INC || in.op == OP_BUFFER_ATOMIC_DEC) {
+        const char* next = in.op == OP_BUFFER_ATOMIC_INC
+                               ? fmt(t, "(cur_ >= %s ? 0u : cur_ + 1u)", d0)
+                               : fmt(t, "((cur_ == 0u || cur_ > %s) ? %s : cur_ - 1u)", d0, d0);
+        emit(t,
+             "uint o_ = 0u; if (EXEC) { uint cur_ = %s.Load(%s), prev_ = 0u; [allow_uav_condition] do { "
+             "uint nxt_ = %s; %s.InterlockedCompareExchange(%s, cur_, nxt_, prev_); if (prev_ == cur_) { o_ "
+             "= cur_; break; } cur_ = prev_; } while (true); }",
+             buf, addr, next, buf, addr);
+    } else if (in.op == OP_BUFFER_ATOMIC_SWAP) {
+        emit(t, "uint o_ = 0u; if (EXEC) %s.InterlockedExchange(%s, %s, o_);", buf, addr, d0);
+    } else {
+        const char* fn = nullptr;
+        const char* val = d0;
+        switch (in.op) {
+        case OP_BUFFER_ATOMIC_ADD:
+            fn = "InterlockedAdd";
+            break;
+        case OP_BUFFER_ATOMIC_SUB:
+            fn = "InterlockedAdd";
+            val = fmt(t, "(uint)(-(int)%s)", d0);
+            break;
+        case OP_BUFFER_ATOMIC_SMIN:
+            fn = "InterlockedMin";
+            val = fmt(t, "(int)%s", d0);
+            break;
+        case OP_BUFFER_ATOMIC_UMIN:
+            fn = "InterlockedMin";
+            break;
+        case OP_BUFFER_ATOMIC_SMAX:
+            fn = "InterlockedMax";
+            val = fmt(t, "(int)%s", d0);
+            break;
+        case OP_BUFFER_ATOMIC_UMAX:
+            fn = "InterlockedMax";
+            break;
+        case OP_BUFFER_ATOMIC_AND:
+            fn = "InterlockedAnd";
+            break;
+        case OP_BUFFER_ATOMIC_OR:
+            fn = "InterlockedOr";
+            break;
+        case OP_BUFFER_ATOMIC_XOR:
+            fn = "InterlockedXor";
+            break;
+        default:
+            translator_fail(t, "unsupported %s", rdna_op_name(in.op));
+            return false;
+        }
+        if (rtn)
+            emit(t, "%s o_ = %s; if (EXEC) %s.%s(%s, %s, o_);", is_signed ? "int" : "uint",
+                 is_signed ? "0" : "0u", buf, fn, addr, val);
+        else
+            emit(t, "if (EXEC) %s.%s(%s, %s);", buf, fn, addr, val);
+    }
+    if (rtn)
+        write_vgpr(t, in, in.dst[0].reg, is_signed ? "(uint)o_" : "o_");
+    return true;
+}
+
+static bool emit_mtbuf_access(Translator& t, const RdnaInst& in, const char* buf, const char* addr,
+                              bool store) {
+    MtbufFmt f;
+    if (!mtbuf_format_info(in.mem.format, &f)) {
+        translator_fail(t, "%s with unsupported format %u at 0x%x", rdna_op_name(in.op), in.mem.format,
+                        in.offset);
+        return false;
+    }
+    bool d16 = is_d16_format(in.op);
+    u32 comps = store ? (u32)(d16 ? in.op - OP_TBUFFER_STORE_FORMAT_D16_X : in.op - OP_TBUFFER_STORE_FORMAT_X) + 1
+                      : (u32)(d16 ? in.op - OP_TBUFFER_LOAD_FORMAT_D16_X : in.op - OP_TBUFFER_LOAD_FORMAT_X) + 1;
+    u32 total_bits = 0;
+    for (u32 i = 0; i < f.channels; i++)
+        total_bits += f.bits[i];
+    u32 dwords = (total_bits + 31) / 32;
+    if (store) {
+        if (total_bits % 32 != 0) {
+            translator_fail(t, "sub-dword %s at 0x%x", rdna_op_name(in.op), in.offset);
+            return false;
+        }
+        const char* in_c[4] = {};
+        for (u32 i = 0; i < 4; i++) {
+            if (i < comps) {
+                if (d16) {
+                    const char* r = vgpr(t, in.dst[0].reg + i / 2);
+                    const char* half = (i & 1) ? fmt(t, "(%s >> 16)", r) : fmt(t, "(%s & 0xffffu)", r);
+                    in_c[i] = (f.num == MTBUF_UINT || f.num == MTBUF_SINT) ? half : fmt(t, "f16tof32(%s)", half);
+                } else {
+                    const char* r = vgpr(t, in.dst[0].reg + i);
+                    in_c[i] = (f.num == MTBUF_UINT || f.num == MTBUF_SINT) ? r : fmt(t, "asfloat(%s)", r);
+                }
+            } else {
+                in_c[i] = (f.num == MTBUF_UINT || f.num == MTBUF_SINT) ? "0u" : "0.0f";
+            }
+        }
+        if (dwords == 1)
+            emit(t, "uint w_ = 0u;");
+        else
+            emit(t, "uint%u w_ = (uint%u)0u;", dwords, dwords);
+        u32 bit_at = 0;
+        for (u32 i = 0; i < f.channels; i++) {
+            u32 w = f.bits[i];
+            const char* enc = nullptr;
+            u32 max_u = w == 32 ? 0xffffffffu : ((1u << w) - 1u);
+            s32 max_s = (s32)((1u << (w - 1)) - 1u);
+            switch (f.num) {
+            case MTBUF_FLOAT:
+                enc = w == 16 ? fmt(t, "f32tof16(%s)", in_c[i]) : fmt(t, "asuint(%s)", in_c[i]);
+                break;
+            case MTBUF_UNORM:
+                enc = fmt(t, "(uint)round(saturate(%s) * %u.0f)", in_c[i], max_u);
+                break;
+            case MTBUF_SNORM:
+                enc = fmt(t, "((uint)(int)round(clamp(%s, -1.0f, 1.0f) * %d.0f) & 0x%xu)", in_c[i], max_s,
+                          max_u);
+                break;
+            case MTBUF_USCALED:
+                enc = fmt(t, "(f32_to_u32(%s) & 0x%xu)", in_c[i], max_u);
+                break;
+            case MTBUF_SSCALED:
+                enc = fmt(t, "((uint)f32_to_i32(%s) & 0x%xu)", in_c[i], max_u);
+                break;
+            default:
+                enc = w == 32 ? in_c[i] : fmt(t, "(%s & 0x%xu)", in_c[i], max_u);
+                break;
+            }
+            u32 dw = bit_at / 32, sh = bit_at % 32;
+            const char* dst_w = dwords == 1 ? "w_" : fmt(t, "w_.%c", "xyzw"[dw]);
+            emit(t, "%s |= (%s << %uu);", dst_w, enc, sh);
+            bit_at += w;
+        }
+        emit(t, "if (EXEC) %s.%s(%s, w_);", buf, k_store_fn[dwords], addr);
+        return true;
+    }
+    emit(t, "uint%s w_ = %s.%s(%s);", dwords == 1 ? "" : fmt(t, "%u", dwords), buf, k_load_fn[dwords],
+         addr);
+    const char* out_c[4] = {};
+    u32 bit_at = 0;
+    bool int_fmt = f.num == MTBUF_UINT || f.num == MTBUF_SINT;
+    for (u32 i = 0; i < comps; i++) {
+        if (i >= f.channels) {
+            out_c[i] = (i == 3) ? (int_fmt ? "1u" : (d16 ? "0x3c00u" : "0x3f800000u")) : "0u";
+            continue;
+        }
+        u32 w = f.bits[i], dw = bit_at / 32, sh = bit_at % 32;
+        bit_at += w;
+        const char* src_w = dwords == 1 ? "w_" : fmt(t, "w_.%c", "xyzw"[dw]);
+        u32 mask = w == 32 ? 0xffffffffu : ((1u << w) - 1u);
+        const char* raw = w == 32 ? src_w : fmt(t, "((%s >> %uu) & 0x%xu)", src_w, sh, mask);
+        const char* sraw =
+            w == 32 ? fmt(t, "(int)%s", src_w) : fmt(t, "((int)(%s << %uu) >> %uu)", src_w, 32u - sh - w, 32u - w);
+        const char* flt = nullptr;
+        switch (f.num) {
+        case MTBUF_FLOAT:
+            if (d16 && w == 16)
+                out_c[i] = raw;
+            else
+                flt = w == 16 ? fmt(t, "f16tof32(%s)", raw) : fmt(t, "asfloat(%s)", raw);
+            break;
+        case MTBUF_UNORM:
+            flt = fmt(t, "((float)%s / %u.0f)", raw, mask);
+            break;
+        case MTBUF_SNORM:
+            flt = fmt(t, "max((float)%s / %d.0f, -1.0f)", sraw, (s32)((1u << (w - 1)) - 1u));
+            break;
+        case MTBUF_USCALED:
+            flt = fmt(t, "(float)%s", raw);
+            break;
+        case MTBUF_SSCALED:
+            flt = fmt(t, "(float)%s", sraw);
+            break;
+        case MTBUF_UINT:
+            out_c[i] = d16 ? fmt(t, "(%s & 0xffffu)", raw) : raw;
+            break;
+        case MTBUF_SINT:
+            out_c[i] = d16 ? fmt(t, "((uint)%s & 0xffffu)", sraw) : fmt(t, "(uint)%s", sraw);
+            break;
+        }
+        if (flt)
+            out_c[i] = d16 ? fmt(t, "f32tof16(%s)", flt) : fmt(t, "asuint(%s)", flt);
+    }
+    if (d16) {
+        for (u32 i = 0; i < comps; i += 2) {
+            const char* packed =
+                (i + 1 < comps) ? fmt(t, "(%s | (%s << 16))", out_c[i], out_c[i + 1]) : out_c[i];
+            write_vgpr(t, in, in.dst[0].reg + i / 2, packed);
+        }
+    } else {
+        for (u32 i = 0; i < comps; i++)
+            write_vgpr(t, in, in.dst[0].reg + i, out_c[i]);
+    }
+    return true;
+}
+
 // Vertex element formats: components and bytes per component (0 for packed formats), and which
 // input assembler component each component in memory becomes.
 struct FormatLayout {
@@ -373,9 +645,13 @@ static bool emit_buffer(Translator& t, const RdnaInst& in) {
     }
     bool store = is_store(in.op);
     bool format = is_format_access(in.op);
+    bool d16 = is_d16_format(in.op);
+    bool atomic = is_buffer_atomic(in.op);
     u32 dwords = store ? in.src[1].count : buffer_dwords(in);
     if (store)
-        dwords = (u32)((in.op >= OP_TBUFFER_STORE_FORMAT_X)     ? in.op - OP_TBUFFER_STORE_FORMAT_X + 1
+        dwords = (u32)((in.op >= OP_TBUFFER_STORE_FORMAT_D16_X) ? in.op - OP_TBUFFER_STORE_FORMAT_D16_X + 1
+                       : (in.op >= OP_TBUFFER_STORE_FORMAT_X)   ? in.op - OP_TBUFFER_STORE_FORMAT_X + 1
+                       : (in.op >= OP_BUFFER_STORE_FORMAT_D16_X) ? in.op - OP_BUFFER_STORE_FORMAT_D16_X + 1
                        : (in.op <= OP_BUFFER_STORE_FORMAT_XYZW) ? in.op - OP_BUFFER_STORE_FORMAT_X + 1
                        : in.op == OP_BUFFER_STORE_DWORDX2       ? 2
                        : in.op == OP_BUFFER_STORE_DWORDX3       ? 3
@@ -384,8 +660,7 @@ static bool emit_buffer(Translator& t, const RdnaInst& in) {
     bool sub_dword = (in.op >= OP_BUFFER_LOAD_UBYTE && in.op <= OP_BUFFER_LOAD_SSHORT) ||
                      (in.op >= OP_BUFFER_STORE_BYTE && in.op <= OP_BUFFER_STORE_SHORT_D16_HI) ||
                      in.op >= OP_BUFFER_LOAD_UBYTE_D16 && in.op <= OP_BUFFER_LOAD_SHORT_D16_HI;
-    if (sub_dword || is_d16_format(in.op) ||
-        (in.op >= OP_BUFFER_ATOMIC_SWAP && in.op <= OP_BUFFER_ATOMIC_FMAX)) {
+    if (sub_dword || (in.op >= OP_BUFFER_ATOMIC_FCMPSWAP && in.op <= OP_BUFFER_ATOMIC_FMAX)) {
         translator_fail(t, "unsupported %s", rdna_op_name(in.op));
         return false;
     }
@@ -395,7 +670,7 @@ static bool emit_buffer(Translator& t, const RdnaInst& in) {
     const char* offset = fmt(t, "(%s + 0x%xu + %s)", voffset, (u32)in.mem.offset, soffset(t, in, 2));
 
     if (tag_kind(hi) == TAG_ROOT_HI) {
-        if (format) {
+        if (format && in.enc != ENC_MTBUF) {
             translator_fail(t, "formatted access to a root buffer at 0x%x", in.offset);
             return false;
         }
@@ -405,7 +680,21 @@ static bool emit_buffer(Translator& t, const RdnaInst& in) {
         emit(t, "{ uint a_ = %s + %s * ((%s >> 16) & 0x3fffu) + %s;", sgpr(t, rsrc), index, sgpr(t, rsrc + 1),
              offset);
         t.depth++;
-        if (store) {
+        if (atomic) {
+            if (t.info->parameters[parameter].kind != USER_DATA_ROOT_UAV) {
+                translator_fail(t, "atomic on a read-only root buffer at 0x%x", in.offset);
+                return false;
+            }
+            if (!emit_buffer_atomic(t, in, fmt(t, "g_root%u", parameter), "a_"))
+                return false;
+        } else if (in.enc == ENC_MTBUF) {
+            if (store && t.info->parameters[parameter].kind != USER_DATA_ROOT_UAV) {
+                translator_fail(t, "store to a read-only root buffer at 0x%x", in.offset);
+                return false;
+            }
+            if (!emit_mtbuf_access(t, in, fmt(t, "g_root%u", parameter), "a_", store))
+                return false;
+        } else if (store) {
             if (t.info->parameters[parameter].kind != USER_DATA_ROOT_UAV) {
                 translator_fail(t, "store to a read-only root buffer at 0x%x", in.offset);
                 return false;
@@ -430,31 +719,55 @@ static bool emit_buffer(Translator& t, const RdnaInst& in) {
         return true;
     }
     if (tag_kind(lo) == TAG_HEAP && (tag_payload(lo) & 1) == HEAP_RESOURCES) {
-        TableRangeKind kind = heap_kind(t, rsrc, store ? RANGE_UAV : RANGE_SRV);
+        TableRangeKind kind = heap_kind(t, rsrc, (store || atomic) ? RANGE_UAV : RANGE_SRV);
         const char* heap_index = fmt(t, "(%s >> 5)", sgpr(t, rsrc));
         emit(t, "{");
         t.depth++;
-        if (format) {
-            if (in.enc == ENC_MTBUF || in.mem.offen || in.mem.offset) {
+        if (format && in.enc != ENC_MTBUF) {
+            if (in.mem.offen || in.mem.offset) {
                 translator_fail(t, "%s with an offset or format at 0x%x", rdna_op_name(in.op), in.offset);
                 return false;
             }
+            u32 comps = store ? dwords
+                              : (u32)(d16 ? in.op - OP_BUFFER_LOAD_FORMAT_D16_X : in.op - OP_BUFFER_LOAD_FORMAT_X) +
+                                    1;
             emit(t, "%s<float4> b_ = ResourceDescriptorHeap[%s];",
                  kind == RANGE_UAV || store ? "RWBuffer" : "Buffer", heap_index);
             if (store) {
                 const char* c[4];
-                for (u32 i = 0; i < 4; i++)
-                    c[i] = i < dwords ? fmt(t, "asfloat(%s)", vgpr(t, in.dst[0].reg + i)) : "0.0f";
+                for (u32 i = 0; i < 4; i++) {
+                    if (i < comps) {
+                        if (d16) {
+                            const char* r = vgpr(t, in.dst[0].reg + i / 2);
+                            c[i] = (i & 1) ? fmt(t, "f16tof32(%s >> 16)", r) : fmt(t, "f16tof32(%s)", r);
+                        } else {
+                            c[i] = fmt(t, "asfloat(%s)", vgpr(t, in.dst[0].reg + i));
+                        }
+                    } else {
+                        c[i] = "0.0f";
+                    }
+                }
                 emit(t, "if (EXEC) b_[%s] = float4(%s, %s, %s, %s);", index, c[0], c[1], c[2], c[3]);
             } else {
                 emit(t, "float4 r_ = b_[%s];", index);
                 static const char k_comp[4] = {'x', 'y', 'z', 'w'};
-                for (u32 i = 0; i < dwords; i++)
-                    write_vgpr(t, in, in.dst[0].reg + i, fmt(t, "asuint(r_.%c)", k_comp[i]));
+                if (d16) {
+                    for (u32 i = 0; i < comps; i += 2) {
+                        const char* packed =
+                            (i + 1 < comps)
+                                ? fmt(t, "(f32tof16(r_.%c) | (f32tof16(r_.%c) << 16))", k_comp[i],
+                                      k_comp[i + 1])
+                                : fmt(t, "f32tof16(r_.%c)", k_comp[i]);
+                        write_vgpr(t, in, in.dst[0].reg + i / 2, packed);
+                    }
+                } else {
+                    for (u32 i = 0; i < comps; i++)
+                        write_vgpr(t, in, in.dst[0].reg + i, fmt(t, "asuint(r_.%c)", k_comp[i]));
+                }
             }
         } else {
-            if (kind == RANGE_CBV && store) {
-                translator_fail(t, "store to a constant buffer at 0x%x", in.offset);
+            if (kind == RANGE_CBV && (store || atomic)) {
+                translator_fail(t, "store or atomic to a constant buffer at 0x%x", in.offset);
                 return false;
             }
             const char* stride = "0u";
@@ -462,11 +775,18 @@ static bool emit_buffer(Translator& t, const RdnaInst& in) {
                 t.needs_descriptor_info = true;
                 stride = fmt(t, "g_descriptor_info.Load(%s * 16u)", heap_index);
             }
-            // Stores go through UAVs whatever the root signature says (dynamically indexed tables).
+            // Stores and atomics go through UAVs whatever the root signature says (dynamically indexed tables).
             emit(t, "%s b_ = ResourceDescriptorHeap[%s];",
-                 kind == RANGE_UAV || store ? "RWByteAddressBuffer" : "ByteAddressBuffer", heap_index);
+                 kind == RANGE_UAV || store || atomic ? "RWByteAddressBuffer" : "ByteAddressBuffer",
+                 heap_index);
             emit(t, "uint a_ = %s * %s + %s;", index, stride, offset);
-            if (store) {
+            if (atomic) {
+                if (!emit_buffer_atomic(t, in, "b_", "a_"))
+                    return false;
+            } else if (in.enc == ENC_MTBUF) {
+                if (!emit_mtbuf_access(t, in, "b_", "a_", store))
+                    return false;
+            } else if (store) {
                 char list[96] = {};
                 usize n = 0;
                 for (u32 i = 0; i < dwords; i++) {
@@ -603,28 +923,14 @@ static const char* const k_texture_types[8] = {"Texture1D",   "Texture2D",      
 static const u8 k_dim_coords[8] = {1, 2, 3, 3, 2, 3, 2, 3};
 static const u8 k_dim_grads[8] = {1, 2, 3, 3, 1, 2, 2, 2};
 
-static const char* float_vector(Translator& t, const u32* regs, u32 count) {
+static const char* join_exprs(Translator& t, const char* type, const char* const* exprs, u32 count) {
     if (count == 1)
-        return fmt(t, "asfloat(%s)", vgpr(t, regs[0]));
-    char list[160] = {};
+        return exprs[0];
+    char list[256] = {};
     usize n = 0;
     for (u32 i = 0; i < count; i++)
-        n += (usize)snprintf(list + n, sizeof(list) - n, "%sasfloat(v%u)", i ? ", " : "", regs[i]);
-    for (u32 i = 0; i < count; i++)
-        use_vgpr(t, regs[i]);
-    return fmt(t, "float%u(%s)", count, list);
-}
-
-static const char* uint_vector(Translator& t, const u32* regs, u32 count) {
-    if (count == 1)
-        return vgpr(t, regs[0]);
-    char list[160] = {};
-    usize n = 0;
-    for (u32 i = 0; i < count; i++)
-        n += (usize)snprintf(list + n, sizeof(list) - n, "%sv%u", i ? ", " : "", regs[i]);
-    for (u32 i = 0; i < count; i++)
-        use_vgpr(t, regs[i]);
-    return fmt(t, "uint%u(%s)", count, list);
+        n += (usize)snprintf(list + n, sizeof(list) - n, "%s%s", i ? ", " : "", exprs[i]);
+    return fmt(t, "%s%u(%s)", type, count, list);
 }
 
 static bool emit_image(Translator& t, const RdnaInst& in) {
@@ -634,8 +940,8 @@ static bool emit_image(Translator& t, const RdnaInst& in) {
         translator_fail(t, "unsupported %s", rdna_op_name(in.op));
         return false;
     }
-    if (m.a16 || m.d16 || m.tfe || m.lwe) {
-        translator_fail(t, "%s with 16-bit data or addresses at 0x%x", rdna_op_name(in.op), in.offset);
+    if (m.tfe || m.lwe) {
+        translator_fail(t, "%s with TFE/LWE at 0x%x", rdna_op_name(in.op), in.offset);
         return false;
     }
     if (m.dim == DIM_CUBE && (form.sample || form.gather)) {
@@ -653,33 +959,52 @@ static bool emit_image(Translator& t, const RdnaInst& in) {
                         in.offset);
         return false;
     }
-    // Address VGPRs in order.
-    u32 regs[16];
+    // Address components in order (packed two 16-bit components per VGPR when a16 is set).
     u32 count = rdna_image_address_count(in.op, m.dim);
     if (count > 16) {
         translator_fail(t, "too many image address registers");
         return false;
     }
-    for (u32 i = 0; i < count; i++)
+    u32 addr_vgprs = m.a16 ? (count + 1) / 2 : count;
+    u32 regs[16];
+    for (u32 i = 0; i < addr_vgprs; i++)
         regs[i] = m.nsa_count && i > 0 ? m.nsa_addr[i - 1] : in.src[0].reg + i;
+    const char* addr_u[16];
+    const char* addr_f[16];
+    for (u32 i = 0; i < count; i++) {
+        if (m.a16) {
+            const char* r = vgpr(t, regs[i / 2]);
+            addr_u[i] = (i & 1) ? fmt(t, "(%s >> 16)", r) : fmt(t, "(%s & 0xffffu)", r);
+            addr_f[i] = (i & 1) ? fmt(t, "f16tof32(%s >> 16)", r) : fmt(t, "f16tof32(%s)", r);
+        } else {
+            const char* r = vgpr(t, regs[i]);
+            addr_u[i] = r;
+            addr_f[i] = fmt(t, "asfloat(%s)", r);
+        }
+    }
     u32 at = 0;
-    u32 bias_reg = 0, compare_reg = 0, lod_reg = 0, clamp_reg = 0, grad_regs[6] = {};
+    const char *bias_f = nullptr, *compare_f = nullptr, *lod_f = nullptr, *lod_u = nullptr, *clamp_f = nullptr;
+    const char* grad_f[6] = {};
     if (form.bias)
-        bias_reg = regs[at++];
+        bias_f = addr_f[at++];
     if (form.compare)
-        compare_reg = regs[at++];
+        compare_f = addr_f[at++];
     u32 grads = k_dim_grads[m.dim];
     if (form.grad) {
         for (u32 i = 0; i < grads * 2; i++)
-            grad_regs[i] = regs[at++];
+            grad_f[i] = addr_f[at++];
     }
     u32 coords = k_dim_coords[m.dim];
-    const u32* coord_regs = regs + at;
+    const char* const* coord_u = addr_u + at;
+    const char* const* coord_f = addr_f + at;
     at += coords;
-    if (form.lod || form.mip || in.op == OP_IMAGE_MSAA_LOAD)
-        lod_reg = regs[at++];
+    if (form.lod || form.mip || in.op == OP_IMAGE_MSAA_LOAD) {
+        lod_u = addr_u[at];
+        lod_f = addr_f[at];
+        at++;
+    }
     if (form.clamp)
-        clamp_reg = regs[at++];
+        clamp_f = addr_f[at++];
 
     TableRangeKind kind = heap_kind(t, rsrc, form.store ? RANGE_UAV : RANGE_SRV);
     bool uav = kind == RANGE_UAV || form.store;
@@ -725,12 +1050,12 @@ static bool emit_image(Translator& t, const RdnaInst& in) {
                             in.offset);
             return false;
         }
-        const char* uv = float_vector(t, coord_regs, coords);
+        const char* uv = join_exprs(t, "float", coord_f, coords);
         if (form.gather) {
             static const char* const k_gather[4] = {"GatherRed", "GatherGreen", "GatherBlue", "GatherAlpha"};
             u32 c = m.dmask & 2 ? 1 : m.dmask & 4 ? 2 : m.dmask & 8 ? 3 : 0;
             if (form.compare)
-                value = fmt(t, "tex_.GatherCmpRed(smp_, %s, asfloat(%s))", uv, vgpr(t, compare_reg));
+                value = fmt(t, "tex_.GatherCmpRed(smp_, %s, %s)", uv, compare_f);
             else
                 value = fmt(t, "tex_.%s(smp_, %s)", k_gather[c], uv);
             if (form.lod || form.bias || form.grad || form.clamp) {
@@ -738,30 +1063,23 @@ static bool emit_image(Translator& t, const RdnaInst& in) {
                 return false;
             }
         } else if (form.compare) {
-            const char* ref = fmt(t, "asfloat(%s)", vgpr(t, compare_reg));
             if (form.lod_zero)
-                value = fmt(t, "tex_.SampleCmpLevelZero(smp_, %s, %s).xxxx", uv, ref);
+                value = fmt(t, "tex_.SampleCmpLevelZero(smp_, %s, %s).xxxx", uv, compare_f);
             else if (form.lod)
-                value =
-                    fmt(t, "tex_.SampleCmpLevel(smp_, %s, %s, asfloat(%s)).xxxx", uv, ref, vgpr(t, lod_reg));
+                value = fmt(t, "tex_.SampleCmpLevel(smp_, %s, %s, %s).xxxx", uv, compare_f, lod_f);
             else if (!form.bias && !form.grad && !form.clamp)
-                value = fmt(t, "tex_.SampleCmp(smp_, %s, %s).xxxx", uv, ref);
+                value = fmt(t, "tex_.SampleCmp(smp_, %s, %s).xxxx", uv, compare_f);
         } else if (form.lod_zero) {
             value = fmt(t, "tex_.SampleLevel(smp_, %s, 0.0f)", uv);
         } else if (form.lod) {
-            value = fmt(t, "tex_.SampleLevel(smp_, %s, asfloat(%s))", uv, vgpr(t, lod_reg));
+            value = fmt(t, "tex_.SampleLevel(smp_, %s, %s)", uv, lod_f);
         } else if (form.bias && !form.clamp) {
-            value = fmt(t, "tex_.SampleBias(smp_, %s, asfloat(%s))", uv, vgpr(t, bias_reg));
+            value = fmt(t, "tex_.SampleBias(smp_, %s, %s)", uv, bias_f);
         } else if (form.grad && !form.clamp) {
-            u32 dx[3], dy[3];
-            for (u32 i = 0; i < grads; i++) {
-                dx[i] = grad_regs[i];
-                dy[i] = grad_regs[grads + i];
-            }
-            value = fmt(t, "tex_.SampleGrad(smp_, %s, %s, %s)", uv, float_vector(t, dx, grads),
-                        float_vector(t, dy, grads));
+            value = fmt(t, "tex_.SampleGrad(smp_, %s, %s, %s)", uv, join_exprs(t, "float", grad_f, grads),
+                        join_exprs(t, "float", grad_f + grads, grads));
         } else if (!form.bias && !form.grad) {
-            value = form.clamp ? fmt(t, "tex_.Sample(smp_, %s, 0, asfloat(%s))", uv, vgpr(t, clamp_reg))
+            value = form.clamp ? fmt(t, "tex_.Sample(smp_, %s, 0, %s)", uv, clamp_f)
                                : fmt(t, "tex_.Sample(smp_, %s)", uv);
         }
         if (!value) {
@@ -769,20 +1087,32 @@ static bool emit_image(Translator& t, const RdnaInst& in) {
             return false;
         }
     } else if (form.load) {
-        const char* xy = uint_vector(t, coord_regs, coords);
-        if (in.op == OP_IMAGE_MSAA_LOAD)
-            value = fmt(t, "tex_.Load(%s, %s)", xy, vgpr(t, lod_reg));
-        else if (uav)
+        const char* xy = join_exprs(t, "uint", coord_u, coords);
+        if (in.op == OP_IMAGE_MSAA_LOAD) {
+            value = fmt(t, "tex_.Load(%s, %s)", xy, lod_u);
+        } else if (uav) {
             value = fmt(t, "tex_[%s]", xy);
-        else
-            value = fmt(t, "tex_.Load(uint%u(%s, %s))", coords + 1, xy, form.mip ? vgpr(t, lod_reg) : "0u");
+        } else {
+            const char* args[4];
+            for (u32 i = 0; i < coords; i++)
+                args[i] = coord_u[i];
+            args[coords] = form.mip ? lod_u : "0u";
+            value = fmt(t, "tex_.Load(%s)", join_exprs(t, "uint", args, coords + 1));
+        }
     } else if (form.store) {
-        const char* xy = uint_vector(t, coord_regs, coords);
+        const char* xy = join_exprs(t, "uint", coord_u, coords);
         const char* c[4] = {"0.0f", "0.0f", "0.0f", "0.0f"};
         u32 source = 0;
         for (u32 i = 0; i < 4; i++)
-            if (m.dmask & (1u << i))
-                c[i] = fmt(t, "asfloat(%s)", vgpr(t, in.dst[0].reg + source++));
+            if (m.dmask & (1u << i)) {
+                if (m.d16) {
+                    const char* r = vgpr(t, in.dst[0].reg + source / 2);
+                    c[i] = (source & 1) ? fmt(t, "f16tof32(%s >> 16)", r) : fmt(t, "f16tof32(%s)", r);
+                } else {
+                    c[i] = fmt(t, "asfloat(%s)", vgpr(t, in.dst[0].reg + source));
+                }
+                source++;
+            }
         emit(t, "if (EXEC) tex_[%s] = float4(%s, %s, %s, %s);", xy, c[0], c[1], c[2], c[3]);
         t.depth--;
         emit(t, "}");
@@ -820,7 +1150,7 @@ static bool emit_image(Translator& t, const RdnaInst& in) {
     } else if (in.op == OP_IMAGE_GET_LOD) {
         u32 samp = in.src[2].reg;
         emit(t, "SamplerState smp_ = SamplerDescriptorHeap[%s >> 4];", sgpr(t, samp));
-        const char* uv = float_vector(t, coord_regs, coords);
+        const char* uv = join_exprs(t, "float", coord_f, coords);
         value = fmt(
             t,
             "float4(tex_.CalculateLevelOfDetail(smp_, %s), tex_.CalculateLevelOfDetailUnclamped(smp_, %s), "
@@ -833,9 +1163,22 @@ static bool emit_image(Translator& t, const RdnaInst& in) {
     emit(t, "float4 r_ = %s;", value);
     u32 dst = in.dst[0].reg;
     u32 mask = form.gather ? 0xF : m.dmask;
-    for (u32 i = 0; i < 4; i++)
-        if (mask & (1u << i))
-            write_vgpr(t, in, dst++, fmt(t, "asuint(r_.%c)", "xyzw"[i]));
+    if (m.d16) {
+        const char* slots[4] = {};
+        u32 n = 0;
+        for (u32 i = 0; i < 4; i++)
+            if (mask & (1u << i))
+                slots[n++] = fmt(t, "f32tof16(r_.%c)", "xyzw"[i]);
+        for (u32 i = 0; i < n; i += 2) {
+            const char* packed =
+                (i + 1 < n) ? fmt(t, "(%s | (%s << 16))", slots[i], slots[i + 1]) : slots[i];
+            write_vgpr(t, in, dst++, packed);
+        }
+    } else {
+        for (u32 i = 0; i < 4; i++)
+            if (mask & (1u << i))
+                write_vgpr(t, in, dst++, fmt(t, "asuint(r_.%c)", "xyzw"[i]));
+    }
     t.depth--;
     emit(t, "}");
     return true;
@@ -861,6 +1204,12 @@ static bool emit_lds(Translator& t, const RdnaInst& in) {
         emit(t, "if (EXEC) { g_lds[(%s + %uu) >> 2] = %s; g_lds[(%s + %uu) >> 2] = %s; }", addr, offset, d0,
              addr, offset + 4, vgpr(t, in.src[1].reg + 1));
         return true;
+    case OP_DS_WRITE_B96:
+        emit(t,
+             "if (EXEC) { uint a_ = (%s + %uu) >> 2; g_lds[a_] = %s; g_lds[a_ + 1u] = %s; g_lds[a_ + 2u] = "
+             "%s; }",
+             addr, offset, d0, vgpr(t, in.src[1].reg + 1), vgpr(t, in.src[1].reg + 2));
+        return true;
     case OP_DS_WRITE_B128:
         emit(t,
              "if (EXEC) { uint a_ = (%s + %uu) >> 2; g_lds[a_] = %s; g_lds[a_ + 1u] = %s; g_lds[a_ + 2u] = "
@@ -876,12 +1225,36 @@ static bool emit_lds(Translator& t, const RdnaInst& in) {
              d0, addr, off1 * unit, vgpr(t, in.src[2].reg));
         return true;
     }
+    case OP_DS_WRITE2_B64:
+    case OP_DS_WRITE2ST64_B64: {
+        u32 unit = in.op == OP_DS_WRITE2ST64_B64 ? 512 : 8;
+        emit(t,
+             "if (EXEC) { uint a0_ = (%s + %uu) >> 2, a1_ = (%s + %uu) >> 2; g_lds[a0_] = %s; g_lds[a0_ + "
+             "1u] = %s; g_lds[a1_] = %s; g_lds[a1_ + 1u] = %s; }",
+             addr, off0 * unit, addr, off1 * unit, d0, vgpr(t, in.src[1].reg + 1), vgpr(t, in.src[2].reg),
+             vgpr(t, in.src[2].reg + 1));
+        return true;
+    }
+    case OP_DS_WRITE_B8:
+    case OP_DS_WRITE_B16:
+    case OP_DS_WRITE_B8_D16_HI:
+    case OP_DS_WRITE_B16_D16_HI: {
+        bool is_16 = in.op == OP_DS_WRITE_B16 || in.op == OP_DS_WRITE_B16_D16_HI;
+        bool hi = in.op == OP_DS_WRITE_B8_D16_HI || in.op == OP_DS_WRITE_B16_D16_HI;
+        u32 mask = is_16 ? 0xffffu : 0xffu;
+        emit(t,
+             "if (EXEC) { uint ba_ = %s + %uu; uint sh_ = (ba_ & %uu) * 8u; uint v_ = (%s%s) & 0x%xu; "
+             "InterlockedAnd(g_lds[ba_ >> 2], ~(0x%xu << sh_)); InterlockedOr(g_lds[ba_ >> 2], v_ << sh_); }",
+             addr, offset, is_16 ? 2u : 3u, d0, hi ? " >> 16" : "", mask, mask);
+        return true;
+    }
     case OP_DS_READ_B32:
         write_vgpr(t, in, in.dst[0].reg, fmt(t, "g_lds[(%s + %uu) >> 2]", addr, offset));
         return true;
     case OP_DS_READ_B64:
+    case OP_DS_READ_B96:
     case OP_DS_READ_B128: {
-        u32 n = in.op == OP_DS_READ_B64 ? 2 : 4;
+        u32 n = in.op == OP_DS_READ_B64 ? 2 : in.op == OP_DS_READ_B96 ? 3 : 4;
         emit(t, "{ uint a_ = (%s + %uu) >> 2;", addr, offset);
         t.depth++;
         // Read every dword before writing any: the destination may overlap the address.
@@ -901,6 +1274,73 @@ static bool emit_lds(Translator& t, const RdnaInst& in) {
         t.depth++;
         write_vgpr(t, in, in.dst[0].reg, "r0_");
         write_vgpr(t, in, in.dst[0].reg + 1, "r1_");
+        t.depth--;
+        emit(t, "}");
+        return true;
+    }
+    case OP_DS_READ2_B64:
+    case OP_DS_READ2ST64_B64: {
+        u32 unit = in.op == OP_DS_READ2ST64_B64 ? 512 : 8;
+        emit(t,
+             "{ uint a0_ = (%s + %uu) >> 2, a1_ = (%s + %uu) >> 2; uint r0_ = g_lds[a0_], r1_ = g_lds[a0_ "
+             "+ 1u], r2_ = g_lds[a1_], r3_ = g_lds[a1_ + 1u];",
+             addr, off0 * unit, addr, off1 * unit);
+        t.depth++;
+        write_vgpr(t, in, in.dst[0].reg, "r0_");
+        write_vgpr(t, in, in.dst[0].reg + 1, "r1_");
+        write_vgpr(t, in, in.dst[0].reg + 2, "r2_");
+        write_vgpr(t, in, in.dst[0].reg + 3, "r3_");
+        t.depth--;
+        emit(t, "}");
+        return true;
+    }
+    case OP_DS_READ_I8:
+    case OP_DS_READ_U8:
+    case OP_DS_READ_I16:
+    case OP_DS_READ_U16:
+    case OP_DS_READ_U8_D16:
+    case OP_DS_READ_U8_D16_HI:
+    case OP_DS_READ_I8_D16:
+    case OP_DS_READ_I8_D16_HI:
+    case OP_DS_READ_U16_D16:
+    case OP_DS_READ_U16_D16_HI: {
+        bool is_16 = in.op == OP_DS_READ_I16 || in.op == OP_DS_READ_U16 ||
+                     in.op == OP_DS_READ_U16_D16 || in.op == OP_DS_READ_U16_D16_HI;
+        bool is_signed = in.op == OP_DS_READ_I8 || in.op == OP_DS_READ_I16 ||
+                         in.op == OP_DS_READ_I8_D16 || in.op == OP_DS_READ_I8_D16_HI;
+        bool d16_lo = in.op == OP_DS_READ_U8_D16 || in.op == OP_DS_READ_I8_D16 ||
+                      in.op == OP_DS_READ_U16_D16;
+        bool d16_hi = in.op == OP_DS_READ_U8_D16_HI || in.op == OP_DS_READ_I8_D16_HI ||
+                      in.op == OP_DS_READ_U16_D16_HI;
+        u32 bits = is_16 ? 16u : 8u;
+        emit(t, "{ uint ba_ = %s + %uu; uint w_ = g_lds[ba_ >> 2]; uint sh_ = (ba_ & %uu) * 8u;", addr,
+             offset, is_16 ? 2u : 3u);
+        t.depth++;
+        const char* val = is_signed ? fmt(t, "(uint)((int)(w_ << (32u - %uu - sh_)) >> %uu)", bits, 32u - bits)
+                                    : fmt(t, "((w_ >> sh_) & 0x%xu)", (1u << bits) - 1u);
+        if (d16_lo) {
+            const char* dst = vgpr(t, in.dst[0].reg);
+            write_vgpr(t, in, in.dst[0].reg, fmt(t, "((%s & 0xffff0000u) | (%s & 0xffffu))", dst, val));
+        } else if (d16_hi) {
+            const char* dst = vgpr(t, in.dst[0].reg);
+            write_vgpr(t, in, in.dst[0].reg, fmt(t, "((%s & 0xffffu) | ((%s & 0xffffu) << 16))", dst, val));
+        } else {
+            write_vgpr(t, in, in.dst[0].reg, val);
+        }
+        t.depth--;
+        emit(t, "}");
+        return true;
+    }
+    case OP_DS_APPEND:
+    case OP_DS_CONSUME: {
+        use_sgpr(t, SRC_M0);
+        const char* delta = in.op == OP_DS_APPEND ? "wave_count(s126)" : "(uint)(-(int)wave_count(s126))";
+        emit(t,
+             "{ uint o_ = 0u; if (EXEC) { uint lane_ = wave_first(s126); if (WaveGetLaneIndex() == lane_) "
+             "InterlockedAdd(g_lds[((s124 & 0xffffu) + %uu) >> 2], %s, o_); o_ = WaveReadLaneAt(o_, lane_); }",
+             offset, delta);
+        t.depth++;
+        write_vgpr(t, in, in.dst[0].reg, "o_");
         t.depth--;
         emit(t, "}");
         return true;
