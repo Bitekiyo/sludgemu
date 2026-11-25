@@ -148,6 +148,9 @@ static ID3D12Heap* block_heap(const MemBlock& block, u64* offset) {
     return heap;
 }
 
+// A capture tool (RenderDoc) is loaded: windows are mapped for it (see open_window).
+static bool g_capture_tool;
+
 static ID3D12Resource* open_window(const MemBlock& block) {
     ID3D12Device13* device = gpu_device();
     u64 heap_offset;
@@ -171,6 +174,14 @@ static ID3D12Resource* open_window(const MemBlock& block) {
         LOG_E("gpu", "cannot place a window buffer over title memory %p+0x%llx (0x%08lx)", block.base,
               block.size, (unsigned long)hr);
         return nullptr;
+    }
+    // RenderDoc sees CPU writes to buffer memory only through mappings it knows of; mapping windows
+    // keeps captures faithful to what the title wrote during the frame (constant buffers above all).
+    if (g_capture_tool) {
+        void* mapped = nullptr;
+        D3D12_RANGE none = {0, 0};
+        if (FAILED(buffer->Map(0, &none, &mapped)))
+            LOG_W_ONCE("gpu", "cannot map window buffers for the capture tool; captures miss CPU writes");
     }
     LOG_D("gpu", "window over title memory %p+0x%llx", block.base, block.size);
     return buffer;
@@ -234,5 +245,6 @@ static void on_mapping_changed(const u8* base, u64 size) {
 }
 
 void gpu_window_init() {
+    g_capture_tool = GetModuleHandleW(L"renderdoc.dll") != nullptr;
     mem_set_mapping_listener(on_mapping_changed);
 }
