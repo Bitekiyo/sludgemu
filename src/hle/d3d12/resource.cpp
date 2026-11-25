@@ -1,6 +1,7 @@
 // Console ID3D12Resource / ID3D12Resource1 / ID3D12Resource2.
 
 #include "common/log.h"
+#include "hle/d3d12/barriers.h"
 #include "hle/d3d12/d3d12_objects.h"
 #include "hle/d3d12/d3d12_tables.h"
 #include "gpu/console_layout.h"
@@ -40,6 +41,15 @@ static D3D12_TEXTURE_LAYOUT desktop_texture_layout(D3D12_TEXTURE_LAYOUT layout) 
     return layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR ? layout : D3D12_TEXTURE_LAYOUT_UNKNOWN;
 }
 
+// Console depth textures can also be written as UAVs; desktop allows one or the other. Depth
+// rendering is what they're for, so their UAV views stay null and their UAV layouts become common
+// ones (console_texture_layout).
+bool console_texture_loses_uav(const D3D12_RESOURCE_DESC1& desc) {
+    const u32 depth_uav =
+        D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    return desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER && (desc.Flags & depth_uav) == depth_uav;
+}
+
 // The desktop description of a console texture.
 static D3D12_RESOURCE_DESC1 desktop_texture_desc(const D3D12_RESOURCE_DESC1& console) {
     D3D12_RESOURCE_DESC1 desc = console;
@@ -47,6 +57,11 @@ static D3D12_RESOURCE_DESC1 desktop_texture_desc(const D3D12_RESOURCE_DESC1& con
     desc.Format = format_desktop_resource(console.Format);
     desc.Layout = desktop_texture_layout(desc.Layout);
     desc.Flags = (D3D12_RESOURCE_FLAGS)(desc.Flags & k_desktop_resource_flags);
+    if (console_texture_loses_uav(console)) {
+        LOG_W_ONCE("d3d12",
+                   "depth textures with UAV access have no desktop equivalent; their UAV views are null");
+        desc.Flags = (D3D12_RESOURCE_FLAGS)(desc.Flags & ~D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    }
     return desc;
 }
 
@@ -67,17 +82,19 @@ static ID3D12Resource* create_texture(ConsoleResource* r) {
     ID3D12Resource* texture = nullptr;
     // The layout the title's first barrier will name. A texture created undefined has no contents
     // to keep, so any layout serves.
-    D3D12_BARRIER_LAYOUT layout =
-        r->initial_layout == D3D12_BARRIER_LAYOUT_UNDEFINED ? D3D12_BARRIER_LAYOUT_COMMON : r->initial_layout;
+    D3D12_BARRIER_LAYOUT layout = console_texture_layout(
+        r, r->initial_layout == D3D12_BARRIER_LAYOUT_UNDEFINED ? D3D12_BARRIER_LAYOUT_COMMON
+                                                               : r->initial_layout);
     HRESULT hr = gpu_device()->CreateCommittedResource3(&heap, D3D12_HEAP_FLAG_NONE, &desc, layout, clear,
                                                         nullptr, 0, nullptr, IID_PPV_ARGS(&texture));
     if (hr == E_INVALIDARG && clear) {
         // The clear value only tells the driver which clears are fast; desktop is stricter about
         // its format (never typeless), so do without one it refuses.
-        LOG_W_ONCE("d3d12", "texture clear value format %d refused; creating textures without it",
-                   r->clear_value.Format);
         hr = gpu_device()->CreateCommittedResource3(&heap, D3D12_HEAP_FLAG_NONE, &desc, layout, nullptr,
                                                     nullptr, 0, nullptr, IID_PPV_ARGS(&texture));
+        if (SUCCEEDED(hr))
+            LOG_W_ONCE("d3d12", "texture clear value format %d refused; creating textures without it",
+                       r->clear_value.Format);
     }
     if (FAILED(hr)) {
         LOG_E("d3d12",

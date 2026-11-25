@@ -261,6 +261,9 @@ HRESULT console_create_committed_resource(ConsoleDevice* device, const D3D12_HEA
 // resource's first byte in it. nullptr if it can't be created.
 ID3D12Resource* console_resource_desktop(ConsoleResource* resource, u64* offset);
 
+// The texture can't keep UAV access on desktop (depth textures that are also UAVs on the console).
+bool console_texture_loses_uav(const D3D12_RESOURCE_DESC1& desc);
+
 // Translates title GPU addresses [address, address + size) to the desktop GPU address of the same
 // memory (see gpu_translate).
 bool console_translate_gpu_address(u64 address, u64 size, u64* desktop_address);

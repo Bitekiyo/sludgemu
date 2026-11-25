@@ -45,6 +45,28 @@ D3D12_BARRIER_LAYOUT console_desktop_layout(u32 layout) {
     return (D3D12_BARRIER_LAYOUT)layout;
 }
 
+D3D12_BARRIER_LAYOUT console_texture_layout(const ConsoleResource* r, D3D12_BARRIER_LAYOUT layout) {
+    if (!console_texture_loses_uav(r->desc))
+        return layout;
+    switch (layout) {
+    case D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS:
+        return D3D12_BARRIER_LAYOUT_COMMON;
+    case D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_UNORDERED_ACCESS:
+        return D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_COMMON;
+    case D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_UNORDERED_ACCESS:
+        return D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_COMMON;
+    default:
+        return layout;
+    }
+}
+
+// The accesses a texture's desktop counterpart can have.
+static D3D12_BARRIER_ACCESS texture_access(const ConsoleResource* r, u32 access) {
+    if (console_texture_loses_uav(r->desc))
+        access &= ~(u32)D3D12_BARRIER_ACCESS_UNORDERED_ACCESS;
+    return (D3D12_BARRIER_ACCESS)access;
+}
+
 D3D12_BARRIER_LAYOUT console_layout_from_state(u32 state) {
     const u32 shader_read =
         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
@@ -179,10 +201,10 @@ static void add_transition(ID3D12GraphicsCommandList7* list, BarrierBatch* b,
     D3D12_TEXTURE_BARRIER& o = b->textures[b->texture_count++];
     o.SyncBefore = D3D12_BARRIER_SYNC_ALL;
     o.SyncAfter = D3D12_BARRIER_SYNC_ALL;
-    o.LayoutBefore = console_layout_from_state(t.StateBefore);
-    o.LayoutAfter = console_layout_from_state(t.StateAfter);
-    o.AccessBefore = narrowed_access(t.StateBefore, k_texture_access);
-    o.AccessAfter = narrowed_access(t.StateAfter, k_texture_access);
+    o.LayoutBefore = console_texture_layout(r, console_layout_from_state(t.StateBefore));
+    o.LayoutAfter = console_texture_layout(r, console_layout_from_state(t.StateAfter));
+    o.AccessBefore = texture_access(r, narrowed_access(t.StateBefore, k_texture_access));
+    o.AccessAfter = texture_access(r, narrowed_access(t.StateAfter, k_texture_access));
     o.pResource = desktop;
     // A subresource index, or all of them (0xffffffff), as legacy barriers name them.
     o.Subresources = {t.Subresource, 0, 0, 0, 0, 0};
@@ -252,15 +274,17 @@ static void record_texture_group(ID3D12GraphicsCommandList7* list, const D3D12_B
     u32 n = 0;
     for (u32 i = 0; i < g.NumBarriers; i++) {
         D3D12_TEXTURE_BARRIER b = g.pTextureBarriers[i];
+        const ConsoleResource* r = (const ConsoleResource*)b.pResource;
         u64 offset;
-        b.pResource =
-            b.pResource ? console_resource_desktop((ConsoleResource*)b.pResource, &offset) : nullptr;
+        b.pResource = r ? console_resource_desktop((ConsoleResource*)r, &offset) : nullptr;
         if (!b.pResource) {
             LOG_W_ONCE("d3d12", "Barrier: texture without desktop backing skipped");
             continue;
         }
-        b.LayoutBefore = console_desktop_layout(b.LayoutBefore);
-        b.LayoutAfter = console_desktop_layout(b.LayoutAfter);
+        b.LayoutBefore = console_texture_layout(r, console_desktop_layout(b.LayoutBefore));
+        b.LayoutAfter = console_texture_layout(r, console_desktop_layout(b.LayoutAfter));
+        b.AccessBefore = texture_access(r, b.AccessBefore);
+        b.AccessAfter = texture_access(r, b.AccessAfter);
         out[n++] = b;
         if (n == BARRIER_BATCH) {
             D3D12_BARRIER_GROUP group = {D3D12_BARRIER_TYPE_TEXTURE, n};

@@ -144,6 +144,50 @@ static bool texture_view_format(const ConsoleResource* r, DXGI_FORMAT view, bool
     return *out != DXGI_FORMAT_UNKNOWN;
 }
 
+// Planes of a desktop format (depth and stencil, or video luma and chroma), asked once per format.
+static u32 desktop_plane_count(ID3D12Device* device, DXGI_FORMAT format) {
+    static volatile u8 s_planes[256]; // 0: not asked yet
+    u32 f = (u32)format;
+    if (f >= ARRAY_COUNT(s_planes))
+        return 1;
+    if (!s_planes[f]) {
+        D3D12_FEATURE_DATA_FORMAT_INFO info = {format, 0};
+        bool ok = SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_INFO, &info, sizeof(info)));
+        s_planes[f] = (u8)(ok && info.PlaneCount ? info.PlaneCount : 1);
+    }
+    return s_planes[f];
+}
+
+// Desktop treats a view of a plane its texture doesn't have as fatal (it removes the device).
+static bool texture_plane_ok(ID3D12Device* device, const ConsoleResource* r, ID3D12Resource* desktop,
+                             u32 plane, DXGI_FORMAT view) {
+    if (plane < desktop_plane_count(device, desktop->GetDesc().Format))
+        return true;
+    LOG_W_ONCE("d3d12",
+               "view of plane %u of a texture of format %d (as format %d), which has no such plane; "
+               "writing null views",
+               plane, r->desc.Format, view);
+    return false;
+}
+
+static u32 srv_plane(const D3D12_SHADER_RESOURCE_VIEW_DESC& d) {
+    if (d.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D)
+        return d.Texture2D.PlaneSlice;
+    return d.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY ? d.Texture2DArray.PlaneSlice : 0;
+}
+
+static u32 uav_plane(const D3D12_UNORDERED_ACCESS_VIEW_DESC& d) {
+    if (d.ViewDimension == D3D12_UAV_DIMENSION_TEXTURE2D)
+        return d.Texture2D.PlaneSlice;
+    return d.ViewDimension == D3D12_UAV_DIMENSION_TEXTURE2DARRAY ? d.Texture2DArray.PlaneSlice : 0;
+}
+
+static u32 rtv_plane(const D3D12_RENDER_TARGET_VIEW_DESC& d) {
+    if (d.ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2D)
+        return d.Texture2D.PlaneSlice;
+    return d.ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DARRAY ? d.Texture2DArray.PlaneSlice : 0;
+}
+
 // The texture's desktop counterpart; nullptr (the view becomes null) for a null resource or one with
 // no desktop texture.
 static ID3D12Resource* texture_view_target(const ConsoleResource* r) {
@@ -151,9 +195,80 @@ static ID3D12Resource* texture_view_target(const ConsoleResource* r) {
     return r ? console_resource_desktop((ConsoleResource*)r, &offset) : nullptr;
 }
 
-// Null views still need a format of their kind; reads through them return zero whatever it is.
+// Null views keep the title's view dimension, with a format of their kind and nothing else: their
+// description must still be valid, and reads through them return zero whatever it says.
 #define NULL_VIEW_FORMAT       DXGI_FORMAT_R8G8B8A8_UNORM
 #define NULL_DEPTH_VIEW_FORMAT DXGI_FORMAT_D32_FLOAT
+
+static D3D12_SHADER_RESOURCE_VIEW_DESC null_srv(D3D12_SRV_DIMENSION dimension) {
+    D3D12_SHADER_RESOURCE_VIEW_DESC d = {};
+    d.Format = NULL_VIEW_FORMAT;
+    d.ViewDimension = dimension;
+    d.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    switch (dimension) {
+    case D3D12_SRV_DIMENSION_TEXTURE1DARRAY:
+        d.Texture1DArray.ArraySize = 1;
+        break;
+    case D3D12_SRV_DIMENSION_TEXTURE2DARRAY:
+        d.Texture2DArray.ArraySize = 1;
+        break;
+    case D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY:
+        d.Texture2DMSArray.ArraySize = 1;
+        break;
+    case D3D12_SRV_DIMENSION_TEXTURECUBEARRAY:
+        d.TextureCubeArray.NumCubes = 1;
+        break;
+    default:
+        break;
+    }
+    // Every texture dimension with mips has the count second, after the most detailed mip.
+    if (dimension != D3D12_SRV_DIMENSION_TEXTURE2DMS && dimension != D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY &&
+        dimension != D3D12_SRV_DIMENSION_BUFFER &&
+        dimension != D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE)
+        d.Texture2D.MipLevels = 1;
+    return d;
+}
+
+static D3D12_UNORDERED_ACCESS_VIEW_DESC null_uav(D3D12_UAV_DIMENSION dimension) {
+    D3D12_UNORDERED_ACCESS_VIEW_DESC d = {};
+    d.Format = NULL_VIEW_FORMAT;
+    d.ViewDimension = dimension;
+    if (dimension == D3D12_UAV_DIMENSION_TEXTURE1DARRAY)
+        d.Texture1DArray.ArraySize = 1;
+    else if (dimension == D3D12_UAV_DIMENSION_TEXTURE2DARRAY)
+        d.Texture2DArray.ArraySize = 1;
+    else if (dimension == D3D12_UAV_DIMENSION_TEXTURE3D)
+        d.Texture3D.WSize = 1;
+    return d;
+}
+
+static D3D12_RENDER_TARGET_VIEW_DESC null_rtv(D3D12_RTV_DIMENSION dimension) {
+    D3D12_RENDER_TARGET_VIEW_DESC d = {};
+    d.Format = NULL_VIEW_FORMAT;
+    d.ViewDimension = dimension;
+    if (dimension == D3D12_RTV_DIMENSION_TEXTURE1DARRAY)
+        d.Texture1DArray.ArraySize = 1;
+    else if (dimension == D3D12_RTV_DIMENSION_TEXTURE2DARRAY)
+        d.Texture2DArray.ArraySize = 1;
+    else if (dimension == D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY)
+        d.Texture2DMSArray.ArraySize = 1;
+    else if (dimension == D3D12_RTV_DIMENSION_TEXTURE3D)
+        d.Texture3D.WSize = 1;
+    return d;
+}
+
+static D3D12_DEPTH_STENCIL_VIEW_DESC null_dsv(D3D12_DSV_DIMENSION dimension) {
+    D3D12_DEPTH_STENCIL_VIEW_DESC d = {};
+    d.Format = NULL_DEPTH_VIEW_FORMAT;
+    d.ViewDimension = dimension;
+    if (dimension == D3D12_DSV_DIMENSION_TEXTURE1DARRAY)
+        d.Texture1DArray.ArraySize = 1;
+    else if (dimension == D3D12_DSV_DIMENSION_TEXTURE2DARRAY)
+        d.Texture2DArray.ArraySize = 1;
+    else if (dimension == D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY)
+        d.Texture2DMSArray.ArraySize = 1;
+    return d;
+}
 
 static bool is_array(const D3D12_RESOURCE_DESC1& r) {
     return r.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D && r.DepthOrArraySize > 1;
@@ -316,9 +431,11 @@ void WINAPI device_create_shader_resource_view(ConsoleDevice* self, void* resour
             return; // the console API requires one or the other
         d = desc ? *desc : whole_texture_srv(r->desc);
         desktop = texture_view_target(r);
+        if (desktop && !texture_plane_ok(self->desktop, r, desktop, srv_plane(d), d.Format))
+            desktop = nullptr;
         if (!desktop || !texture_view_format(r, d.Format, true, &d.Format)) {
             desktop = nullptr;
-            d.Format = NULL_VIEW_FORMAT;
+            d = null_srv(d.ViewDimension);
         }
     }
     self->desktop->CreateShaderResourceView(desktop, &d, slot.cpu);
@@ -356,9 +473,13 @@ void WINAPI device_create_unordered_access_view(ConsoleDevice* self, void* resou
             return;
         d = desc ? desktop_uav_desc(desc) : whole_texture_uav(r->desc);
         desktop = texture_view_target(r);
+        // Some console textures lose UAV access on desktop (depth ones).
+        if (desktop && (!(desktop->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) ||
+                        !texture_plane_ok(self->desktop, r, desktop, uav_plane(d), d.Format)))
+            desktop = nullptr;
         if (!desktop || !texture_view_format(r, d.Format, false, &d.Format)) {
             desktop = nullptr;
-            d.Format = NULL_VIEW_FORMAT;
+            d = null_uav(d.ViewDimension);
         }
     }
     self->desktop->CreateUnorderedAccessView(desktop, desktop_counter, &d, slot.cpu);
@@ -376,9 +497,11 @@ void WINAPI device_create_render_target_view(ConsoleDevice* self, void* resource
         return;
     D3D12_RENDER_TARGET_VIEW_DESC d = desc ? *desc : whole_texture_rtv(r->desc);
     ID3D12Resource* desktop = texture_view_target(r);
+    if (desktop && !texture_plane_ok(self->desktop, r, desktop, rtv_plane(d), d.Format))
+        desktop = nullptr;
     if (!desktop || !texture_view_format(r, d.Format, false, &d.Format)) {
         desktop = nullptr;
-        d.Format = NULL_VIEW_FORMAT;
+        d = null_rtv(d.ViewDimension);
     }
     self->desktop->CreateRenderTargetView(desktop, &d, slot.cpu);
     finish_write(slot);
@@ -397,7 +520,7 @@ void WINAPI device_create_depth_stencil_view(ConsoleDevice* self, void* resource
     ID3D12Resource* desktop = texture_view_target(r);
     if (!desktop || !texture_view_format(r, d.Format, false, &d.Format)) {
         desktop = nullptr;
-        d.Format = NULL_DEPTH_VIEW_FORMAT;
+        d = null_dsv(d.ViewDimension);
     }
     self->desktop->CreateDepthStencilView(desktop, &d, slot.cpu);
     finish_write(slot);

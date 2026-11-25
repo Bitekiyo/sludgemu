@@ -15,6 +15,11 @@ D3D12_BARRIER_LAYOUT console_layout_from_state(u32 state);
 // own before the last one; desktop's present layout is its common layout.
 D3D12_BARRIER_LAYOUT console_desktop_layout(u32 layout);
 
+// The layout a console texture is in on desktop when the title names `layout` (a desktop value).
+// Textures that lose UAV access on desktop (console_texture_loses_uav) take the common layouts in
+// place of the UAV ones.
+D3D12_BARRIER_LAYOUT console_texture_layout(const ConsoleResource* r, D3D12_BARRIER_LAYOUT layout);
+
 // ResourceBarrier: legacy transition, aliasing and UAV barriers.
 void console_record_resource_barriers(ID3D12GraphicsCommandList7* list, u32 count,
                                       const D3D12_RESOURCE_BARRIER* barriers);
