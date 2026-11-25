@@ -142,6 +142,19 @@ static SystemAnalyticsInfo* WINAPI XSystemGetAnalyticsInfo(RuntimeSelf, SystemAn
     return ret;
 }
 
+// Retail consoles are in the retail Xbox services sandbox, which titles check before going online.
+static HRESULT WINAPI XSystemGetXboxLiveSandboxId(RuntimeSelf, usize size, char* sandbox, usize* used) {
+    static const char k_retail[] = "RETAIL";
+    if (!sandbox)
+        return E_INVALIDARG;
+    if (size < sizeof(k_retail))
+        return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+    memcpy(sandbox, k_retail, sizeof(k_retail));
+    if (used)
+        *used = sizeof(k_retail);
+    return S_OK;
+}
+
 // --- feature availability ------------------------------------------------------------------------
 
 // Runtime feature areas, numbered as titles pass them.
@@ -163,9 +176,12 @@ static const GUID k_XSystem_iids[] = {
     {0x1861cf2e, 0xe18b, 0x4834, {0xa9, 0xf5, 0xb4, 0xa4, 0xe6, 0xef, 0xb4, 0xcf}},
 };
 static const RuntimeMethod k_XSystem_methods[] = {
-    {3, "XSystemGetConsoleId", nullptr},           {4, "XSystemGetXboxLiveSandboxId", nullptr},
-    {5, "XSystemGetAppSpecificDeviceId", nullptr}, {6, "XSystemHandleTrack", nullptr},
-    {7, "XSystemIsHandleValid", nullptr},          {8, "XSystemAllowFullDownloadBandwidth", nullptr},
+    {3, "XSystemGetConsoleId", nullptr},
+    {4, "XSystemGetXboxLiveSandboxId", (void*)&XSystemGetXboxLiveSandboxId},
+    {5, "XSystemGetAppSpecificDeviceId", nullptr},
+    {6, "XSystemHandleTrack", nullptr},
+    {7, "XSystemIsHandleValid", nullptr},
+    {8, "XSystemAllowFullDownloadBandwidth", nullptr},
 };
 extern const RuntimeApi g_runtime_api_XSystem =
     RUNTIME_API("XSystem", &k_XSystem_provider, k_XSystem_iids, k_XSystem_methods);
