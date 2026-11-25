@@ -249,6 +249,34 @@ static void buffer_barrier(ID3D12GraphicsCommandList7* list, ID3D12Resource* buf
     list->Barrier(1, &g);
 }
 
+// Console titles hand over planes in the present layout (desktop's common layout) with no access
+// after their last write. The composite reads them as shader resources in between and gives them
+// back as they came, which is what the title's next barrier on them names as its starting point.
+static void plane_barriers(ID3D12GraphicsCommandList7* list, const PresentPlane* planes, u32 count,
+                           bool to_read) {
+    D3D12_TEXTURE_BARRIER b[PRESENT_MAX_PLANES] = {};
+    u32 n = 0;
+    for (u32 i = 0; i < count && i < PRESENT_MAX_PLANES; i++) {
+        ID3D12Resource* t = planes[i].texture;
+        if (!t || (n == 1 && b[0].pResource == t)) // both planes may show one texture
+            continue;
+        D3D12_TEXTURE_BARRIER& o = b[n++];
+        o.SyncBefore = to_read ? D3D12_BARRIER_SYNC_NONE : D3D12_BARRIER_SYNC_PIXEL_SHADING;
+        o.SyncAfter = to_read ? D3D12_BARRIER_SYNC_PIXEL_SHADING : D3D12_BARRIER_SYNC_NONE;
+        o.AccessBefore = to_read ? D3D12_BARRIER_ACCESS_NO_ACCESS : D3D12_BARRIER_ACCESS_SHADER_RESOURCE;
+        o.AccessAfter = to_read ? D3D12_BARRIER_ACCESS_SHADER_RESOURCE : D3D12_BARRIER_ACCESS_NO_ACCESS;
+        o.LayoutBefore = to_read ? D3D12_BARRIER_LAYOUT_PRESENT : D3D12_BARRIER_LAYOUT_SHADER_RESOURCE;
+        o.LayoutAfter = to_read ? D3D12_BARRIER_LAYOUT_SHADER_RESOURCE : D3D12_BARRIER_LAYOUT_PRESENT;
+        o.pResource = t;
+        o.Subresources.IndexOrFirstMipLevel = 0xffffffff; // all
+    }
+    if (!n)
+        return;
+    D3D12_BARRIER_GROUP g = {D3D12_BARRIER_TYPE_TEXTURE, n};
+    g.pTextureBarriers = b;
+    list->Barrier(1, &g);
+}
+
 bool presenter_present(ID3D12CommandQueue* queue, const PresentPlane* planes, u32 count) {
     Presenter* p = &g_presenter;
     AcquireSRWLockExclusive(&p->lock);
@@ -273,6 +301,7 @@ bool presenter_present(ID3D12CommandQueue* queue, const PresentPlane* planes, u3
     D3D12_CPU_DESCRIPTOR_HANDLE rtv = p->rtv_heap->GetCPUDescriptorHandleForHeapStart();
     rtv.ptr += frame * p->rtv_stride;
     buffer_barrier(p->list, buffer, true);
+    plane_barriers(p->list, planes, count, true);
     static const f32 k_black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
     p->list->ClearRenderTargetView(rtv, k_black, 0, nullptr);
     p->list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
@@ -296,6 +325,7 @@ bool presenter_present(ID3D12CommandQueue* queue, const PresentPlane* planes, u3
         if (planes[i].texture)
             draw_plane(p, frame, i, planes[i], display);
 
+    plane_barriers(p->list, planes, count, false);
     buffer_barrier(p->list, buffer, false);
     HRESULT hr = p->list->Close();
     if (SUCCEEDED(hr)) {
