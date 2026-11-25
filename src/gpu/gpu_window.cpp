@@ -91,20 +91,22 @@ static MemBlock window_extent(const MemBlock& block, u64 address, u64 size) {
     return {(u8*)lo, hi - lo, block.host + (lo - (u64)block.base)};
 }
 
-// Physical memory chunks are sections, which the GPU sees through heaps opened over the section
-// itself (heaps over addresses are for VirtualAlloc memory only). Each chunk's heap is opened once
-// and kept: chunks live as long as the process.
+// Physical memory chunks are sections, which the GPU sees through heaps opened over their views in
+// the linear view (mapped for the life of the process). Not over the section handles: heaps opened
+// from file mappings keep the section's commit charged after the heap, the section and even the
+// process are gone, so every run would leak all the physical memory it touched. Each chunk's heap is
+// opened once and kept: chunks live as long as the process.
 static ID3D12Heap** g_chunk_heaps = nullptr;
 static SRWLOCK g_chunk_lock = SRWLOCK_INIT;
 
-static ID3D12Heap* chunk_heap(u32 chunk) {
+static ID3D12Heap* chunk_heap(u32 chunk, void* chunk_view) {
     AcquireSRWLockExclusive(&g_chunk_lock);
     if (!g_chunk_heaps)
         g_chunk_heaps = (ID3D12Heap**)calloc(mem_physical_chunk_count(), sizeof(ID3D12Heap*));
     ID3D12Heap* heap = g_chunk_heaps ? g_chunk_heaps[chunk] : nullptr;
     if (g_chunk_heaps && !heap) {
-        HRESULT hr = gpu_device()->OpenExistingHeapFromFileMapping((HANDLE)mem_physical_chunk(chunk),
-                                                                   IID_PPV_ARGS(&heap));
+        HRESULT hr =
+            gpu_device()->OpenExistingHeapFromAddress1(chunk_view, MEM_CHUNK_SIZE, IID_PPV_ARGS(&heap));
         if (FAILED(hr)) {
             gpu_device_lost(hr);
             LOG_E("gpu", "cannot open a GPU heap over physical memory chunk %u (0x%08lx)", chunk,
@@ -121,7 +123,7 @@ static ID3D12Heap* chunk_heap(u32 chunk) {
 static ID3D12Heap* block_heap(const MemBlock& block, u64* offset) {
     u32 chunk;
     if (mem_linear_location(block.host, &chunk, offset)) {
-        ID3D12Heap* heap = chunk_heap(chunk);
+        ID3D12Heap* heap = chunk_heap(chunk, block.host - *offset);
         if (heap)
             heap->AddRef();
         return heap;
