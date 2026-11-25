@@ -18,6 +18,7 @@
 #include "common/log.h"
 #include "common/str.h"
 #include "core/console_profile.h"
+#include "core/cpu_compat.h"
 #include "core/title.h"
 #include "gpu/console_layout.h"
 #include "gpu/gpu.h"
@@ -153,6 +154,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
 
     SetCurrentDirectoryW(title.dir);
     crash_install(dump_path);
+    cpu_compat_init();
     stubs_init(opt.break_on_stub);
     console_profile_select(opt.model);
     LOG_I("main", "presenting as %s, title memory %llu MiB", console_profile().name,

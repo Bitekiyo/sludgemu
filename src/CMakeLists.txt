@@ -16,6 +16,8 @@ add_executable(sludgemu WIN32
     core/vfs.cpp
     core/console_profile.h
     core/console_profile.cpp
+    core/cpu_compat.h
+    core/cpu_compat.cpp
 
     loader/pe_image.h
     loader/pe_image.cpp
