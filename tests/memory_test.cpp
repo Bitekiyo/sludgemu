@@ -18,6 +18,14 @@ static int g_failures = 0;
 
 #define PAGE MEM_PAGE_SIZE
 
+static u32 g_notifications = 0;
+static const u8* g_last_notified = nullptr;
+
+static void on_mapping_changed(const u8* base, u64) {
+    g_notifications++;
+    g_last_notified = base;
+}
+
 static bool range_is_free(const u8* base, u64 size) {
     const u8* p = base;
     while (p < base + size) {
@@ -143,13 +151,38 @@ static void test_runs_and_remaps() {
     CHECK(size == 8 * PAGE);
     for (u32 i = 0; i < 8; i++)
         CHECK(shows_frame(base + (4 + i) * PAGE, run[i]));
+    // The run is one block, seen through the linear view.
+    MemBlock block;
+    CHECK(mem_backing_block(base + 6 * PAGE + 100, &block));
+    CHECK(block.base == base + 4 * PAGE && block.size == 8 * PAGE && block.host == mem_physical_ptr(run[0]));
+    CHECK(!mem_backing_block(base + 3 * PAGE, &block)); // page 3 isn't mapped
 
     // Remapping one page in the middle splits the view; every page still shows the right frame.
+    u32 notified = g_notifications;
     CHECK(mem_map_physical(base + 7 * PAGE, 1, &other[0]));
+    CHECK(g_notifications == notified + 1);
+    CHECK(g_last_notified == base + 7 * PAGE);
     for (u32 i = 0; i < 8; i++)
         CHECK(shows_frame(base + (4 + i) * PAGE, i == 3 ? other[0] : run[i]));
     query_allocation(base + 4 * PAGE, &alloc, &size, &state);
     CHECK(size == 3 * PAGE);
+    // The frames are no longer consecutive at page 7: three blocks.
+    CHECK(mem_backing_block(base + 5 * PAGE, &block));
+    CHECK(block.base == base + 4 * PAGE && block.size == 3 * PAGE && block.host == mem_physical_ptr(run[0]));
+    CHECK(mem_backing_block(base + 7 * PAGE, &block));
+    CHECK(block.base == base + 7 * PAGE && block.size == PAGE && block.host == mem_physical_ptr(other[0]));
+    CHECK(mem_backing_block(base + 11 * PAGE, &block));
+    CHECK(block.base == base + 8 * PAGE && block.size == 4 * PAGE && block.host == mem_physical_ptr(run[4]));
+
+    // Separately mapped views whose frames continue the sequence form one block; a view whose
+    // frames don't starts a new one.
+    CHECK(mem_map_physical(base + 12 * PAGE, 2, &run[0]));
+    CHECK(mem_map_physical(base + 14 * PAGE, 1, &run[2]));
+    CHECK(mem_backing_block(base + 14 * PAGE, &block));
+    CHECK(block.base == base + 12 * PAGE && block.size == 3 * PAGE && block.host == mem_physical_ptr(run[0]));
+    CHECK(mem_backing_block(base + 11 * PAGE, &block) && block.base == base + 8 * PAGE); // run[7], run[0]: no
+    u64 invalid3[3] = {MEM_INVALID_PFN, MEM_INVALID_PFN, MEM_INVALID_PFN};
+    CHECK(mem_map_physical(base + 12 * PAGE, 3, invalid3));
 
     // Aliasing: the same frame at a second address, writes visible through both.
     CHECK(mem_map_physical(base + 20 * PAGE, 1, &other[0]));
@@ -187,14 +220,44 @@ static void test_runs_and_remaps() {
     mem_physical_free(2, other);
 }
 
+// Titles allocate page frames first and map slices of them later, not necessarily in address order.
+// Frames are placed in memory when first mapped, following the range's layout, so the whole range
+// still ends up as one block the GPU can see.
+static void test_out_of_order_slices_form_one_block() {
+    const u32 pages = 40;
+    MemAddressLimits limits = {};
+    u8* base = (u8*)mem_reserve_placeholder(pages * PAGE, limits, 0, PAGE_READWRITE, 0);
+    CHECK(base != nullptr);
+    if (!base)
+        return;
+    u64 ids[pages];
+    CHECK(mem_physical_alloc(pages, ids));
+    CHECK(mem_map_physical(base + 20 * PAGE, 10, &ids[0]));
+    CHECK(mem_map_physical(base + 30 * PAGE, 10, &ids[10]));
+    CHECK(mem_map_physical(base + 0 * PAGE, 10, &ids[20]));
+    CHECK(mem_map_physical(base + 10 * PAGE, 10, &ids[30]));
+
+    MemBlock block;
+    CHECK(mem_backing_block(base + 25 * PAGE, &block));
+    CHECK(block.base == base && block.size == pages * PAGE);
+    base[3 * PAGE + 5] = 0x42; // ids[23], seen through the linear view
+    CHECK(mem_physical_ptr(ids[23])[5] == 0x42);
+    CHECK(block.host + 3 * PAGE == mem_physical_ptr(ids[23]));
+
+    CHECK(mem_release(base));
+    mem_physical_free(pages, ids);
+}
+
 int main() {
     log_init(nullptr, LOG_LEVEL_WARN);
     if (!mem_init(GiB(1))) {
         printf("FAIL: mem_init\n");
         return 1;
     }
+    mem_set_mapping_listener(on_mapping_changed);
     test_placeholder_release();
     test_runs_and_remaps();
+    test_out_of_order_slices_form_one_block();
     test_backed_release();
     test_frames_zeroed_on_reuse();
     printf("%s (%d failures)\n", g_failures ? "FAILED" : "passed", g_failures);

@@ -13,8 +13,8 @@
 // Mappings are 64 KiB granular because console pages are (and Windows view granularity matches),
 // but runs of consecutive frames are mapped as one view.
 //
-// Every range the title marks as GPU-visible is recorded in a registry that the graphics layer
-// uses to translate title GPU addresses.
+// Every range the title marks as GPU-visible is tracked, so the graphics layer can find the host
+// memory behind title GPU addresses (mem_backing_block) and hear about mapping changes.
 
 #define MEM_PAGE_SIZE  KiB(64)
 #define MEM_PAGE_SHIFT 16
@@ -56,8 +56,9 @@ void mem_physical_free(u64 count, const u64* pfns);
 // Host pointer to a page frame through the linear view.
 u8* mem_physical_ptr(u64 pfn);
 
-// Physical memory chunks (committed sections, nullptr until first used), for opening them as GPU
-// heaps. Chunk i holds frames [i * MEM_CHUNK_PAGES, (i + 1) * MEM_CHUNK_PAGES).
+// Physical memory chunks (committed sections, nullptr until first used). Chunk i holds frames
+// [i * MEM_CHUNK_PAGES, (i + 1) * MEM_CHUNK_PAGES). Allocations that fit in a chunk get consecutive
+// frames of one chunk where possible, so the GPU can see them as one block.
 u32 mem_physical_chunk_count();
 void* mem_physical_chunk(u32 index); // section HANDLE
 
@@ -94,6 +95,24 @@ bool mem_release(void* base);
 
 // Copies the description of the range containing `addr`; false if it isn't tracked.
 bool mem_query_range(const void* addr, MemRange* out);
+
+// A block of title memory backed by one contiguous block of a single host allocation, which is what
+// a GPU heap can be opened over: a whole ordinary range, or in a placeholder range the longest run
+// of pages around an address that map consecutive frames of one chunk (seen through the linear
+// view).
+struct MemBlock {
+    u8* base; // title address
+    u64 size;
+    u8* host; // host address of the same memory
+};
+
+// The block holding `addr`. False if `addr` isn't tracked or isn't mapped.
+bool mem_backing_block(const void* addr, MemBlock* out);
+
+// Called after page mappings change in [base, base + size) of a tracked range, or when the range is
+// released. Called without memory locks held, possibly from any thread; must be cheap.
+typedef void (*MemMappingListener)(const u8* base, u64 size);
+void mem_set_mapping_listener(MemMappingListener listener);
 
 // Changes the host protection used for future mappings in the range containing `addr`.
 void mem_set_range_protect(const void* addr, u32 protect);

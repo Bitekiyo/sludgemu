@@ -5,10 +5,10 @@
 
 #include "common/log.h"
 
-// One region of a placeholder range: a placeholder, or a view of consecutive page frames.
+// One region of a placeholder range: a placeholder, or a view of consecutive real frames.
 struct MemRegion {
     u32 first_page; // page index within the range; the region ends where the next one starts
-    u32 pfn;        // frame mapped at first_page, or REGION_PLACEHOLDER
+    u32 pfn;        // real frame mapped at first_page, or REGION_PLACEHOLDER
 };
 #define REGION_PLACEHOLDER 0xFFFFFFFFu
 
@@ -17,6 +17,8 @@ struct RangeSlot {
     MemRegion* regions; // placeholder ranges only; sorted by first_page, regions[0].first_page == 0
     u32 region_count;
     u32 region_capacity;
+    u32* anchors; // placeholder ranges: per slice of MEM_CHUNK_PAGES pages, the first real frame of
+                  // the chunk the slice prefers, or MEM_INVALID_PFN
 };
 
 #define MAX_RANGES 8192
@@ -34,16 +36,25 @@ struct MemoryState {
     UnmapViewOfFile2Fn unmap_view2;
 
     // Physical memory is a set of committed sections ("chunks") created as pages get allocated, so
-    // the commit charge follows actual use. Committed sections can also be opened as D3D12 heaps,
-    // which makes every page GPU-visible in place.
+    // the commit charge follows actual use.
     HANDLE chunks[MAX_CHUNKS];
-    u32 chunk_count; // chunks covering all of physical memory (created or not)
-    u8* linear;      // every chunk is mapped here, at pfn * MEM_PAGE_SIZE
+    bool chunk_anchored[MAX_CHUNKS]; // preferred by a slice of some placeholder range (see bind_frame)
+    u32 chunk_count;                 // chunks covering all of physical memory (created or not)
+    u8* linear;                      // every chunk is mapped here, real frame r at r * MEM_PAGE_SIZE
     u64 total_pages;
-    u64 used_pages;
-    u64* used_bitmap;  // 1 = allocated
-    u64* dirty_bitmap; // 1 = was used before, must be zeroed on next allocation
-    u64 search_hint;
+
+    // The page frame numbers titles get are IDs. An ID is bound to a real frame (a page of the
+    // linear view) only when it is first mapped or touched, which lets the binding follow the
+    // title's address layout (see bind_frame). Allocating IDs reserves the budget, so binding
+    // never runs out.
+    u64 used_pages;    // allocated IDs
+    u64* id_bitmap;    // 1 = ID allocated
+    u32* id_to_real;   // MEM_INVALID_PFN while unbound
+    u32* real_to_id;   // for bound real frames
+    u64* real_bitmap;  // 1 = real frame bound
+    u64* dirty_bitmap; // 1 = real frame was used before, zeroed when bound again
+    u64 id_hint;
+    u64 real_hint;
     SRWLOCK phys_lock;
 
     RangeSlot ranges[MAX_RANGES];
@@ -52,6 +63,8 @@ struct MemoryState {
 
     u64 gpu_lowest;
     u64 gpu_highest;
+
+    MemMappingListener mapping_listener;
 };
 
 static MemoryState g_mem;
@@ -103,8 +116,18 @@ bool mem_init(u64 physical_bytes) {
         }
     }
     u64 words = (g_mem.total_pages + 63) / 64;
-    g_mem.used_bitmap = (u64*)VirtualAlloc(nullptr, words * 8 * 2, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-    g_mem.dirty_bitmap = g_mem.used_bitmap + words;
+    u64 table_bytes = words * 8 * 3 + g_mem.total_pages * 4 * 2;
+    u8* tables = (u8*)VirtualAlloc(nullptr, table_bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!tables) {
+        LOG_E("memory", "cannot allocate page frame tables (%lu)", GetLastError());
+        return false;
+    }
+    g_mem.id_bitmap = (u64*)tables;
+    g_mem.real_bitmap = g_mem.id_bitmap + words;
+    g_mem.dirty_bitmap = g_mem.real_bitmap + words;
+    g_mem.id_to_real = (u32*)(g_mem.dirty_bitmap + words);
+    g_mem.real_to_id = g_mem.id_to_real + g_mem.total_pages;
+    memset(g_mem.id_to_real, 0xFF, g_mem.total_pages * 4);
 
     g_mem.gpu_lowest = GiB(2);
     g_mem.gpu_highest = (1ull << 40) - 1;
@@ -123,9 +146,6 @@ u64 mem_physical_total_pages() {
 u64 mem_physical_used_pages() {
     return g_mem.used_pages;
 }
-u8* mem_physical_ptr(u64 pfn) {
-    return g_mem.linear + (pfn << MEM_PAGE_SHIFT);
-}
 
 u32 mem_physical_chunk_count() {
     return g_mem.chunk_count;
@@ -134,8 +154,11 @@ void* mem_physical_chunk(u32 index) {
     return index < g_mem.chunk_count ? g_mem.chunks[index] : nullptr;
 }
 
-// Creates the section for a chunk and maps it into its slot of the linear view. Called with
-// phys_lock held.
+static u8* real_ptr(u32 real) {
+    return g_mem.linear + ((u64)real << MEM_PAGE_SHIFT);
+}
+
+// Creates the section for a chunk and maps it into its slot of the linear view. phys_lock held.
 static void create_chunk(u32 index) {
     HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_COMMIT,
                                         (DWORD)(MEM_CHUNK_SIZE >> 32), (DWORD)MEM_CHUNK_SIZE, nullptr);
@@ -149,6 +172,79 @@ static void create_chunk(u32 index) {
     LOG_D("memory", "physical chunk %u committed (%llu MiB)", index, MEM_CHUNK_SIZE >> 20);
 }
 
+// Claims a chunk that has no real frame bound and no range slice preferring it, for a slice.
+// Returns its first real frame, or MEM_INVALID_PFN. phys_lock held.
+static u32 claim_free_chunk() {
+    const u64 words_per_chunk = MEM_CHUNK_PAGES / 64;
+    for (u32 c = 0; c < g_mem.chunk_count; c++) {
+        if (g_mem.chunk_anchored[c])
+            continue;
+        const u64* w = g_mem.real_bitmap + c * words_per_chunk;
+        u64 any = 0;
+        for (u64 i = 0; i < words_per_chunk; i++)
+            any |= w[i];
+        if (!any) {
+            g_mem.chunk_anchored[c] = true;
+            return c * (u32)MEM_CHUNK_PAGES;
+        }
+    }
+    return MEM_INVALID_PFN;
+}
+
+// A free real frame, preferring chunks no range slice has claimed. phys_lock held.
+static u32 find_free_real() {
+    for (int pass = 0; pass < 2; pass++) {
+        u64 i = g_mem.real_hint;
+        for (u64 scanned = 0; scanned < g_mem.total_pages; scanned++, i++) {
+            if (i >= g_mem.total_pages)
+                i = 0;
+            if (pass == 0 && g_mem.chunk_anchored[i / MEM_CHUNK_PAGES]) {
+                u64 skip = MEM_CHUNK_PAGES - i % MEM_CHUNK_PAGES - 1; // to the end of this chunk
+                scanned += skip;
+                i += skip;
+                continue;
+            }
+            if (!bit_get(g_mem.real_bitmap, i)) {
+                g_mem.real_hint = i + 1 < g_mem.total_pages ? i + 1 : 0;
+                return (u32)i;
+            }
+        }
+    }
+    FATAL("no free real page frame although allocated IDs reserve them");
+}
+
+// Binds frame ID `id` to real memory, at `preferred` if that frame is free. Chunks are created as
+// needed and recycled frames are zeroed, so a frame reads as zero until written. phys_lock held.
+static u32 bind_frame(u32 id, u32 preferred) {
+    u32 real = g_mem.id_to_real[id];
+    if (real != MEM_INVALID_PFN)
+        return real;
+    if (preferred < g_mem.total_pages && !bit_get(g_mem.real_bitmap, preferred))
+        real = preferred;
+    else
+        real = find_free_real();
+    bit_set(g_mem.real_bitmap, real);
+    g_mem.id_to_real[id] = real;
+    g_mem.real_to_id[real] = id;
+    u32 chunk = real / (u32)MEM_CHUNK_PAGES;
+    if (!g_mem.chunks[chunk])
+        create_chunk(chunk);
+    if (bit_get(g_mem.dirty_bitmap, real)) {
+        memset(real_ptr(real), 0, MEM_PAGE_SIZE);
+        bit_clear(g_mem.dirty_bitmap, real);
+    }
+    return real;
+}
+
+u8* mem_physical_ptr(u64 pfn) {
+    if (pfn >= g_mem.total_pages)
+        return nullptr;
+    AcquireSRWLockExclusive(&g_mem.phys_lock);
+    u32 real = bit_get(g_mem.id_bitmap, pfn) ? bind_frame((u32)pfn, MEM_INVALID_PFN) : MEM_INVALID_PFN;
+    ReleaseSRWLockExclusive(&g_mem.phys_lock);
+    return real != MEM_INVALID_PFN ? real_ptr(real) : nullptr;
+}
+
 bool mem_physical_alloc(u64 count, u64* pfns) {
     AcquireSRWLockExclusive(&g_mem.phys_lock);
     if (g_mem.used_pages + count > g_mem.total_pages) {
@@ -158,29 +254,18 @@ bool mem_physical_alloc(u64 count, u64* pfns) {
         return false;
     }
     u64 found = 0;
-    u64 i = g_mem.search_hint;
+    u64 i = g_mem.id_hint;
     for (u64 scanned = 0; found < count && scanned < g_mem.total_pages; scanned++, i++) {
         if (i >= g_mem.total_pages)
             i = 0;
-        if (!bit_get(g_mem.used_bitmap, i)) {
-            bit_set(g_mem.used_bitmap, i);
+        if (!bit_get(g_mem.id_bitmap, i)) {
+            bit_set(g_mem.id_bitmap, i);
             pfns[found++] = i;
         }
     }
     SLUDGE_ASSERT(found == count);
-    g_mem.search_hint = i;
+    g_mem.id_hint = i < g_mem.total_pages ? i : 0;
     g_mem.used_pages += count;
-
-    // Make sure the frames' chunks exist; recycled frames are zeroed (new chunks come zeroed).
-    for (u64 k = 0; k < count; k++) {
-        u32 chunk = (u32)(pfns[k] / MEM_CHUNK_PAGES);
-        if (!g_mem.chunks[chunk])
-            create_chunk(chunk);
-        if (bit_get(g_mem.dirty_bitmap, pfns[k])) {
-            memset(mem_physical_ptr(pfns[k]), 0, MEM_PAGE_SIZE);
-            bit_clear(g_mem.dirty_bitmap, pfns[k]);
-        }
-    }
     ReleaseSRWLockExclusive(&g_mem.phys_lock);
     return true;
 }
@@ -188,16 +273,21 @@ bool mem_physical_alloc(u64 count, u64* pfns) {
 void mem_physical_free(u64 count, const u64* pfns) {
     AcquireSRWLockExclusive(&g_mem.phys_lock);
     for (u64 k = 0; k < count; k++) {
-        u64 pfn = pfns[k];
-        if (pfn >= g_mem.total_pages || !bit_get(g_mem.used_bitmap, pfn)) {
-            LOG_W("memory", "freeing invalid/unallocated page frame 0x%llx", pfn);
+        u64 id = pfns[k];
+        if (id >= g_mem.total_pages || !bit_get(g_mem.id_bitmap, id)) {
+            LOG_W("memory", "freeing invalid/unallocated page frame 0x%llx", id);
             continue;
         }
-        bit_clear(g_mem.used_bitmap, pfn);
-        bit_set(g_mem.dirty_bitmap, pfn);
+        bit_clear(g_mem.id_bitmap, id);
         g_mem.used_pages--;
-        // Hand the RAM back; the frame is zeroed when it's allocated again.
-        DiscardVirtualMemory(mem_physical_ptr(pfn), MEM_PAGE_SIZE);
+        u32 real = g_mem.id_to_real[id];
+        if (real != MEM_INVALID_PFN) {
+            g_mem.id_to_real[id] = MEM_INVALID_PFN;
+            bit_clear(g_mem.real_bitmap, real);
+            bit_set(g_mem.dirty_bitmap, real);
+            // Hand the RAM back; the frame is zeroed when it's bound again.
+            DiscardVirtualMemory(real_ptr(real), MEM_PAGE_SIZE);
+        }
     }
     ReleaseSRWLockExclusive(&g_mem.phys_lock);
 }
@@ -368,6 +458,49 @@ bool mem_query_range(const void* addr, MemRange* out) {
     return s != nullptr;
 }
 
+bool mem_backing_block(const void* addr, MemBlock* out) {
+    bool ok = false;
+    AcquireSRWLockShared(&g_mem.range_lock);
+    RangeSlot* s = find_range_locked(addr);
+    if (s && !(s->info.flags & MEM_RANGE_PLACEHOLDER)) {
+        *out = {s->info.base, s->info.size, s->info.base}; // one VirtualAlloc allocation
+        ok = true;
+    } else if (s) {
+        u32 page = (u32)((u64)((const u8*)addr - s->info.base) >> MEM_PAGE_SHIFT);
+        u32 index = region_find(s, page);
+        const MemRegion* r = s->regions;
+        if (r[index].pfn != REGION_PLACEHOLDER) {
+            // Neighbouring views continue the block while their frames continue the sequence
+            // within the chunk.
+            u32 chunk = r[index].pfn / (u32)MEM_CHUNK_PAGES;
+            u32 first = index, last = index;
+            while (first > 0 && r[first - 1].pfn != REGION_PLACEHOLDER &&
+                   r[first - 1].pfn + (r[first].first_page - r[first - 1].first_page) == r[first].pfn &&
+                   r[first - 1].pfn / (u32)MEM_CHUNK_PAGES == chunk)
+                first--;
+            while (last + 1 < s->region_count && r[last + 1].pfn != REGION_PLACEHOLDER &&
+                   r[last].pfn + (r[last + 1].first_page - r[last].first_page) == r[last + 1].pfn &&
+                   r[last + 1].pfn / (u32)MEM_CHUNK_PAGES == chunk)
+                last++;
+            out->base = page_va(s, r[first].first_page);
+            out->size = (u64)(region_end(s, last) - r[first].first_page) << MEM_PAGE_SHIFT;
+            out->host = real_ptr(r[first].pfn);
+            ok = true;
+        }
+    }
+    ReleaseSRWLockShared(&g_mem.range_lock);
+    return ok;
+}
+
+void mem_set_mapping_listener(MemMappingListener listener) {
+    g_mem.mapping_listener = listener;
+}
+
+static void notify_mapping_changed(const u8* base, u64 size) {
+    if (g_mem.mapping_listener)
+        g_mem.mapping_listener(base, size);
+}
+
 bool mem_is_tracked(const void* addr) {
     MemRange r;
     return mem_query_range(addr, &r);
@@ -380,9 +513,10 @@ void mem_set_range_protect(const void* addr, u32 protect) {
     ReleaseSRWLockExclusive(&g_mem.range_lock);
 }
 
-// Publishes a fully initialized range. `regions` (placeholder ranges only) is owned by the range
-// from here on.
-static void add_range(u8* base, u64 size, u32 flags, u32 protect, u64 xflags, MemRegion* regions) {
+// Publishes a fully initialized range. `regions` and `anchors` (placeholder ranges only) are owned
+// by the range from here on.
+static void add_range(u8* base, u64 size, u32 flags, u32 protect, u64 xflags, MemRegion* regions,
+                      u32* anchors) {
     AcquireSRWLockExclusive(&g_mem.range_lock);
     if (g_mem.range_count >= MAX_RANGES) {
         ReleaseSRWLockExclusive(&g_mem.range_lock);
@@ -397,6 +531,7 @@ static void add_range(u8* base, u64 size, u32 flags, u32 protect, u64 xflags, Me
     s.regions = regions;
     s.region_count = regions ? 1 : 0;
     s.region_capacity = regions ? 1 : 0;
+    s.anchors = anchors;
     ReleaseSRWLockExclusive(&g_mem.range_lock);
 }
 
@@ -416,10 +551,13 @@ void* mem_reserve_placeholder(u64 size, const MemAddressLimits& limits, u32 rang
         return nullptr;
     }
     MemRegion* regions = (MemRegion*)malloc(sizeof(MemRegion));
-    if (!regions)
+    u64 slices = ((size >> MEM_PAGE_SHIFT) + MEM_CHUNK_PAGES - 1) / MEM_CHUNK_PAGES;
+    u32* anchors = (u32*)malloc(slices * sizeof(u32));
+    if (!regions || !anchors)
         FATAL("out of memory tracking mappings");
     regions[0].first_page = 0;
     regions[0].pfn = REGION_PLACEHOLDER;
+    memset(anchors, 0xFF, slices * sizeof(u32));
 
     MEM_ADDRESS_REQUIREMENTS req;
     fill_address_requirements(limits, &req);
@@ -431,9 +569,10 @@ void* mem_reserve_placeholder(u64 size, const MemAddressLimits& limits, u32 rang
     if (!base) {
         LOG_E("memory", "placeholder reservation of %llu MiB failed (%lu)", size >> 20, GetLastError());
         free(regions);
+        free(anchors);
         return nullptr;
     }
-    add_range(base, size, range_flags | MEM_RANGE_PLACEHOLDER, protect, xflags, regions);
+    add_range(base, size, range_flags | MEM_RANGE_PLACEHOLDER, protect, xflags, regions, anchors);
     LOG_I("memory", "placeholder range %p..%p (%llu MiB)%s", base, base + size, size >> 20,
           (range_flags & MEM_RANGE_GPU) ? " [gpu]" : "");
     return base;
@@ -458,56 +597,105 @@ void* mem_alloc_virtual(void* base, u64 size, u32 alloc_type, u32 protect, const
     // Fresh reservations are tracked; commits into an existing tracked range are not new ranges.
     if (!base || !mem_is_tracked(base)) {
         if (range_flags & MEM_RANGE_GPU)
-            add_range((u8*)p, ALIGN_UP(size, MEM_PAGE_SIZE), range_flags, protect, xflags, nullptr);
+            add_range((u8*)p, ALIGN_UP(size, MEM_PAGE_SIZE), range_flags, protect, xflags, nullptr, nullptr);
     }
     return p;
 }
 
-// An allocated frame always has its chunk (both are set up together under the physical lock).
-static bool frame_mappable(u64 pfn) {
-    if (pfn >= g_mem.total_pages)
+static bool frame_allocated(u64 id) {
+    if (id >= g_mem.total_pages)
         return false;
     AcquireSRWLockShared(&g_mem.phys_lock);
-    bool ok = bit_get(g_mem.used_bitmap, pfn) && g_mem.chunks[pfn / MEM_CHUNK_PAGES] != nullptr;
+    bool ok = bit_get(g_mem.id_bitmap, id);
     ReleaseSRWLockShared(&g_mem.phys_lock);
     return ok;
 }
 
-// Maps (or unmaps, for MEM_INVALID_PFN entries or pfns == nullptr) `count` consecutive pages at
-// `va`, one view per run of consecutive frames within a chunk. Range lock held exclusively.
-static bool map_span_locked(void* va, u64 count, const u64* pfns) {
+// Where a frame mapped at `page` of a placeholder range should live in real memory. Each slice of
+// MEM_CHUNK_PAGES pages of the range claims a whole free chunk when it first needs one and lays its
+// pages out in it in address order, so pages the title maps next to each other are next to each
+// other in memory, whatever order it maps them in. That is what lets the GPU see a range of title
+// memory as one block (see MemBlock). Without a chunk to claim, a page follows its predecessor.
+// Range lock and phys_lock held.
+static u32 preferred_real(RangeSlot* s, u32 page, u32 previous) {
+    u32 slice = page / (u32)MEM_CHUNK_PAGES;
+    if (s->anchors[slice] == MEM_INVALID_PFN)
+        s->anchors[slice] = claim_free_chunk();
+    if (s->anchors[slice] != MEM_INVALID_PFN)
+        return s->anchors[slice] + page % (u32)MEM_CHUNK_PAGES;
+    if (previous == MEM_INVALID_PFN && page > 0) {
+        const MemRegion& r = s->regions[region_find(s, page - 1)];
+        if (r.pfn != REGION_PLACEHOLDER)
+            previous = r.pfn + (page - 1 - r.first_page);
+    }
+    return previous == MEM_INVALID_PFN ? MEM_INVALID_PFN : previous + 1;
+}
+
+// Gives up the range's claims on chunks. Range lock held.
+static void release_anchors(RangeSlot* s) {
+    u32 slices = (range_pages(s) + (u32)MEM_CHUNK_PAGES - 1) / (u32)MEM_CHUNK_PAGES;
+    AcquireSRWLockExclusive(&g_mem.phys_lock);
+    for (u32 i = 0; i < slices; i++) {
+        if (s->anchors[i] != MEM_INVALID_PFN)
+            g_mem.chunk_anchored[s->anchors[i] / MEM_CHUNK_PAGES] = false;
+    }
+    ReleaseSRWLockExclusive(&g_mem.phys_lock);
+    free(s->anchors);
+    s->anchors = nullptr;
+}
+
+// Maps (or unmaps, for MEM_INVALID_PFN entries or ids == nullptr) `count` consecutive pages at
+// `va`, one view per run of consecutive real frames within a chunk. Range lock held exclusively.
+static bool map_span_locked(void* va, u64 count, const u64* ids) {
     RangeSlot* s = find_range_locked(va);
     if (!s || !(s->info.flags & MEM_RANGE_PLACEHOLDER) || ((uptr)va & (MEM_PAGE_SIZE - 1))) {
         LOG_E("memory", "physical map target %p is not a page in a placeholder range", va);
         return false;
     }
-    u64 first = (u64)((u8*)va - s->info.base) >> MEM_PAGE_SHIFT;
+    u32 first = (u32)((u64)((u8*)va - s->info.base) >> MEM_PAGE_SHIFT);
     if (count > range_pages(s) - first) {
         LOG_E("memory", "physical map of %llu pages at %p runs past its range", count, va);
         return false;
     }
     // Validate everything before changing anything.
-    for (u64 i = 0; pfns && i < count; i++) {
-        if (pfns[i] != MEM_INVALID_PFN && !frame_mappable(pfns[i])) {
-            LOG_E("memory", "frame 0x%llx mapped at %p is not an allocated page frame", pfns[i],
+    for (u64 i = 0; ids && i < count; i++) {
+        if (ids[i] != MEM_INVALID_PFN && !frame_allocated(ids[i])) {
+            LOG_E("memory", "frame 0x%llx mapped at %p is not an allocated page frame", ids[i],
                   (u8*)va + (i << MEM_PAGE_SHIFT));
             return false;
         }
     }
+    u32* reals = nullptr;
+    if (ids) {
+        reals = (u32*)malloc(count * sizeof(u32));
+        if (!reals)
+            FATAL("out of memory mapping %llu pages", count);
+        AcquireSRWLockExclusive(&g_mem.phys_lock);
+        for (u64 i = 0; i < count; i++) {
+            if (ids[i] == MEM_INVALID_PFN) {
+                reals[i] = MEM_INVALID_PFN;
+                continue;
+            }
+            u32 previous = i > 0 ? reals[i - 1] : MEM_INVALID_PFN;
+            reals[i] = bind_frame((u32)ids[i], preferred_real(s, (u32)(first + i), previous));
+        }
+        ReleaseSRWLockExclusive(&g_mem.phys_lock);
+    }
     for (u64 i = 0; i < count;) {
-        u64 pfn = pfns ? pfns[i] : MEM_INVALID_PFN;
+        u32 real = reals ? reals[i] : MEM_INVALID_PFN;
         u64 run = 1;
-        if (pfn == MEM_INVALID_PFN) {
-            while (i + run < count && (!pfns || pfns[i + run] == MEM_INVALID_PFN))
+        if (real == MEM_INVALID_PFN) {
+            while (i + run < count && (!reals || reals[i + run] == MEM_INVALID_PFN))
                 run++;
             unmap_run(s, (u32)(first + i), (u32)run);
         } else {
-            while (i + run < count && pfns[i + run] == pfn + run && (pfn + run) % MEM_CHUNK_PAGES != 0)
+            while (i + run < count && reals[i + run] == real + run && (real + run) % MEM_CHUNK_PAGES != 0)
                 run++;
-            map_run(s, (u32)(first + i), (u32)run, (u32)pfn);
+            map_run(s, (u32)(first + i), (u32)run, real);
         }
         i += run;
     }
+    free(reals);
     return true;
 }
 
@@ -515,6 +703,8 @@ bool mem_map_physical(void* va, u64 count, const u64* pfns) {
     AcquireSRWLockExclusive(&g_mem.range_lock);
     bool ok = map_span_locked(va, count, pfns);
     ReleaseSRWLockExclusive(&g_mem.range_lock);
+    if (ok)
+        notify_mapping_changed((const u8*)va, count << MEM_PAGE_SHIFT);
     return ok;
 }
 
@@ -530,6 +720,14 @@ bool mem_map_physical_scatter(void* const* vas, u64 count, const u64* pfns) {
         i += span;
     }
     ReleaseSRWLockExclusive(&g_mem.range_lock);
+    // Spans before a failed one did change.
+    for (u64 i = 0; i < count;) {
+        u64 span = 1;
+        while (i + span < count && (u8*)vas[i + span] == (u8*)vas[i] + (span << MEM_PAGE_SHIFT))
+            span++;
+        notify_mapping_changed((const u8*)vas[i], span << MEM_PAGE_SHIFT);
+        i += span;
+    }
     return ok;
 }
 
@@ -578,8 +776,8 @@ bool mem_release(void* base) {
                 ok = g_mem.unmap_view2(GetCurrentProcess(), va, 0) != FALSE;
                 if (owns) {
                     for (u32 p = 0; p < region_end(s, i) - r.first_page; p++) {
-                        u64 pfn = r.pfn + p;
-                        mem_physical_free(1, &pfn);
+                        u64 id = g_mem.real_to_id[r.pfn + p];
+                        mem_physical_free(1, &id);
                     }
                 }
             }
@@ -587,11 +785,14 @@ bool mem_release(void* base) {
                 LOG_E("memory", "releasing %p failed (%lu)", va, GetLastError());
         }
         free(s->regions);
+        release_anchors(s);
     } else {
         VirtualFree(s->info.base, 0, MEM_RELEASE);
     }
+    u64 size = s->info.size;
     *s = g_mem.ranges[--g_mem.range_count];
     ReleaseSRWLockExclusive(&g_mem.range_lock);
+    notify_mapping_changed((const u8*)base, size);
     return true;
 }
 
