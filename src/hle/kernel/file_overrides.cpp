@@ -5,6 +5,7 @@
 
 #include "common/log.h"
 #include "common/str.h"
+#include "core/memory.h"
 #include "core/vfs.h"
 #include "hle/kernel/overrides.h"
 
@@ -107,7 +108,23 @@ static BOOL WINAPI hk_MoveFileExW(LPCWSTR from, LPCWSTR to, DWORD flags) {
     return MoveFileExW(host_path(from, from_buf), host_path(to, to_buf), flags);
 }
 
+// The kernel reads and writes title buffers without faulting them in, so their pages are backed
+// first (see mem_prepare).
+static BOOL WINAPI hk_ReadFile(HANDLE file, LPVOID buffer, DWORD size, LPDWORD read,
+                               LPOVERLAPPED overlapped) {
+    mem_prepare(buffer, size);
+    return ReadFile(file, buffer, size, read, overlapped);
+}
+
+static BOOL WINAPI hk_WriteFile(HANDLE file, LPCVOID buffer, DWORD size, LPDWORD written,
+                                LPOVERLAPPED overlapped) {
+    mem_prepare(buffer, size);
+    return WriteFile(file, buffer, size, written, overlapped);
+}
+
 const HleExport g_file_overrides[] = {
+    HLE_EXPORT_AS(hk_ReadFile, "ReadFile"),
+    HLE_EXPORT_AS(hk_WriteFile, "WriteFile"),
     HLE_EXPORT_AS(hk_CreateFileW, "CreateFileW"),
     HLE_EXPORT_AS(hk_CreateFile2, "CreateFile2"),
     HLE_EXPORT_AS(hk_GetFileAttributesW, "GetFileAttributesW"),

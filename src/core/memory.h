@@ -98,8 +98,15 @@ void* mem_alloc_virtual(void* base, u64 size, u32 alloc_type, u32 protect, const
 // Maps page frames (by page number) into a placeholder range. pfns == nullptr unmaps. Each page
 // may be at a different address (scatter) when `vas` is given; otherwise pages are consecutive from
 // `va`.
+//
+// Mapped frames are backed by memory only when their pages are first touched: CPU accesses are
+// caught and handled transparently, but anything that reaches title memory without faulting in user
+// mode (kernel I/O, the GPU) must call mem_prepare first.
 bool mem_map_physical(void* va, u64 count, const u64* pfns);
 bool mem_map_physical_scatter(void* const* vas, u64 count, const u64* pfns);
+
+// Backs any frames mapped but not yet backed under [addr, addr + size) (see mem_map_physical).
+void mem_prepare(const void* addr, u64 size);
 
 // Releases a range created by the functions above. Returns false if `base` isn't one of ours.
 bool mem_release(void* base);

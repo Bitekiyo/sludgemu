@@ -370,6 +370,9 @@ void ConsoleQueue::EnqueueRequest(const ConsoleRequest* r) {
     void* destination = r->destination;
     if (r->options & OPT_DESTINATION_PAGES)
         destination = contiguous_pages(r->destination_pages, r->destination_page_offset, r->destination_size);
+    // DirectStorage may write and read title memory from the kernel, which doesn't fault pages in.
+    if (destination && !(r->options & OPT_DESTINATION_PAGES))
+        mem_prepare(destination, r->destination_size);
     d.Destination.Memory.Buffer = destination;
     d.Destination.Memory.Size = r->destination_size;
 
@@ -379,6 +382,8 @@ void ConsoleQueue::EnqueueRequest(const ConsoleRequest* r) {
         source = (r->options & OPT_SOURCE_PAGES)
                      ? contiguous_pages(r->source_pages, r->source_page_offset, r->source_size)
                      : r->source;
+        if (source && !(r->options & OPT_SOURCE_PAGES))
+            mem_prepare(source, r->source_size);
         d.Source.Memory.Source = source;
         d.Source.Memory.Size = r->source_size;
     } else {

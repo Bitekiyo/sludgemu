@@ -19,6 +19,8 @@ struct RangeSlot {
     u32 region_capacity;
     u32* anchors; // placeholder ranges: per slice of MEM_CHUNK_PAGES pages, the first real frame of
                   // the chunk the slice prefers, or MEM_INVALID_PFN
+    u32* pending; // placeholder ranges, once frames are mapped: per page, the frame ID mapped there but
+                  // not backed yet (see "Lazy backing"), or MEM_INVALID_PFN
 };
 
 #define MAX_RANGES 8192
@@ -68,6 +70,8 @@ struct MemoryState {
 };
 
 static MemoryState g_mem;
+
+static LONG CALLBACK on_access_fault(EXCEPTION_POINTERS* ep);
 
 static inline bool bit_get(const u64* bm, u64 i) {
     return (bm[i >> 6] >> (i & 63)) & 1;
@@ -136,6 +140,12 @@ bool mem_init(u64 physical_bytes) {
 
     g_mem.gpu_lowest = GiB(2);
     g_mem.gpu_highest = (1ull << 40) - 1;
+
+    // First in line: faults on pending pages are ours, not crashes.
+    if (!AddVectoredExceptionHandler(1, on_access_fault)) {
+        LOG_E("memory", "cannot install the page backing handler");
+        return false;
+    }
 
     LOG_I("memory", "physical memory: %llu MiB (%llu pages), linear view at %p", physical_bytes >> 20,
           g_mem.total_pages, g_mem.linear);
@@ -555,6 +565,7 @@ static void add_range(u8* base, u64 size, u32 flags, u32 protect, u64 xflags, Me
     s.region_count = regions ? 1 : 0;
     s.region_capacity = regions ? 1 : 0;
     s.anchors = anchors;
+    s.pending = nullptr;
     ReleaseSRWLockExclusive(&g_mem.range_lock);
 }
 
@@ -665,8 +676,111 @@ static void release_anchors(RangeSlot* s) {
     s->anchors = nullptr;
 }
 
+// Backs the frames `ids` (MEM_INVALID_PFN: none) at pages [first, first + count) and maps them, one
+// view per run of consecutive real frames within a chunk. Range lock held exclusively.
+static void back_and_map_locked(RangeSlot* s, u32 first, u32 count, const u32* ids) {
+    u32* reals = (u32*)malloc(count * sizeof(u32));
+    if (!reals)
+        FATAL("out of memory mapping %u pages", count);
+    AcquireSRWLockExclusive(&g_mem.phys_lock);
+    for (u32 i = 0; i < count; i++) {
+        u32 previous = i > 0 ? reals[i - 1] : MEM_INVALID_PFN;
+        reals[i] = ids[i] == MEM_INVALID_PFN ? MEM_INVALID_PFN
+                                             : bind_frame(ids[i], preferred_real(s, first + i, previous));
+    }
+    ReleaseSRWLockExclusive(&g_mem.phys_lock);
+    for (u32 i = 0; i < count;) {
+        u32 real = reals[i];
+        u32 run = 1;
+        if (real == MEM_INVALID_PFN) {
+            while (i + run < count && reals[i + run] == MEM_INVALID_PFN)
+                run++;
+            unmap_run(s, first + i, run);
+        } else {
+            while (i + run < count && reals[i + run] == real + run && (real + run) % MEM_CHUNK_PAGES != 0)
+                run++;
+            map_run(s, first + i, run, real);
+        }
+        i += run;
+    }
+    free(reals);
+}
+
+// --- Lazy backing ------------------------------------------------------------------------------------
+//
+// Titles map far more frames than they touch (whole pools at once), and every backed frame costs
+// commit charge. So a mapped frame stays pending, its page a placeholder, until the page is first
+// touched: by the CPU (an access fault, see on_access_fault) or by us for the GPU and for kernel I/O
+// (mem_prepare). Then the pending frames of the page's whole slice are backed together, which keeps
+// the slice's frames consecutive in one chunk for the GPU and makes later touches nearby free.
+
+// Backs the pending frames of the slice holding `page`. Range lock held exclusively.
+static void back_slice_locked(RangeSlot* s, u32 page) {
+    u32 lo = page - page % (u32)MEM_CHUNK_PAGES;
+    u32 hi = lo + (u32)MEM_CHUNK_PAGES < range_pages(s) ? lo + (u32)MEM_CHUNK_PAGES : range_pages(s);
+    for (u32 p = lo; p < hi;) {
+        if (s->pending[p] == MEM_INVALID_PFN) {
+            p++;
+            continue;
+        }
+        u32 run = 1;
+        while (p + run < hi && s->pending[p + run] != MEM_INVALID_PFN)
+            run++;
+        back_and_map_locked(s, p, run, &s->pending[p]);
+        memset(&s->pending[p], 0xFF, run * sizeof(u32));
+        p += run;
+    }
+}
+
+// Backs the pending frames under [addr, addr + size) of a placeholder range. Range lock held
+// exclusively. Returns whether anything was pending.
+static bool back_range_locked(RangeSlot* s, const u8* addr, u64 size) {
+    if (!s->pending)
+        return false;
+    u32 first = (u32)((u64)(addr - s->info.base) >> MEM_PAGE_SHIFT);
+    u64 end = ((u64)(addr - s->info.base) + size + MEM_PAGE_SIZE - 1) >> MEM_PAGE_SHIFT;
+    u32 last = (u32)(end < range_pages(s) ? end : range_pages(s));
+    bool any = false;
+    for (u32 p = first; p < last; p++) {
+        if (s->pending[p] != MEM_INVALID_PFN) {
+            back_slice_locked(s, p);
+            any = true;
+        }
+    }
+    return any;
+}
+
+void mem_prepare(const void* addr, u64 size) {
+    const u8* p = (const u8*)addr;
+    const u8* end = p + size;
+    AcquireSRWLockExclusive(&g_mem.range_lock);
+    while (p < end) {
+        RangeSlot* s = find_range_locked(p);
+        if (!s)
+            break;
+        const u8* range_end = s->info.base + s->info.size;
+        if (s->info.flags & MEM_RANGE_PLACEHOLDER)
+            back_range_locked(s, p, (u64)((end < range_end ? end : range_end) - p));
+        p = range_end;
+    }
+    ReleaseSRWLockExclusive(&g_mem.range_lock);
+}
+
+// CPU access to a pending page: back it and retry the access.
+static LONG CALLBACK on_access_fault(EXCEPTION_POINTERS* ep) {
+    const EXCEPTION_RECORD* e = ep->ExceptionRecord;
+    if (e->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || e->NumberParameters < 2)
+        return EXCEPTION_CONTINUE_SEARCH;
+    const u8* addr = (const u8*)e->ExceptionInformation[1];
+    AcquireSRWLockExclusive(&g_mem.range_lock);
+    RangeSlot* s = find_range_locked(addr);
+    bool backed = s && (s->info.flags & MEM_RANGE_PLACEHOLDER) && back_range_locked(s, addr, 1);
+    ReleaseSRWLockExclusive(&g_mem.range_lock);
+    return backed ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
+}
+
 // Maps (or unmaps, for MEM_INVALID_PFN entries or pfns == nullptr) `count` consecutive pages at
-// `va`, one view per run of consecutive real frames within a chunk. Range lock held exclusively.
+// `va`. Frames are backed when first touched (see "Lazy backing"). Range lock held exclusively.
 static bool map_span_locked(void* va, u64 count, const u64* pfns) {
     RangeSlot* s = find_range_locked(va);
     if (!s || !(s->info.flags & MEM_RANGE_PLACEHOLDER) || ((uptr)va & (MEM_PAGE_SIZE - 1))) {
@@ -686,38 +800,18 @@ static bool map_span_locked(void* va, u64 count, const u64* pfns) {
             return false;
         }
     }
-    u32* reals = nullptr;
-    if (pfns) {
-        reals = (u32*)malloc(count * sizeof(u32));
-        if (!reals)
-            FATAL("out of memory mapping %llu pages", count);
-        AcquireSRWLockExclusive(&g_mem.phys_lock);
-        for (u64 i = 0; i < count; i++) {
-            if (pfns[i] == MEM_INVALID_PFN) {
-                reals[i] = MEM_INVALID_PFN;
-                continue;
-            }
-            u32 previous = i > 0 ? reals[i - 1] : MEM_INVALID_PFN;
-            u32 id = (u32)(pfns[i] >> MEM_PAGE_NUMBER_SHIFT);
-            reals[i] = bind_frame(id, preferred_real(s, (u32)(first + i), previous));
-        }
-        ReleaseSRWLockExclusive(&g_mem.phys_lock);
+    if (pfns && !s->pending) {
+        s->pending = (u32*)malloc((u64)range_pages(s) * sizeof(u32));
+        if (!s->pending)
+            FATAL("out of memory tracking mappings");
+        memset(s->pending, 0xFF, (u64)range_pages(s) * sizeof(u32));
     }
-    for (u64 i = 0; i < count;) {
-        u32 real = reals ? reals[i] : MEM_INVALID_PFN;
-        u64 run = 1;
-        if (real == MEM_INVALID_PFN) {
-            while (i + run < count && (!reals || reals[i + run] == MEM_INVALID_PFN))
-                run++;
-            unmap_run(s, (u32)(first + i), (u32)run);
-        } else {
-            while (i + run < count && reals[i + run] == real + run && (real + run) % MEM_CHUNK_PAGES != 0)
-                run++;
-            map_run(s, (u32)(first + i), (u32)run, real);
-        }
-        i += run;
+    // Whatever was mapped there goes; the new frames wait for their first touch.
+    unmap_run(s, first, (u32)count);
+    for (u64 i = 0; s->pending && i < count; i++) {
+        bool frame = pfns && pfns[i] != MEM_INVALID_PFN;
+        s->pending[first + i] = frame ? (u32)(pfns[i] >> MEM_PAGE_NUMBER_SHIFT) : MEM_INVALID_PFN;
     }
-    free(reals);
     return true;
 }
 
@@ -806,6 +900,14 @@ bool mem_release(void* base) {
             if (!ok)
                 LOG_E("memory", "releasing %p failed (%lu)", va, GetLastError());
         }
+        // Frames that were never touched are owned too.
+        for (u32 p = 0; owns && s->pending && p < range_pages(s); p++) {
+            if (s->pending[p] != MEM_INVALID_PFN) {
+                u64 pfn = (u64)s->pending[p] << MEM_PAGE_NUMBER_SHIFT;
+                mem_physical_free(1, &pfn);
+            }
+        }
+        free(s->pending);
         free(s->regions);
         release_anchors(s);
     } else {

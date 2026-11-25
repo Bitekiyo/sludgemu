@@ -177,6 +177,7 @@ bool gpu_translate(u64 address, u64 size, GpuAddress* out) {
         return ok;
 
     MemBlock block;
+    mem_prepare((const void*)address, size); // the GPU can't fault pages in
     if (!mem_backing_block((const void*)address, &block)) {
         LOG_E("gpu", "GPU access to unmapped title memory 0x%llx+0x%llx", address, size);
         return false;
