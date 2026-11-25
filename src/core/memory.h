@@ -149,6 +149,21 @@ bool mem_is_mapped(const void* addr, u64 size);
 typedef void (*MemMappingListener)(const u8* base, u64 size);
 void mem_add_mapping_listener(MemMappingListener listener);
 
+// Write watches: [base, base + size) of tracked title memory becomes read-only until the first write,
+// which makes it writable again and reports the range to the write listener. Mapped frames can show
+// at several addresses (the console's physical pages), so every address showing the range's frames
+// is watched, and a write through any of them reports the range. For memory the title keeps
+// read-write. Watches survive views being remapped over the same frames; they end, reported like
+// writes, when other frames are mapped there. Writes through our own views of the memory (for the
+// GPU) and by the kernel aren't seen: kernel I/O into title memory ends the watches first (see
+// mem_end_write_watches), since its writes would fail rather than fault.
+typedef void (*MemWriteListener)(u64 base, u64 size); // called without memory locks held
+void mem_set_write_listener(MemWriteListener listener);
+void mem_watch_writes(const void* base, u64 size);
+
+// Ends the watches overlapping [base, base + size), reporting them.
+void mem_end_write_watches(const void* base, u64 size);
+
 // Changes the host protection used for future mappings in the range containing `addr`.
 void mem_set_range_protect(const void* addr, u32 protect);
 bool mem_is_tracked(const void* addr);

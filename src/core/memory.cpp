@@ -45,6 +45,12 @@ typedef BOOL(WINAPI* UnmapViewOfFile2Fn)(HANDLE, PVOID, ULONG);
 
 #define MAX_MAPPING_LISTENERS 4
 
+// A frame mapped at more than one address: the addresses after the first (see frame_va).
+struct FrameAlias {
+    u32 id;
+    u64 va;
+};
+
 struct MemoryState {
     VirtualAlloc2Fn virtual_alloc2;
     MapViewOfFile3Fn map_view3;
@@ -81,6 +87,13 @@ struct MemoryState {
 
     MemMappingListener mapping_listeners[MAX_MAPPING_LISTENERS];
     volatile long mapping_listener_count;
+
+    // Where frames are mapped, for write watches: per frame ID the first address showing it (0: none),
+    // further addresses in `aliases`, sorted by ID. Range lock held.
+    u64* frame_va;
+    FrameAlias* aliases;
+    u32 alias_count;
+    u32 alias_capacity;
 };
 
 static MemoryState g_mem;
@@ -134,7 +147,7 @@ bool mem_init(u64 physical_bytes) {
         }
     }
     u64 words = (g_mem.total_pages + 63) / 64;
-    u64 table_bytes = words * 8 * 3 + g_mem.total_pages * 4 * 2;
+    u64 table_bytes = words * 8 * 3 + g_mem.total_pages * 4 * 2 + g_mem.total_pages * 8;
     u8* tables = (u8*)VirtualAlloc(nullptr, table_bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     if (!tables) {
         LOG_E("memory", "cannot allocate page frame tables (%lu)", GetLastError());
@@ -145,6 +158,7 @@ bool mem_init(u64 physical_bytes) {
     g_mem.dirty_bitmap = g_mem.real_bitmap + words;
     g_mem.id_to_real = (u32*)(g_mem.dirty_bitmap + words);
     g_mem.real_to_id = g_mem.id_to_real + g_mem.total_pages;
+    g_mem.frame_va = (u64*)(g_mem.real_to_id + g_mem.total_pages);
     memset(g_mem.id_to_real, 0xFF, g_mem.total_pages * 4);
     // Frame 0 is never handed out: titles map page number 0 where they want no page (see
     // map_span_locked), so it must not name a frame.
@@ -411,6 +425,87 @@ static u32 mapping_protect(const RangeSlot* s) {
     return prot;
 }
 
+// --- write watches -----------------------------------------------------------------------------------
+//
+// Watches are kept sorted by start and may overlap. A watch over aliases of a range reports the range
+// it was made for. Lock order: range lock, phys_lock, then the watch lock; the listener is called
+// with none held.
+
+struct WriteWatch {
+    u64 start;
+    u64 end;
+    u64 report_start; // what a write here reports
+    u64 report_end;
+};
+
+static struct {
+    WriteWatch* entries;
+    u32 count;
+    u32 capacity;
+    SRWLOCK lock;
+    MemWriteListener listener;
+} g_watches = {nullptr, 0, 0, SRWLOCK_INIT, nullptr};
+
+#define MAX_WATCH_SIZE    GiB(4) // bounds the look back for watches reaching an address
+#define HOST_PAGE_SIZE    4096u
+#define MAX_WATCH_PIECES  65536 // a range and its aliases, as contiguous pieces
+#define MAX_WATCH_REPORTS 16
+
+void mem_set_write_listener(MemWriteListener listener) {
+    g_watches.listener = listener;
+}
+
+static u32 watch_lower_bound(u64 start) {
+    u32 lo = 0, hi = g_watches.count;
+    while (lo < hi) {
+        u32 mid = lo + (hi - lo) / 2;
+        if (g_watches.entries[mid].start < start)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return lo;
+}
+
+// Gives the committed host pages of [start, end) protected `from` the protection `to`. Views are
+// separate allocations to VirtualProtect, so it goes region by region. VirtualProtect refuses caching
+// modifiers on views; without them, a view keeps the caching it was mapped with.
+static void reprotect(u64 start, u64 end, u32 from, u32 to) {
+    const u32 modifiers = PAGE_WRITECOMBINE | PAGE_NOCACHE;
+    u64 p = start & ~0xFFFull;
+    end = (end + 0xFFF) & ~0xFFFull;
+    while (p < end) {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (!VirtualQuery((const void*)p, &mbi, sizeof(mbi)))
+            break;
+        u64 region_end = (u64)mbi.BaseAddress + mbi.RegionSize;
+        u64 stop = region_end < end ? region_end : end;
+        DWORD old;
+        if (mbi.State == MEM_COMMIT && (mbi.Protect & ~modifiers) == from &&
+            !VirtualProtect((void*)p, stop - p, to, &old))
+            LOG_W_ONCE("memory", "cannot change the protection of %p (+0x%llx) for a write watch (%lu)",
+                       (void*)p, stop - p, GetLastError());
+        p = stop;
+    }
+}
+
+// Views and commits land with their range's protection: watched pages among them become read-only
+// again. Range lock held.
+static void reapply_watches(u64 start, u64 end) {
+    if (!g_watches.count)
+        return;
+    AcquireSRWLockShared(&g_watches.lock);
+    for (u32 i = watch_lower_bound(end); i-- > 0;) {
+        const WriteWatch& w = g_watches.entries[i];
+        if (w.start + MAX_WATCH_SIZE < start)
+            break; // nothing earlier reaches
+        if (w.end > start)
+            reprotect(w.start > start ? w.start : start, w.end < end ? w.end : end, PAGE_READWRITE,
+                      PAGE_READONLY);
+    }
+    ReleaseSRWLockShared(&g_watches.lock);
+}
+
 static void win_split(u8* va, u64 bytes) {
     if (!VirtualFree(va, bytes, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER))
         FATAL("splitting placeholder at %p+0x%llx failed (%lu)", va, bytes, GetLastError());
@@ -435,6 +530,7 @@ static void win_map(u8* va, u32 pfn, u32 pages, u32 protect) {
                               MEM_REPLACE_PLACEHOLDER, protect, nullptr, 0);
     if (v != va)
         FATAL("mapping frames 0x%x+%u at %p failed (%lu)", pfn, pages, va, GetLastError());
+    reapply_watches((u64)va, (u64)va + ((u64)pages << MEM_PAGE_SHIFT));
 }
 
 // Ensures a region boundary at `page`. A view that straddles it is unmapped, split and mapped
@@ -558,6 +654,249 @@ static u32 frame_at_locked(const RangeSlot* s, u32 page) {
     return g_mem.real_to_id[r.pfn + (page - r.first_page)];
 }
 
+// --- where frames are mapped ---------------------------------------------------------------------
+
+static u32 alias_lower_bound(u32 id) {
+    u32 lo = 0, hi = g_mem.alias_count;
+    while (lo < hi) {
+        u32 mid = lo + (hi - lo) / 2;
+        if (g_mem.aliases[mid].id < id)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return lo;
+}
+
+// Frame `id` is now mapped at `va` too. Range lock held exclusively.
+static void note_mapped(u32 id, u64 va) {
+    if (!g_mem.frame_va[id]) {
+        g_mem.frame_va[id] = va;
+        return;
+    }
+    if (g_mem.alias_count == g_mem.alias_capacity) {
+        u32 capacity = g_mem.alias_capacity ? g_mem.alias_capacity * 2 : 1024;
+        FrameAlias* grown = (FrameAlias*)realloc(g_mem.aliases, capacity * sizeof(FrameAlias));
+        if (!grown)
+            FATAL("out of memory tracking where frames are mapped");
+        g_mem.aliases = grown;
+        g_mem.alias_capacity = capacity;
+    }
+    u32 at = alias_lower_bound(id);
+    memmove(&g_mem.aliases[at + 1], &g_mem.aliases[at], (g_mem.alias_count - at) * sizeof(FrameAlias));
+    g_mem.aliases[at] = {id, va};
+    g_mem.alias_count++;
+}
+
+// Frame `id` is no longer mapped at `va`. Range lock held exclusively.
+static void note_unmapped(u32 id, u64 va) {
+    u32 at = alias_lower_bound(id);
+    if (g_mem.frame_va[id] == va) {
+        // The first further address, if any, becomes the first.
+        if (at < g_mem.alias_count && g_mem.aliases[at].id == id) {
+            g_mem.frame_va[id] = g_mem.aliases[at].va;
+        } else {
+            g_mem.frame_va[id] = 0;
+            return;
+        }
+    } else {
+        while (at < g_mem.alias_count && g_mem.aliases[at].id == id && g_mem.aliases[at].va != va)
+            at++;
+        if (at == g_mem.alias_count || g_mem.aliases[at].id != id)
+            return;
+    }
+    memmove(&g_mem.aliases[at], &g_mem.aliases[at + 1], (g_mem.alias_count - at - 1) * sizeof(FrameAlias));
+    g_mem.alias_count--;
+}
+
+// --- write watch API ---------------------------------------------------------------------------------
+
+struct WatchReport {
+    u64 start;
+    u64 end;
+};
+
+// Adds [start, end) to the pieces to watch for a range, extending the last piece where it continues it.
+// The memory one watch covers: the range and the other addresses showing its frames, as contiguous
+// pieces. Usually a few; pages of a pool mapped elsewhere in any order can make many.
+struct WatchPieces {
+    WriteWatch local[16];
+    WriteWatch* items;
+    u32 count;
+    u32 capacity;
+};
+
+// Protection is per host page, so pieces cover whole pages: a write anywhere in a protected page finds
+// the watch that protected it (small textures share pages).
+static void add_piece(WatchPieces* p, u64 start, u64 end, u64 report_start, u64 report_end) {
+    start &= ~(u64)(HOST_PAGE_SIZE - 1);
+    end = ALIGN_UP(end, (u64)HOST_PAGE_SIZE);
+    if (p->count && p->items[p->count - 1].end >= start && p->items[p->count - 1].start <= start) {
+        if (end > p->items[p->count - 1].end)
+            p->items[p->count - 1].end = end;
+        return;
+    }
+    if (p->count == p->capacity) {
+        u32 capacity = p->capacity * 2;
+        WriteWatch* grown =
+            capacity <= MAX_WATCH_PIECES ? (WriteWatch*)malloc(capacity * sizeof(WriteWatch)) : nullptr;
+        if (!grown) {
+            LOG_W_ONCE("memory",
+                       "memory at %p shows at too many addresses; writes through some aren't watched",
+                       (void*)report_start);
+            return;
+        }
+        memcpy(grown, p->items, p->count * sizeof(WriteWatch));
+        if (p->items != p->local)
+            free(p->items);
+        p->items = grown;
+        p->capacity = capacity;
+    }
+    p->items[p->count++] = {start, end, report_start, report_end};
+}
+
+void mem_watch_writes(const void* base, u64 size) {
+    u64 start = (u64)base, end = start + size;
+    if (!size || size > MAX_WATCH_SIZE)
+        return;
+    AcquireSRWLockShared(&g_mem.range_lock);
+    RangeSlot* s = find_range_locked(base);
+    if (!s || (const u8*)end > s->info.base + s->info.size) {
+        ReleaseSRWLockShared(&g_mem.range_lock);
+        return; // not title memory we track
+    }
+    WatchPieces pieces;
+    pieces.items = pieces.local;
+    pieces.count = 0;
+    pieces.capacity = ARRAY_COUNT(pieces.local);
+    add_piece(&pieces, start, end, start, end);
+    if ((s->info.flags & MEM_RANGE_PLACEHOLDER) && g_mem.alias_count) {
+        // Other addresses showing the same frames, page by page.
+        AcquireSRWLockShared(&g_mem.phys_lock);
+        u32 first = (u32)((start - (u64)s->info.base) >> MEM_PAGE_SHIFT);
+        u32 last = (u32)((end - (u64)s->info.base + MEM_PAGE_SIZE - 1) >> MEM_PAGE_SHIFT);
+        for (u32 page = first; page < last; page++) {
+            u32 id = frame_at_locked(s, page);
+            if (id == MEM_INVALID_PFN)
+                continue;
+            u64 page_va_here = (u64)page_va(s, page);
+            u64 lo = start > page_va_here ? start : page_va_here;
+            u64 hi = end < page_va_here + MEM_PAGE_SIZE ? end : page_va_here + MEM_PAGE_SIZE;
+            u64 va = g_mem.frame_va[id];
+            if (va && va != page_va_here)
+                add_piece(&pieces, va + (lo - page_va_here), va + (hi - page_va_here), start, end);
+            for (u32 a = alias_lower_bound(id); a < g_mem.alias_count && g_mem.aliases[a].id == id; a++) {
+                va = g_mem.aliases[a].va;
+                if (va != page_va_here)
+                    add_piece(&pieces, va + (lo - page_va_here), va + (hi - page_va_here), start, end);
+            }
+        }
+        ReleaseSRWLockShared(&g_mem.phys_lock);
+    }
+    AcquireSRWLockExclusive(&g_watches.lock);
+    for (u32 k = 0; k < pieces.count; k++) {
+        const WriteWatch& w = pieces.items[k];
+        u32 at = watch_lower_bound(w.start);
+        bool known = false;
+        for (u32 i = at; i < g_watches.count && g_watches.entries[i].start == w.start && !known; i++)
+            known = g_watches.entries[i].end == w.end &&
+                    g_watches.entries[i].report_start == w.report_start &&
+                    g_watches.entries[i].report_end == w.report_end;
+        if (!known) {
+            if (g_watches.count == g_watches.capacity) {
+                u32 capacity = g_watches.capacity ? g_watches.capacity * 2 : 256;
+                WriteWatch* grown = (WriteWatch*)realloc(g_watches.entries, capacity * sizeof(WriteWatch));
+                if (!grown)
+                    FATAL("out of memory for write watches");
+                g_watches.entries = grown;
+                g_watches.capacity = capacity;
+            }
+            memmove(&g_watches.entries[at + 1], &g_watches.entries[at],
+                    (g_watches.count - at) * sizeof(WriteWatch));
+            g_watches.entries[at] = w;
+            g_watches.count++;
+        }
+        // Listed first: a write racing with this finds the watch once the lock is free.
+        reprotect(w.start, w.end, PAGE_READWRITE, PAGE_READONLY);
+    }
+    ReleaseSRWLockExclusive(&g_watches.lock);
+    ReleaseSRWLockShared(&g_mem.range_lock);
+    if (pieces.items != pieces.local)
+        free(pieces.items);
+}
+
+// Ends the watches overlapping [lo, hi), and those overlapping them in turn (their pages become
+// writable together), and collects what they report. Watch lock held exclusively.
+static u32 end_watches_locked(u64 lo, u64 hi, WatchReport* reports) {
+    u32 report_count = 0;
+    u64 ended_lo = lo, ended_hi = hi;
+    bool any = false;
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (u32 i = watch_lower_bound(ended_hi); i-- > 0;) {
+            const WriteWatch w = g_watches.entries[i];
+            if (w.start + MAX_WATCH_SIZE < ended_lo)
+                break; // nothing earlier reaches
+            if (w.end <= ended_lo)
+                continue;
+            ended_lo = w.start < ended_lo ? w.start : ended_lo;
+            ended_hi = w.end > ended_hi ? w.end : ended_hi;
+            memmove(&g_watches.entries[i], &g_watches.entries[i + 1],
+                    (g_watches.count - i - 1) * sizeof(WriteWatch));
+            g_watches.count--;
+            any = changed = true;
+            bool known = false;
+            for (u32 r = 0; r < report_count && !known; r++)
+                known = reports[r].start == w.report_start && reports[r].end == w.report_end;
+            if (known)
+                continue;
+            if (report_count < MAX_WATCH_REPORTS) {
+                reports[report_count++] = {w.report_start, w.report_end};
+            } else { // too many to list: the last one grows to cover the rest
+                WatchReport& last = reports[MAX_WATCH_REPORTS - 1];
+                last.start = w.report_start < last.start ? w.report_start : last.start;
+                last.end = w.report_end > last.end ? w.report_end : last.end;
+            }
+        }
+    }
+    if (any)
+        reprotect(ended_lo, ended_hi, PAGE_READONLY, PAGE_READWRITE);
+    return report_count;
+}
+
+static void report_writes(const WatchReport* reports, u32 count) {
+    for (u32 i = 0; i < count && g_watches.listener; i++)
+        g_watches.listener(reports[i].start, reports[i].end - reports[i].start);
+}
+
+void mem_end_write_watches(const void* base, u64 size) {
+    if (!g_watches.count || !size)
+        return;
+    WatchReport reports[MAX_WATCH_REPORTS];
+    AcquireSRWLockExclusive(&g_watches.lock);
+    u32 count = end_watches_locked((u64)base, (u64)base + size, reports);
+    ReleaseSRWLockExclusive(&g_watches.lock);
+    report_writes(reports, count);
+}
+
+static bool access_allowed(const void* addr, ULONG_PTR access);
+
+// A write fault: if a watch made the page read-only, it ends and the write is retried. A write that
+// faulted while another thread was ending the watch finds the page writable and is retried too.
+static bool end_watch_on_write(u64 addr) {
+    if (!g_watches.count)
+        return false;
+    WatchReport reports[MAX_WATCH_REPORTS];
+    u64 page = addr & ~(u64)(HOST_PAGE_SIZE - 1);
+    AcquireSRWLockExclusive(&g_watches.lock);
+    u32 count = end_watches_locked(page, page + HOST_PAGE_SIZE, reports);
+    ReleaseSRWLockExclusive(&g_watches.lock);
+    if (!count)
+        return access_allowed((const void*)addr, 1);
+    report_writes(reports, count);
+    return true;
+}
+
 bool mem_frames_at(const void* va, u64 count, u64* pfns) {
     AcquireSRWLockShared(&g_mem.range_lock);
     RangeSlot* s = find_range_locked(va);
@@ -611,6 +950,7 @@ void mem_add_mapping_listener(MemMappingListener listener) {
 }
 
 static void notify_mapping_changed(const u8* base, u64 size) {
+    mem_end_write_watches(base, size); // other frames there now
     long n = g_mem.mapping_listener_count;
     for (long i = 0; i < n; i++)
         g_mem.mapping_listeners[i](base, size);
@@ -907,8 +1247,10 @@ static bool commit_lazy_locked(const RangeSlot* s, const u8* addr, u64 size) {
     u8* hi = (u8*)ALIGN_UP((uptr)(addr + size), LAZY_COMMIT_GRANULE);
     lo = lo > s->info.base ? lo : s->info.base;
     hi = hi < range_end ? hi : (u8*)range_end;
-    if (VirtualAlloc(lo, (u64)(hi - lo), MEM_COMMIT, mapping_protect(s)))
+    if (VirtualAlloc(lo, (u64)(hi - lo), MEM_COMMIT, mapping_protect(s))) {
+        reapply_watches((u64)lo, (u64)hi); // committing pages already there resets their protection
         return true;
+    }
     LOG_E("memory", "cannot commit title memory %p+0x%llx (%lu)", lo, (u64)(hi - lo), GetLastError());
     return false;
 }
@@ -953,6 +1295,8 @@ static LONG CALLBACK on_access_fault(EXCEPTION_POINTERS* ep) {
     if (e->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || e->NumberParameters < 2)
         return EXCEPTION_CONTINUE_SEARCH;
     const u8* addr = (const u8*)e->ExceptionInformation[1];
+    if (e->ExceptionInformation[0] == 1 && end_watch_on_write((u64)addr))
+        return EXCEPTION_CONTINUE_EXECUTION;
     AcquireSRWLockExclusive(&g_mem.range_lock);
     RangeSlot* s = find_range_locked(addr);
     bool backed = false;
@@ -998,12 +1342,21 @@ static bool map_span_locked(void* va, u64 count, const u64* pfns) {
         memset(s->pending, 0xFF, (u64)range_pages(s) * sizeof(u32));
     }
     // Whatever was mapped there goes; the new frames wait for their first touch.
+    AcquireSRWLockShared(&g_mem.phys_lock);
+    for (u64 i = 0; i < count; i++) {
+        u32 old = frame_at_locked(s, first + (u32)i);
+        if (old != MEM_INVALID_PFN)
+            note_unmapped(old, (u64)page_va(s, first + (u32)i));
+    }
+    ReleaseSRWLockShared(&g_mem.phys_lock);
     unmap_run(s, first, (u32)count);
     for (u64 i = 0; s->pending && i < count; i++) {
         // Titles release slots by mapping page number 0 over them (console page numbers start
         // above it), so 0 unmaps like a missing array.
         bool frame = pfns && pfns[i] != MEM_INVALID_PFN && pfns[i] != 0;
         s->pending[first + i] = frame ? (u32)(pfns[i] >> MEM_PAGE_NUMBER_SHIFT) : MEM_INVALID_PFN;
+        if (frame)
+            note_mapped(s->pending[first + i], (u64)page_va(s, first + (u32)i));
     }
     return true;
 }
@@ -1072,6 +1425,13 @@ bool mem_release(void* base) {
         return false;
     }
     if (s->info.flags & MEM_RANGE_PLACEHOLDER) {
+        AcquireSRWLockShared(&g_mem.phys_lock);
+        for (u32 p = 0; p < range_pages(s); p++) {
+            u32 id = frame_at_locked(s, p);
+            if (id != MEM_INVALID_PFN)
+                note_unmapped(id, (u64)page_va(s, p));
+        }
+        ReleaseSRWLockShared(&g_mem.phys_lock);
         // Each region is one placeholder or one view, so each is released exactly once. Unmapping
         // a view without MEM_PRESERVE_PLACEHOLDER frees its address space as well.
         bool owns = (s->info.flags & MEM_RANGE_OWNS_PAGES) != 0;

@@ -360,6 +360,115 @@ static void test_gpu_section_ranges() {
     CHECK(range_is_free(base, size));
 }
 
+static u32 g_write_reports = 0;
+static u64 g_write_base = 0, g_write_size = 0;
+
+static void on_write(u64 base, u64 size) {
+    g_write_reports++;
+    g_write_base = base;
+    g_write_size = size;
+}
+
+static bool page_writable(const void* p) {
+    MEMORY_BASIC_INFORMATION mbi;
+    return VirtualQuery(p, &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT &&
+           (mbi.Protect & 0xFF) == PAGE_READWRITE;
+}
+
+// Write watches: reads pass and the first write reports the watched range, also through another
+// address showing the same frames; watches survive views being remapped and pages being backed or
+// committed, and end when other frames are mapped there.
+static void test_write_watches() {
+    mem_set_write_listener(on_write);
+    MemAddressLimits limits = {};
+    u8* a = (u8*)mem_reserve_placeholder(4 * PAGE, limits, 0, PAGE_READWRITE, 0);
+    u8* b = (u8*)mem_reserve_placeholder(4 * PAGE, limits, 0, PAGE_READWRITE, 0);
+    CHECK(a && b);
+    if (!a || !b)
+        return;
+    u64 frames[3];
+    CHECK(mem_physical_alloc(3, frames));
+    CHECK(mem_map_physical(a, 2, frames));        // a: frames 0, 1 (pending until touched)
+    CHECK(mem_map_physical(b + PAGE, 2, frames)); // b: the same frames, one page further
+    volatile u8* pa = a;
+    volatile u8* pb = b;
+
+    mem_watch_writes(a, 2 * PAGE); // over pending pages: protected once they are backed
+    CHECK(pa[100] == 0);           // a read backs the page, which comes up read-only
+    CHECK(!page_writable(a));
+    CHECK(g_write_reports == 0);
+    pa[PAGE + 5] = 1; // a write backs and faults once more; reported
+    CHECK(g_write_reports == 1 && g_write_base == (u64)a && g_write_size == 2 * PAGE);
+    CHECK(pa[PAGE + 5] == 1 && page_writable(a));
+
+    // Through the alias.
+    mem_watch_writes(a, 2 * PAGE);
+    CHECK(pb[PAGE + 7] == 0);
+    CHECK(!page_writable(b + PAGE));
+    pb[2 * PAGE + 9] = 2; // frame 1 through b
+    CHECK(g_write_reports == 2 && g_write_base == (u64)a && g_write_size == 2 * PAGE);
+    CHECK(pa[PAGE + 9] == 2);
+    mem_end_write_watches(a, 2 * PAGE); // the watch through a itself is still there
+    CHECK(g_write_reports == 3 && page_writable(a));
+
+    // A view remapped over the same frames keeps the watch; other frames end it.
+    g_write_reports = 0;
+    mem_watch_writes(a, PAGE);
+    CHECK(mem_map_physical(a + PAGE, 1, &frames[2])); // splits a's view next to the watch
+    CHECK(g_write_reports == 0);
+    CHECK(!page_writable(a));
+    CHECK(mem_map_physical(a, 1, &frames[2]));
+    CHECK(g_write_reports == 1 && g_write_base == (u64)a);
+    CHECK(mem_release(a));
+    CHECK(mem_release(b));
+    mem_physical_free(3, frames);
+    g_write_reports = 0;
+
+    // Pool pages shown elsewhere in another order: one piece per page, all watched.
+    const u32 n = 20;
+    u8* c = (u8*)mem_reserve_placeholder(n * PAGE, limits, 0, PAGE_READWRITE, 0);
+    u8* d = (u8*)mem_reserve_placeholder(n * PAGE, limits, 0, PAGE_READWRITE, 0);
+    u64 pool[n], reversed[n];
+    CHECK(c && d && mem_physical_alloc(n, pool));
+    if (c && d) {
+        for (u32 i = 0; i < n; i++)
+            reversed[i] = pool[n - 1 - i];
+        CHECK(mem_map_physical(c, n, pool));
+        CHECK(mem_map_physical(d, n, reversed));
+        mem_prepare(c, n * PAGE);
+        mem_prepare(d, n * PAGE);
+        mem_watch_writes(c, n * PAGE);
+        CHECK(!page_writable(d) && !page_writable(d + (n - 1) * PAGE));
+        ((volatile u8*)d)[3] = 9; // pool page n - 1, the last of c
+        CHECK(g_write_reports == 1 && g_write_base == (u64)c && g_write_size == n * PAGE);
+        CHECK(c[(n - 1) * PAGE + 3] == 9);
+        mem_end_write_watches(c, n * PAGE);
+        CHECK(mem_release(c) && mem_release(d));
+        mem_physical_free(n, pool);
+    }
+    g_write_reports = 0;
+
+    // Section memory: committing a granule again keeps watched pages protected.
+    u8* gpu = (u8*)mem_alloc_virtual(nullptr, MiB(32), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE, limits,
+                                     MEM_RANGE_GPU, 0);
+    CHECK(gpu != nullptr);
+    if (gpu) {
+        gpu[MiB(3)] = 1;
+        mem_watch_writes(gpu + MiB(3), 4096);
+        mem_prepare(gpu + MiB(3), MiB(1)); // commits the granule again
+        CHECK(!page_writable(gpu + MiB(3)));
+        gpu[MiB(3) + 10] = 3;
+        CHECK(g_write_reports == 1 && g_write_base == (u64)gpu + MiB(3) && g_write_size == 4096);
+        // A write elsewhere in a protected host page (small textures share pages) is caught too.
+        gpu[MiB(5)] = 1;
+        mem_watch_writes(gpu + MiB(5), 0x400);
+        gpu[MiB(5) + 0xB00] = 4;
+        CHECK(g_write_reports == 2 && g_write_base == (u64)gpu + MiB(5) && g_write_size == 0x400);
+        CHECK(mem_release(gpu));
+    }
+    mem_set_write_listener(nullptr);
+}
+
 void test_xapu_decode();
 void test_xapu_convert();
 void test_xdsp();
@@ -380,6 +489,7 @@ int main() {
     test_lazy_backing();
     test_lazy_commit();
     test_gpu_section_ranges();
+    test_write_watches();
     test_xapu_decode();
     test_xapu_convert();
     test_xdsp();
