@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include "common/log.h"
+#include "gpu/gpu.h"
 #include "hle/d3d12/d3d12_objects.h"
 #include "hle/d3d12/d3d12_tables.h"
 #include "hle/d3d12/root_signature.h"
@@ -69,8 +70,44 @@ HRESULT WINAPI console_serialize_root_signature(const D3D12_ROOT_SIGNATURE_DESC*
 
 static void root_signature_destroy(void* object) {
     ConsoleRootSignature* rs = (ConsoleRootSignature*)object;
+    for (u32 i = 0; i < rs->variant_count; i++)
+        gpu_retire(rs->variants[i].desktop);
     if (rs->deserializer)
         rs->deserializer->Release();
+}
+
+static HRESULT create_desktop_signature(ConsoleRootSignature* rs, const SamplerSet* sets, u32 set_count,
+                                        ID3D12RootSignature** out);
+
+ID3D12RootSignature* console_root_signature_desktop(ConsoleRootSignature* rs, const SamplerSet* sets,
+                                                    u32 set_count) {
+    u64 key = 0xcbf29ce484222325ull; // FNV-1a over the sets
+    u32 samplers = 0;
+    for (u32 i = 0; i < set_count; i++) {
+        samplers += sets[i].count;
+        const u8* bytes[2] = {(const u8*)sets[i].samplers, (const u8*)&sets[i].visibility};
+        usize sizes[2] = {sets[i].count * sizeof(InlineSampler), sizeof(sets[i].visibility)};
+        for (u32 part = 0; part < 2; part++)
+            for (usize b = 0; b < sizes[part]; b++)
+                key = (key ^ bytes[part][b]) * 0x100000001b3ull;
+    }
+    if (!samplers)
+        return rs->desktop;
+    AcquireSRWLockExclusive(&rs->variant_lock);
+    ID3D12RootSignature* desktop = nullptr;
+    for (u32 i = 0; i < rs->variant_count && !desktop; i++)
+        if (rs->variants[i].key == key)
+            desktop = rs->variants[i].desktop;
+    if (!desktop) {
+        if (rs->variant_count == ROOT_MAX_SIGNATURE_VARIANTS)
+            LOG_W_ONCE("d3d12",
+                       "more than %d sets of inline samplers with one root signature; pipelines skipped",
+                       ROOT_MAX_SIGNATURE_VARIANTS);
+        else if (SUCCEEDED(create_desktop_signature(rs, sets, set_count, &desktop)))
+            rs->variants[rs->variant_count++] = {key, desktop};
+    }
+    ReleaseSRWLockExclusive(&rs->variant_lock);
+    return desktop;
 }
 
 void console_root_signature_init() {
@@ -129,8 +166,9 @@ static void console_layout(const D3D12_ROOT_SIGNATURE_DESC1& desc, ConsoleRootLa
 }
 
 // The desktop signature translated shaders use: user data as root constants, then the root
-// descriptors, the console's static samplers, and directly indexed heaps.
-static HRESULT create_desktop_signature(ConsoleDevice* device, ConsoleRootSignature* rs) {
+// descriptors, the console's static samplers, programs' inline samplers, and directly indexed heaps.
+static HRESULT create_desktop_signature(ConsoleRootSignature* rs, const SamplerSet* sets, u32 set_count,
+                                        ID3D12RootSignature** out) {
     const D3D12_ROOT_SIGNATURE_DESC1& desc = *rs->desc;
     // The user data image starts at s0; compute shaders put root parameters lower than graphics ones,
     // so the image covers the graphics layout, the longer one.
@@ -168,7 +206,7 @@ static HRESULT create_desktop_signature(ConsoleDevice* device, ConsoleRootSignat
               dwords);
         return E_INVALIDARG;
     }
-    D3D12_STATIC_SAMPLER_DESC1 samplers[64];
+    D3D12_STATIC_SAMPLER_DESC1 samplers[64 + 3 * SHADER_MAX_INLINE_SAMPLERS];
     u32 sampler_count = desc.NumStaticSamplers < 64 ? desc.NumStaticSamplers : 64;
     for (u32 i = 0; i < sampler_count; i++) {
         const D3D12_STATIC_SAMPLER_DESC& s = desc.pStaticSamplers[i];
@@ -179,6 +217,30 @@ static HRESULT create_desktop_signature(ConsoleDevice* device, ConsoleRootSignat
         d.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
         d.Flags = D3D12_SAMPLER_FLAG_NONE;
     }
+    u32 console_samplers = sampler_count;
+    for (u32 i = 0; i < set_count; i++) {
+        for (u32 k = 0; k < sets[i].count && sampler_count < ARRAY_COUNT(samplers); k++) {
+            const InlineSampler& in = sets[i].samplers[k];
+            D3D12_STATIC_SAMPLER_DESC1& d = samplers[sampler_count++];
+            d = {};
+            d.Filter = (D3D12_FILTER)in.filter;
+            d.AddressU = (D3D12_TEXTURE_ADDRESS_MODE)in.address[0];
+            d.AddressV = (D3D12_TEXTURE_ADDRESS_MODE)in.address[1];
+            d.AddressW = (D3D12_TEXTURE_ADDRESS_MODE)in.address[2];
+            d.MipLODBias = in.mip_bias;
+            d.MaxAnisotropy = in.max_anisotropy;
+            d.ComparisonFunc = (D3D12_COMPARISON_FUNC)in.comparison;
+            d.BorderColor = (D3D12_STATIC_BORDER_COLOR)in.border_color;
+            d.MinLOD = in.min_lod;
+            d.MaxLOD = in.max_lod;
+            d.ShaderRegister = k;
+            d.RegisterSpace = SHADER_INLINE_SAMPLER_SPACE;
+            d.ShaderVisibility = sets[i].visibility;
+            d.Flags =
+                in.unnormalized ? D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES : D3D12_SAMPLER_FLAG_NONE;
+        }
+    }
+    (void)console_samplers;
     D3D12_VERSIONED_ROOT_SIGNATURE_DESC versioned = {};
     versioned.Version = D3D_ROOT_SIGNATURE_VERSION_1_2;
     versioned.Desc_1_2.NumParameters = count;
@@ -198,8 +260,8 @@ static HRESULT create_desktop_signature(ConsoleDevice* device, ConsoleRootSignat
             error->Release();
         return hr;
     }
-    hr = device->desktop->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(),
-                                              IID_PPV_ARGS(&rs->desktop));
+    hr = gpu_device()->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(),
+                                           IID_PPV_ARGS(out));
     blob->Release();
     if (FAILED(hr))
         LOG_E("d3d12", "CreateRootSignature failed (0x%08lx)", (unsigned long)hr);
@@ -238,7 +300,8 @@ HRESULT console_create_root_signature(ConsoleDevice* device, const void* blob, u
     rs->deserializer = deserializer;
     rs->layout = layout;
     // Without a desktop signature the title still gets its object; draws using it are skipped.
-    if (SUCCEEDED(create_desktop_signature(device, rs)))
+    InitializeSRWLock(&rs->variant_lock);
+    if (SUCCEEDED(create_desktop_signature(rs, nullptr, 0, &rs->desktop)))
         console_private(rs)->desktop = rs->desktop; // the object owns it from here
     u32 constants = 0;
     for (u32 i = 0; i < rs->desc->NumParameters && i < ROOT_MAX_PARAMETERS; i++) {

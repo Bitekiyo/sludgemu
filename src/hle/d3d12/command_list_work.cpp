@@ -19,10 +19,23 @@ static D3D12_GPU_VIRTUAL_ADDRESS translate(u64 address, u64 size, GpuAddress* ou
 // translation is being built (or when it failed).
 static bool prepare(ConsoleCommandList* self, bool graphics) {
     ListState& s = self->state;
-    ID3D12PipelineState* desktop = console_pipeline_desktop(s.pipeline, graphics ? &s.outputs : nullptr);
+    ID3D12RootSignature* signature = nullptr;
+    PipelineOutputs outputs = s.outputs;
+    outputs.rect_list = s.topology == CONSOLE_TOPOLOGY_RECT_LIST;
+    ID3D12PipelineState* desktop =
+        console_pipeline_desktop(s.pipeline, graphics ? &outputs : nullptr, &signature);
     if (!desktop) {
         self->skipped_draws++;
         return false;
+    }
+    // Pipelines with inline samplers have a signature of their own; changing signatures drops the
+    // root arguments, which then go again.
+    u32 g = graphics ? 0 : 1;
+    if (signature != s.bound_signature[g]) {
+        graphics ? self->desktop->SetGraphicsRootSignature(signature)
+                 : self->desktop->SetComputeRootSignature(signature);
+        s.bound_signature[g] = signature;
+        s.user_data_dirty[g] = true;
     }
     if (desktop != s.bound) {
         self->desktop->SetPipelineState(desktop);

@@ -109,7 +109,7 @@ struct PipelineOutputs {
     u8 render_target_count;
     u8 depth_format;
     u8 sample_count;
-    u8 unused;
+    u8 rect_list; // drawn as console rectangle lists (geometry shader expansion)
 };
 
 // Root arguments: tables as desktop heap indices, root descriptors as desktop GPU addresses. They
@@ -136,10 +136,11 @@ struct ListState {
     ConsoleDescriptorHeap* heaps[2]; // bound shader-visible heaps: views, samplers
     RootArgs graphics;
     RootArgs compute;
-    bool user_data_dirty[2];        // graphics, compute: root arguments changed since the last flush
-    ConsolePipelineState* pipeline; // set by the title (not referenced: the title keeps it alive)
-    ID3D12PipelineState* bound;     // the desktop pipeline set on the desktop list
-    PipelineOutputs outputs;        // formats of the bound targets
+    bool user_data_dirty[2];                 // graphics, compute: root arguments changed since the last flush
+    ConsolePipelineState* pipeline;          // set by the title (not referenced: the title keeps it alive)
+    ID3D12PipelineState* bound;              // the desktop pipeline set on the desktop list
+    ID3D12RootSignature* bound_signature[2]; // graphics, compute: set on the desktop list
+    PipelineOutputs outputs;                 // formats of the bound targets
     D3D12_PRIMITIVE_TOPOLOGY topology;
     u32 vertex_buffer_mask;
     D3D12_VERTEX_BUFFER_VIEW vertex_buffers[D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT];
@@ -408,8 +409,9 @@ HRESULT console_create_command_signature(ConsoleDevice* device, const D3D12_COMM
 // A root signature. Translated shaders read the console's user data (the root arguments as they lie
 // in user SGPRs) from root constants, and root descriptors from root SRVs/UAVs; the desktop
 // signature has that layout (see shader/translate.h).
-#define ROOT_USER_DATA_SPACE      100 // root constants (b0) and root descriptors (t<n>/u<n>, n = parameter)
-#define ROOT_STATIC_SAMPLER_SPACE 102
+#define ROOT_USER_DATA_SPACE        100 // root constants (b0) and root descriptors (t<n>/u<n>, n = parameter)
+#define ROOT_STATIC_SAMPLER_SPACE   102
+#define ROOT_MAX_SIGNATURE_VARIANTS 16
 
 struct ConsoleRootSignature {
     ConsoleObjectHeader header;
@@ -423,7 +425,27 @@ struct ConsoleRootSignature {
     u8 user_dwords;                            // user data dwords in the desktop root constants
     u8 user_sgpr[ROOT_MAX_PARAMETERS];         // each parameter's first user SGPR
     s8 desktop_parameter[ROOT_MAX_PARAMETERS]; // root descriptors: their desktop root parameter
+
+    // Desktop signatures that also carry pipelines' inline samplers, by their samplers' hash.
+    SRWLOCK variant_lock;
+    u32 variant_count;
+    struct SignatureVariant {
+        u64 key;
+        ID3D12RootSignature* desktop;
+    } variants[ROOT_MAX_SIGNATURE_VARIANTS];
 };
+
+// Programs' inline samplers, for the stage that sees them.
+struct SamplerSet {
+    const InlineSampler* samplers;
+    u32 count;
+    D3D12_SHADER_VISIBILITY visibility;
+};
+
+// The desktop signature for pipelines whose programs have these inline samplers: the translated
+// signature itself without any. Nullptr (logged) if it can't be made.
+ID3D12RootSignature* console_root_signature_desktop(ConsoleRootSignature* rs, const SamplerSet* sets,
+                                                    u32 set_count);
 
 void console_root_signature_init();
 
@@ -489,6 +511,7 @@ struct PipelineVariant {
     PipelineOutputs outputs;
     volatile u32 state; // PipelineVariantState
     ID3D12PipelineState* desktop;
+    ID3D12RootSignature* signature; // the desktop signature it was made with (owned by the signature)
 };
 
 // A pipeline state: the console's packet for it (public; title code copies it into command lists)
@@ -526,7 +549,8 @@ HRESULT console_deserialize_pipeline_state(ConsoleDevice* device, bool compute,
 
 // The desktop pipeline for drawing (or dispatching) with `pso` to `outputs`, or nullptr while it is
 // being made or if it cannot be.
-ID3D12PipelineState* console_pipeline_desktop(ConsolePipelineState* pso, const PipelineOutputs* outputs);
+ID3D12PipelineState* console_pipeline_desktop(ConsolePipelineState* pso, const PipelineOutputs* outputs,
+                                              ID3D12RootSignature** signature);
 
 // Page pools (page_pool.cpp): title memory registered as a source of GPU page mapping copies.
 HRESULT console_register_page_pool(u64 address, u32 page_count, u32 flags, HANDLE* handle);

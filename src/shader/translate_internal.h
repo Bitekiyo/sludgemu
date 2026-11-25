@@ -54,7 +54,18 @@ struct TagState {
     // Registers loaded from a descriptor table at a known place: the descriptor's index in the table
     // (by heap slot), or NO_DESCRIPTOR. Decides the HLSL resource type from the table's ranges.
     u16 descriptor[128];
+    // SGPRs holding a value known at translation time (moved from constants).
+    u32 constant[128];
+    u64 constant_known[2];
 };
+
+inline bool sgpr_constant(const TagState& s, u32 reg, u32* value) {
+    reg &= 127;
+    if (!(s.constant_known[reg / 64] & (1ull << (reg % 64))))
+        return false;
+    *value = s.constant[reg];
+    return true;
+}
 
 #define NO_DESCRIPTOR 0xFFFF
 
@@ -94,7 +105,8 @@ struct Translator {
     bool needs_descriptor_info;
     bool uses_lds;
     bool wave32;
-    u64 root_used; // root descriptor parameters read
+    u64 root_used;       // root descriptor parameters read
+    u32 sampler_compare; // inline samplers used for comparisons, by index
 
     // Scratch strings for operand expressions (a ring: an expression stays valid for a while).
     char ring[32][320];

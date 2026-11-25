@@ -605,6 +605,10 @@ static void write_declarations(Translator& t, Text& h) {
     }
     if (t.needs_descriptor_info)
         h.put("ByteAddressBuffer g_descriptor_info : register(t0, space101);\n");
+    for (u32 i = 0; i < t.out->sampler_count; i++)
+        h.put("%s g_sampler%u : register(s%u, space%d);\n",
+              t.sampler_compare & (1u << i) ? "SamplerComparisonState" : "SamplerState", i, i,
+              SHADER_INLINE_SAMPLER_SPACE);
     if (t.uses_lds)
         h.put("groupshared uint g_lds[%u];\n", (info.lds_bytes ? info.lds_bytes : 65536) / 4);
     h.put("struct CbArray { uint4 c[4096]; };\n");

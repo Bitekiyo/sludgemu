@@ -142,11 +142,45 @@ static Tag tag_of(const TagState& s, const RdnaOperand& o, u32 part = 0) {
     return TAG_NONE;
 }
 
+// Every scalar write goes through here, which also forgets the register's constant value.
 static void set_tag(TagState& s, const RdnaOperand& o, u32 part, Tag t) {
-    if (o.kind == OPND_SGPR || (o.kind == OPND_SPECIAL && o.reg < 128 && o.reg != SRC_NULL))
-        s.sgpr[(o.reg + part) & 127] = t;
-    else if (o.kind == OPND_VGPR)
+    if (o.kind == OPND_SGPR || (o.kind == OPND_SPECIAL && o.reg < 128 && o.reg != SRC_NULL)) {
+        u32 reg = (o.reg + part) & 127;
+        s.sgpr[reg] = t;
+        s.constant_known[reg / 64] &= ~(1ull << (reg % 64));
+    } else if (o.kind == OPND_VGPR) {
         s.vgpr[(o.reg + part) & 255] = t;
+    }
+}
+
+// The value of an integer operand known at translation time: literals (zero-extended for 64-bit
+// operations), inline integers (sign-extended), and SGPRs holding constants.
+static bool constant_of(const TagState& s, const RdnaOperand& o, u32 part, u32* value) {
+    switch (o.kind) {
+    case OPND_LITERAL:
+        *value = part ? 0 : o.value;
+        return true;
+    case OPND_INLINE:
+        if (o.reg > SRC_INT_NEG_MAX)
+            return false; // float constants
+        {
+            s32 v = o.reg <= SRC_INT_MAX ? (s32)o.reg - SRC_ZERO : SRC_INT_MAX - (s32)o.reg;
+            *value = part ? (v < 0 ? 0xFFFFFFFFu : 0) : (u32)v;
+        }
+        return true;
+    case OPND_SGPR:
+        return sgpr_constant(s, o.reg + part, value);
+    default:
+        return false;
+    }
+}
+
+static void set_constant(TagState& s, const RdnaOperand& o, u32 part, u32 value) {
+    if (o.kind != OPND_SGPR)
+        return;
+    u32 reg = (o.reg + part) & 127;
+    s.constant[reg] = value;
+    s.constant_known[reg / 64] |= 1ull << (reg % 64);
 }
 
 static u32 descriptor_of(const TagState& s, const RdnaOperand& o, u32 part = 0) {
@@ -179,6 +213,7 @@ static Tag carried(Tag a, Tag b) {
 }
 
 void tags_transfer(const Translator& t, TagState& s, const RdnaInst& in) {
+    u32 value;
     switch (in.op) {
     case OP_S_MOV_B32:
     case OP_S_CMOV_B32:
@@ -189,14 +224,27 @@ void tags_transfer(const Translator& t, TagState& s, const RdnaInst& in) {
         set_descriptor(s, in.dst[0], 0, descriptor_of(s, in.src[0]));
         if (is_exec_or_vcc(in.src[0]))
             set_tag(s, in.dst[0], 0, make_tag(TAG_MASK, 0));
+        if (in.op == OP_S_MOV_B32 && constant_of(s, in.src[0], 0, &value))
+            set_constant(s, in.dst[0], 0, value);
         return;
     case OP_S_MOV_B64:
-    case OP_S_CMOV_B64:
+    case OP_S_CMOV_B64: {
+        u32 values[2];
+        bool constant = in.op == OP_S_MOV_B64 && constant_of(s, in.src[0], 0, &values[0]) &&
+                        constant_of(s, in.src[0], 1, &values[1]);
         for (u32 i = 0; i < 2; i++) {
             set_tag(s, in.dst[0], i,
                     mask_source(s, in.src[0]) ? make_tag(TAG_MASK, 0) : tag_of(s, in.src[0], i));
             set_descriptor(s, in.dst[0], i, descriptor_of(s, in.src[0], i));
+            if (constant)
+                set_constant(s, in.dst[0], i, values[i]);
         }
+        return;
+    }
+    case OP_S_MOVK_I32:
+        set_tag(s, in.dst[0], 0, TAG_NONE);
+        set_descriptor(s, in.dst[0], 0, NO_DESCRIPTOR);
+        set_constant(s, in.dst[0], 0, (u32)(s32)in.simm16);
         return;
     case OP_S_ADD_U32:
     case OP_S_ADD_I32:
@@ -312,6 +360,17 @@ static bool tags_merge(TagState& into, const TagState& from) {
             into.descriptor[i] = NO_DESCRIPTOR;
             changed = true;
         }
+    // Constants survive a join only where both paths agree.
+    for (u32 w = 0; w < 2; w++) {
+        u64 keep = into.constant_known[w] & from.constant_known[w];
+        for (u32 b = 0; b < 64; b++)
+            if ((keep & (1ull << b)) && into.constant[w * 64 + b] != from.constant[w * 64 + b])
+                keep &= ~(1ull << b);
+        if (keep != into.constant_known[w]) {
+            into.constant_known[w] = keep;
+            changed = true;
+        }
+    }
     return changed;
 }
 

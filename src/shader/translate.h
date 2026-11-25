@@ -99,6 +99,27 @@ struct ShaderInfo {
     u32 lds_bytes;
 };
 
+// A sampler built into the program: console code can sample with a sampler descriptor made from
+// constants (static samplers are compiled that way). Decoded to D3D12 terms (filter, address modes,
+// comparison and border are the D3D12 enumerations); the pipeline's desktop root signature carries it
+// as a static sampler.
+struct InlineSampler {
+    u32 filter;
+    u8 address[3];
+    u8 max_anisotropy;
+    u8 comparison;
+    u8 border_color;
+    bool unnormalized;
+    u8 unused[3];
+    f32 mip_bias;
+    f32 min_lod;
+    f32 max_lod;
+};
+
+#define SHADER_MAX_INLINE_SAMPLERS  16
+#define TABLE_REACH_UNKNOWN         0xFFFF
+#define SHADER_INLINE_SAMPLER_SPACE 103 // register s<i> holds inline sampler i
+
 // The translation's result: HLSL source plus what the pipeline needs to know about it.
 struct TranslatedShader {
     Text hlsl;
@@ -110,6 +131,11 @@ struct TranslatedShader {
     bool ps_discards;
     // Vertex shaders: the desktop input format of each element read (raw fetches read dwords).
     u32 element_format[SHADER_MAX_VERTEX_ELEMENTS];
+    u32 sampler_count;
+    InlineSampler samplers[SHADER_MAX_INLINE_SAMPLERS];
+    // Per root parameter: descriptor tables' slots the program loads from (one past the last), which
+    // can be more than the root signature declares; TABLE_REACH_UNKNOWN if not all at known places.
+    u16 table_reach[SHADER_MAX_ROOT_PARAMETERS];
     char error[160]; // why translation failed
 };
 

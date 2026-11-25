@@ -21,6 +21,7 @@
 
 #include "common/log.h"
 #include "gpu/gpu.h"
+#include "gpu/shader_programs.h"
 #include "hle/d3d12/barriers.h"
 #include "hle/d3d12/console_iids.h"
 #include "hle/d3d12/d3d12_tables.h"
@@ -116,7 +117,6 @@ static u64 desktop_address(u64 address, u64 size) {
 
 // Console topologies desktop D3D12 lacks (the triangle fan only on some GPUs).
 #define CONSOLE_TOPOLOGY_TRIANGLE_FAN 6
-#define CONSOLE_TOPOLOGY_RECT_LIST    17
 #define CONSOLE_TOPOLOGY_LINE_LOOP    18
 #define CONSOLE_TOPOLOGY_QUAD_LIST    19
 #define CONSOLE_TOPOLOGY_QUAD_STRIP   20
@@ -214,6 +214,19 @@ static u32 table_extent(const ConsoleRootParameter& p) {
 // The user data image translated shaders read: root arguments where the console puts them in user
 // SGPRs, descriptor tables as byte offsets into the desktop heaps. Root descriptors go to their own
 // desktop root parameters.
+// The slots of table parameter `index` the pipeline's programs read: what they load from, when that
+// reaches past the root signature's ranges (`declared`).
+static u32 table_reach(const ConsolePipelineState* pso, u32 index, u32 declared) {
+    u32 extent = declared;
+    for (u32 i = 0; pso && i < 2 && index < SHADER_MAX_ROOT_PARAMETERS; i++) {
+        const ShaderProgram* p = pso->programs[i];
+        if (p && p->state == PROGRAM_READY && p->table_reach[index] != TABLE_REACH_UNKNOWN &&
+            p->table_reach[index] > extent)
+            extent = p->table_reach[index];
+    }
+    return extent;
+}
+
 void list_flush_user_data(ConsoleCommandList* self, bool graphics) {
     const RootArgs& args = graphics ? self->state.graphics : self->state.compute;
     const ConsoleRootSignature* rs = args.signature;
@@ -234,10 +247,11 @@ void list_flush_user_data(ConsoleCommandList* self, bool graphics) {
         case ROOT_ARG_TABLE: {
             const ConsoleRootParameter& p = rs->layout.parameters[i];
             ConsoleDescriptorHeap* heap = self->state.heaps[p.sampler_table ? 1 : 0];
-            u32 desktop_first = heap ? list_place_table(self, heap, (u32)v, table_extent(p)) : ~0u;
+            u32 extent = table_reach(self->state.pipeline, i, table_extent(p));
+            u32 desktop_first = heap ? list_place_table(self, heap, (u32)v, extent) : ~0u;
             if (desktop_first != ~0u) {
-                console_descriptor_mirror(heap, (u32)v, table_extent(p), desktop_first);
-                list_note_table(self, heap, (u32)v, table_extent(p), desktop_first);
+                console_descriptor_mirror(heap, (u32)v, extent, desktop_first);
+                list_note_table(self, heap, (u32)v, extent, desktop_first);
             } else {
                 LOG_W_ONCE("d3d12", "descriptor table at slot %llu has no shader-visible place", v);
                 desktop_first = 0;
@@ -285,16 +299,13 @@ static void apply_state(ConsoleCommandList* self) {
         l->SetDescriptorHeaps(heap_count, heaps);
     if (s.bound)
         l->SetPipelineState(s.bound);
-    // Root arguments reach the new list with the next draw or dispatch.
-    if (s.compute.signature && s.compute.signature->desktop)
-        l->SetComputeRootSignature(s.compute.signature->desktop);
+    // Signatures and root arguments reach the new list with the next draw or dispatch.
+    s.bound_signature[0] = s.bound_signature[1] = nullptr;
     self->state.user_data_dirty[1] = true;
     if (s.predication)
         l->SetPredication(s.predication, s.predication_offset, s.predication_op);
     if (self->type != D3D12_COMMAND_LIST_TYPE_DIRECT)
         return;
-    if (s.graphics.signature && s.graphics.signature->desktop)
-        l->SetGraphicsRootSignature(s.graphics.signature->desktop);
     self->state.user_data_dirty[0] = true;
     if (s.topology != D3D_PRIMITIVE_TOPOLOGY_UNDEFINED)
         l->IASetPrimitiveTopology(desktop_topology(s.topology));
@@ -519,18 +530,16 @@ static void set_root_signature(RootArgs* args, ConsoleRootSignature* signature) 
 
 static void WINAPI list_set_compute_root_signature(ConsoleCommandList* self,
                                                    ConsoleRootSignature* signature) {
+    // The desktop signature goes with the next dispatch: it depends on the pipeline too.
     set_root_signature(&self->state.compute, signature);
     self->state.user_data_dirty[1] = true;
-    if (signature && signature->desktop)
-        self->desktop->SetComputeRootSignature(signature->desktop);
 }
 
 static void WINAPI list_set_graphics_root_signature(ConsoleCommandList* self,
                                                     ConsoleRootSignature* signature) {
+    // The desktop signature goes with the next draw: it depends on the pipeline too.
     set_root_signature(&self->state.graphics, signature);
     self->state.user_data_dirty[0] = true;
-    if (signature && signature->desktop)
-        self->desktop->SetGraphicsRootSignature(signature->desktop);
 }
 
 static bool record_root_arg(ConsoleCommandList* self, bool graphics, UINT index, RootArgKind kind,

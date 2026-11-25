@@ -403,15 +403,22 @@ static bool programs_failed(const ConsolePipelineState* pso) {
     return false;
 }
 
-static ID3D12PipelineState* create_graphics(const ConsolePipelineState* pso, const PipelineOutputs& o) {
+static ID3D12PipelineState* create_graphics(const ConsolePipelineState* pso, const PipelineOutputs& o,
+                                            ID3D12RootSignature* signature) {
     const PipelineFixedState& f = pso->fixed;
     const ShaderProgram* vs = pso->programs[0];
     const ShaderProgram* ps = pso->programs[1];
     D3D12_GRAPHICS_PIPELINE_STATE_DESC d = {};
-    d.pRootSignature = pso->root_signature->desktop;
+    d.pRootSignature = signature;
     d.VS = {vs->dxil, vs->dxil_size};
     if (ps)
         d.PS = {ps->dxil, ps->dxil_size};
+    if (o.rect_list) {
+        const D3D12_SHADER_BYTECODE* gs = shader_rect_list_gs(vs->vs_param_mask);
+        if (!gs)
+            return nullptr;
+        d.GS = *gs;
+    }
     d.BlendState = f.blend;
     d.SampleMask = f.sample_mask;
     d.RasterizerState = f.rasterizer;
@@ -452,10 +459,10 @@ static ID3D12PipelineState* create_graphics(const ConsolePipelineState* pso, con
     return desktop;
 }
 
-static ID3D12PipelineState* create_compute(const ConsolePipelineState* pso) {
+static ID3D12PipelineState* create_compute(const ConsolePipelineState* pso, ID3D12RootSignature* signature) {
     const ShaderProgram* cs = pso->programs[0];
     D3D12_COMPUTE_PIPELINE_STATE_DESC d = {};
-    d.pRootSignature = pso->root_signature->desktop;
+    d.pRootSignature = signature;
     d.CS = {cs->dxil, cs->dxil_size};
     ID3D12PipelineState* desktop = nullptr;
     HRESULT hr = g_device->CreateComputePipelineState(&d, IID_PPV_ARGS(&desktop));
@@ -469,14 +476,30 @@ static void build_variant(void* context) {
     VariantJob* job = (VariantJob*)context;
     ConsolePipelineState* pso = job->pso;
     PipelineVariant& v = pso->variants[job->index];
-    ID3D12PipelineState* desktop = pso->compute ? create_compute(pso) : create_graphics(pso, v.outputs);
+    // The programs' inline samplers go to the root signature, each stage's for that stage.
+    SamplerSet sets[2];
+    u32 set_count = 0;
+    for (u32 i = 0; i < 2; i++) {
+        const ShaderProgram* p = pso->programs[i];
+        if (p && p->sampler_count)
+            sets[set_count++] = {p->samplers, p->sampler_count,
+                                 pso->compute ? D3D12_SHADER_VISIBILITY_ALL
+                                 : i == 0     ? D3D12_SHADER_VISIBILITY_VERTEX
+                                              : D3D12_SHADER_VISIBILITY_PIXEL};
+    }
+    ID3D12RootSignature* signature = console_root_signature_desktop(pso->root_signature, sets, set_count);
+    ID3D12PipelineState* desktop = nullptr;
+    if (signature)
+        desktop = pso->compute ? create_compute(pso, signature) : create_graphics(pso, v.outputs, signature);
+    v.signature = signature;
     v.desktop = desktop;
     InterlockedExchange((volatile LONG*)&v.state, desktop ? VARIANT_READY : VARIANT_FAILED);
     console_release(pso);
     free(job);
 }
 
-ID3D12PipelineState* console_pipeline_desktop(ConsolePipelineState* pso, const PipelineOutputs* outputs) {
+ID3D12PipelineState* console_pipeline_desktop(ConsolePipelineState* pso, const PipelineOutputs* outputs,
+                                              ID3D12RootSignature** signature) {
     if (!pso || !pso->translated || !pso->root_signature || !pso->root_signature->desktop)
         return nullptr;
     if (!programs_ready(pso))
@@ -489,6 +512,7 @@ ID3D12PipelineState* console_pipeline_desktop(ConsolePipelineState* pso, const P
         PipelineVariant& v = pso->variants[i];
         if (memcmp(&v.outputs, &key, sizeof(key)) == 0) {
             ID3D12PipelineState* desktop = v.state == VARIANT_READY ? v.desktop : nullptr;
+            *signature = v.signature;
             ReleaseSRWLockShared(&pso->lock);
             return desktop;
         }
@@ -514,6 +538,7 @@ ID3D12PipelineState* console_pipeline_desktop(ConsolePipelineState* pso, const P
     v.outputs = key;
     v.state = VARIANT_BUILDING;
     v.desktop = nullptr;
+    v.signature = nullptr;
     ReleaseSRWLockExclusive(&pso->lock);
     VariantJob* job = (VariantJob*)malloc(sizeof(VariantJob));
     if (!job || !console_try_add_ref(pso)) {

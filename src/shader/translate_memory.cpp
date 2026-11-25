@@ -77,6 +77,22 @@ static bool emit_scalar_memory(Translator& t, const RdnaInst& in) {
     Tag lo = sgpr_tag(t, base), hi = sgpr_tag(t, base + 1);
 
     if (!buffer && tag_kind(lo) == TAG_HEAP) {
+        // How far into its table the program reads: console tables are plain memory, and programs may
+        // read past the ranges their root signature declares.
+        u32 parameter = tag_payload(lo) >> 1;
+        if (parameter < SHADER_MAX_ROOT_PARAMETERS) {
+            u32 slot = (tag_payload(lo) & 1) == HEAP_SAMPLERS ? 16 : 32;
+            u32 at = t.tags.descriptor[base & 127];
+            bool constant = in.src[1].kind == OPND_SPECIAL && in.src[1].reg == SRC_NULL;
+            u16& reach = t.out->table_reach[parameter];
+            if (at != NO_DESCRIPTOR && constant && in.mem.offset >= 0) {
+                u32 end = (at * slot + (u32)in.mem.offset + 4 * dwords + slot - 1) / slot;
+                if (reach != TABLE_REACH_UNKNOWN && end > reach)
+                    reach = (u16)(end < TABLE_REACH_UNKNOWN ? end : TABLE_REACH_UNKNOWN);
+            } else {
+                reach = TABLE_REACH_UNKNOWN;
+            }
+        }
         // Descriptors: each destination dword holds its own heap byte address.
         emit(t, "{ uint a_ = %s;", offset);
         t.depth++;
@@ -475,6 +491,73 @@ static bool emit_buffer(Translator& t, const RdnaInst& in) {
 
 // --- images ------------------------------------------------------------------------------------------
 
+// Samplers built from constants: the descriptor's fields in D3D12 terms. False (with the reason) for
+// what a desktop static sampler can't express.
+static bool decode_sampler(const u32 w[4], InlineSampler* out, const char** why) {
+    static const u8 k_address[8] = {1, 2, 3, 5, 4, 5, 4, 5}; // wrap, mirror, clamp, mirror once, border
+    memset(out, 0, sizeof(*out));
+    for (u32 a = 0; a < 3; a++)
+        out->address[a] = k_address[(w[0] >> (3 * a)) & 7];
+    u32 aniso_ratio = (w[0] >> 9) & 7;
+    u32 compare = (w[0] >> 12) & 7;
+    out->unnormalized = (w[0] >> 15) & 1;
+    u32 reduction = (w[0] >> 29) & 3;
+    out->min_lod = (f32)(w[1] & 0xFFF) / 256.0f;
+    out->max_lod = (f32)((w[1] >> 12) & 0xFFF) / 256.0f;
+    out->mip_bias = (f32)((s32)(w[2] << 18) >> 18) / 256.0f;
+    u32 mag = (w[2] >> 20) & 3, min = (w[2] >> 22) & 3, mip = (w[2] >> 26) & 3;
+    out->border_color = (u8)((w[3] >> 30) & 3);
+    if (out->border_color == 3) {
+        *why = "a border color from the border color table";
+        return false;
+    }
+    if (reduction == 3) {
+        *why = "an unknown reduction mode";
+        return false;
+    }
+    if (mag >= 2 || min >= 2)
+        out->filter = 0x55; // anisotropic
+    else
+        out->filter = (min == 1 ? 0x10 : 0) | (mag == 1 ? 0x4 : 0) | (mip == 2 ? 0x1 : 0);
+    if (compare)
+        out->filter |= 0x80;
+    if (reduction)
+        out->filter |= reduction == 1 ? 0x100 : 0x180; // minimum, maximum
+    out->comparison = (u8)(compare + 1);
+    out->max_anisotropy = (u8)(1u << (aniso_ratio > 4 ? 4 : aniso_ratio));
+    if (out->max_lod >= 15.99f)
+        out->max_lod = 3.402823466e+38f; // saturated: no limit
+    return true;
+}
+
+// The program's inline sampler for a descriptor, added on first use; -1 (failed) if impossible.
+static s32 inline_sampler(Translator& t, const RdnaInst& in, const u32 words[4], bool compare) {
+    InlineSampler s;
+    const char* why = nullptr;
+    if (!decode_sampler(words, &s, &why)) {
+        translator_fail(t, "%s at 0x%x with a constant sampler using %s", rdna_op_name(in.op), in.offset,
+                        why);
+        return -1;
+    }
+    TranslatedShader& out = *t.out;
+    u32 i = 0;
+    while (i < out.sampler_count && memcmp(&out.samplers[i], &s, sizeof(s)) != 0)
+        i++;
+    if (i == out.sampler_count) {
+        if (i == SHADER_MAX_INLINE_SAMPLERS) {
+            translator_fail(t, "more than %d constant samplers", SHADER_MAX_INLINE_SAMPLERS);
+            return -1;
+        }
+        out.samplers[out.sampler_count++] = s;
+        if (compare)
+            t.sampler_compare |= 1u << i;
+    } else if (((t.sampler_compare >> i) & 1) != (compare ? 1u : 0u)) {
+        translator_fail(t, "constant sampler %u used with and without comparison", i);
+        return -1;
+    }
+    return (s32)i;
+}
+
 struct ImageForm {
     bool sample, gather, load, store, mip, lod, bias, lod_zero, compare, grad, clamp, offset;
 };
@@ -624,13 +707,24 @@ static bool emit_image(Translator& t, const RdnaInst& in) {
     if (form.sample || form.gather) {
         u32 samp = in.src[2].reg;
         Tag stag = sgpr_tag(t, samp);
-        if (tag_kind(stag) != TAG_HEAP || (tag_payload(stag) & 1) != HEAP_SAMPLERS) {
+        u32 words[4];
+        bool literal = true;
+        for (u32 i = 0; i < 4; i++)
+            literal &= sgpr_constant(t.tags, samp + i, &words[i]);
+        if (literal) {
+            s32 index = inline_sampler(t, in, words, form.compare);
+            if (index < 0)
+                return false;
+            emit(t, "%s smp_ = g_sampler%d;", form.compare ? "SamplerComparisonState" : "SamplerState",
+                 index);
+        } else if (tag_kind(stag) == TAG_HEAP && (tag_payload(stag) & 1) == HEAP_SAMPLERS) {
+            emit(t, "%s smp_ = SamplerDescriptorHeap[%s >> 4];",
+                 form.compare ? "SamplerComparisonState" : "SamplerState", sgpr(t, samp));
+        } else {
             translator_fail(t, "%s at 0x%x with a sampler not from a sampler table", rdna_op_name(in.op),
                             in.offset);
             return false;
         }
-        emit(t, "%s smp_ = SamplerDescriptorHeap[%s >> 4];",
-             form.compare ? "SamplerComparisonState" : "SamplerState", sgpr(t, samp));
         const char* uv = float_vector(t, coord_regs, coords);
         if (form.gather) {
             static const char* const k_gather[4] = {"GatherRed", "GatherGreen", "GatherBlue", "GatherAlpha"};

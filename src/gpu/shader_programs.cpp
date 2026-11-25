@@ -122,6 +122,10 @@ static void build_program(Worker& w, ShaderProgram* p) {
                 p->vertex_element_mask = t.vertex_element_mask;
                 memcpy(p->element_format, t.element_format, sizeof(p->element_format));
                 p->ps_target_mask = t.ps_target_mask;
+                p->sampler_count = t.sampler_count;
+                memcpy(p->samplers, t.samplers, sizeof(p->samplers));
+                memcpy(p->table_reach, t.table_reach, sizeof(p->table_reach));
+                p->vs_param_mask = t.vs_param_mask;
                 state = PROGRAM_READY;
                 dump(p, t.hlsl.data, nullptr);
             }
@@ -168,6 +172,96 @@ static DWORD WINAPI worker_main(void* param) {
         else
             job.run(job.context);
     }
+}
+
+// --- rectangle lists ---------------------------------------------------------------------------------
+
+// Console rectangle lists give three corners per rectangle. The corner between the other two is the
+// one facing the longest edge (the diagonal), whatever the order; the fourth corner, and its
+// attributes, are the other two minus it. Drawn as a strip: the corner, its neighbours, the fourth.
+#define RECT_GS_MAX 64
+
+static struct {
+    SRWLOCK lock;
+    IDxcCompiler3* compiler;
+    u32 count;
+    struct {
+        u32 param_mask;
+        D3D12_SHADER_BYTECODE code;
+    } entries[RECT_GS_MAX];
+} g_rect = {SRWLOCK_INIT};
+
+static bool compile_rect_gs(u32 param_mask, D3D12_SHADER_BYTECODE* out) {
+    char hlsl[4096];
+    usize n = (usize)snprintf(hlsl, sizeof(hlsl), "struct V {\n    float4 position : SV_Position;\n");
+    for (u32 i = 0; i < 32; i++)
+        if (param_mask & (1u << i))
+            n += (usize)snprintf(hlsl + n, sizeof(hlsl) - n, "    float4 p%u : P%u;\n", i, i);
+    n += (usize)snprintf(hlsl + n, sizeof(hlsl) - n,
+                         "};\n[maxvertexcount(4)]\n"
+                         "void main(triangle V v[3], inout TriangleStream<V> stream) {\n"
+                         "    float2 a = v[0].position.xy / v[0].position.w;\n"
+                         "    float2 b = v[1].position.xy / v[1].position.w;\n"
+                         "    float2 c = v[2].position.xy / v[2].position.w;\n"
+                         "    float da = dot(b - c, b - c), db = dot(a - c, a - c), dc = dot(a - b, a - b);\n"
+                         "    uint k = da >= db && da >= dc ? 0 : (db >= dc ? 1 : 2);\n"
+                         "    V corner = v[k], p = v[(k + 1) %% 3], q = v[(k + 2) %% 3], r;\n"
+                         "    r.position = p.position + q.position - corner.position;\n");
+    for (u32 i = 0; i < 32; i++)
+        if (param_mask & (1u << i))
+            n += (usize)snprintf(hlsl + n, sizeof(hlsl) - n, "    r.p%u = p.p%u + q.p%u - corner.p%u;\n", i,
+                                 i, i, i);
+    n += (usize)snprintf(hlsl + n, sizeof(hlsl) - n,
+                         "    stream.Append(corner);\n    stream.Append(p);\n    stream.Append(q);\n"
+                         "    stream.Append(r);\n}\n");
+    if (n >= sizeof(hlsl))
+        return false;
+    if (!g_rect.compiler && FAILED(g_dxc_create(CLSID_DxcCompiler, IID_PPV_ARGS(&g_rect.compiler))))
+        return false;
+    DxcBuffer source = {hlsl, n, DXC_CP_UTF8};
+    const wchar_t* args[] = {L"-E", L"main", L"-T", L"gs_6_6", L"-O3", L"-Qstrip_debug", L"-Qstrip_reflect"};
+    IDxcResult* result = nullptr;
+    HRESULT status = E_FAIL;
+    if (SUCCEEDED(g_rect.compiler->Compile(&source, args, ARRAY_COUNT(args), nullptr, IID_PPV_ARGS(&result))))
+        result->GetStatus(&status);
+    IDxcBlob* object = nullptr;
+    if (SUCCEEDED(status))
+        result->GetOutput(DXC_OUT_OBJECT, IID_PPV_ARGS(&object), nullptr);
+    bool ok = false;
+    if (object && object->GetBufferSize()) {
+        void* code = malloc(object->GetBufferSize());
+        if (code) {
+            memcpy(code, object->GetBufferPointer(), object->GetBufferSize());
+            *out = {code, object->GetBufferSize()};
+            ok = true;
+        }
+    }
+    if (object)
+        object->Release();
+    if (result)
+        result->Release();
+    return ok;
+}
+
+const D3D12_SHADER_BYTECODE* shader_rect_list_gs(u32 param_mask) {
+    if (!g_ready)
+        return nullptr;
+    AcquireSRWLockExclusive(&g_rect.lock);
+    const D3D12_SHADER_BYTECODE* found = nullptr;
+    for (u32 i = 0; i < g_rect.count && !found; i++)
+        if (g_rect.entries[i].param_mask == param_mask)
+            found = &g_rect.entries[i].code;
+    if (!found && g_rect.count < RECT_GS_MAX) {
+        D3D12_SHADER_BYTECODE code;
+        if (compile_rect_gs(param_mask, &code)) {
+            g_rect.entries[g_rect.count] = {param_mask, code};
+            found = &g_rect.entries[g_rect.count++].code;
+        } else {
+            LOG_E("gpu", "cannot compile the rectangle list geometry shader for parameters 0x%x", param_mask);
+        }
+    }
+    ReleaseSRWLockExclusive(&g_rect.lock);
+    return found;
 }
 
 // --- the program table -------------------------------------------------------------------------------

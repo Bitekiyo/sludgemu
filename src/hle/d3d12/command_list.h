@@ -5,6 +5,9 @@
 // Shared by the command list sources: command_list.cpp (lifetime and state) and
 // command_list_work.cpp (draws, dispatches, copies, clears, queries).
 
+// Console-only primitive topology: three corners per rectangle.
+#define CONSOLE_TOPOLOGY_RECT_LIST 17
+
 // The desktop handle for a console GPU descriptor handle in one of the list's bound heaps.
 bool list_gpu_descriptor(const ConsoleCommandList* list, u64 handle, D3D12_GPU_DESCRIPTOR_HANDLE* out);
 
