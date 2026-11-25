@@ -7,6 +7,7 @@
 
 #include "common/log.h"
 #include "gpu/gpu.h"
+#include "hle/d3d12/barriers.h"
 #include "hle/d3d12/console_iids.h"
 #include "hle/d3d12/d3d12_objects.h"
 #include "hle/d3d12/d3d12_tables.h"
@@ -122,9 +123,8 @@ static HRESULT WINAPI device_create_placed_resource_x(ConsoleDevice* self, D3D12
                                                       void** out) {
     if (!desc)
         return E_INVALIDARG;
-    // Resource states predate the barrier layouts the resource keeps; the first barrier sets one.
     D3D12_RESOURCE_DESC1 d1 = console_desc1_from_desc(*desc);
-    return console_create_placed_resource(self, address, &d1, D3D12_BARRIER_LAYOUT_UNDEFINED, clear, iid,
+    return console_create_placed_resource(self, address, &d1, console_layout_from_state(state), clear, iid,
                                           out);
 }
 
@@ -179,13 +179,13 @@ static D3D12_RESOURCE_ALLOCATION_INFO* WINAPI device_get_resource_allocation_inf
 
 static HRESULT WINAPI device_create_committed_resource(ConsoleDevice* self, const D3D12_HEAP_PROPERTIES* heap,
                                                        D3D12_HEAP_FLAGS heap_flags,
-                                                       const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES,
+                                                       const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES state,
                                                        const D3D12_CLEAR_VALUE* clear, REFIID iid,
                                                        void** out) {
     if (!desc)
         return E_INVALIDARG;
     D3D12_RESOURCE_DESC1 d1 = console_desc1_from_desc(*desc);
-    return console_create_committed_resource(self, heap, heap_flags, &d1, D3D12_BARRIER_LAYOUT_UNDEFINED,
+    return console_create_committed_resource(self, heap, heap_flags, &d1, console_layout_from_state(state),
                                              clear, iid, out);
 }
 

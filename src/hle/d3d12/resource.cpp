@@ -56,9 +56,12 @@ static ID3D12Resource* create_texture(ConsoleResource* r) {
     const D3D12_CLEAR_VALUE* clear = r->has_clear_value && clear_allowed ? &r->clear_value : nullptr;
 
     ID3D12Resource* texture = nullptr;
-    HRESULT hr = gpu_device()->CreateCommittedResource3(&heap, D3D12_HEAP_FLAG_NONE, &desc,
-                                                        D3D12_BARRIER_LAYOUT_COMMON, clear, nullptr, 0,
-                                                        nullptr, IID_PPV_ARGS(&texture));
+    // The layout the title's first barrier will name. A texture created undefined has no contents
+    // to keep, so any layout serves.
+    D3D12_BARRIER_LAYOUT layout =
+        r->initial_layout == D3D12_BARRIER_LAYOUT_UNDEFINED ? D3D12_BARRIER_LAYOUT_COMMON : r->initial_layout;
+    HRESULT hr = gpu_device()->CreateCommittedResource3(&heap, D3D12_HEAP_FLAG_NONE, &desc, layout, clear,
+                                                        nullptr, 0, nullptr, IID_PPV_ARGS(&texture));
     if (FAILED(hr)) {
         LOG_E("d3d12",
               "cannot create the desktop texture for 0x%llx (dim %d, %llux%ux%u, mips %u, format %d, "

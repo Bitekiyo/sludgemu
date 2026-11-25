@@ -63,7 +63,11 @@ add_executable(sludgemu WIN32
     hle/d3d12/views.h
     hle/d3d12/views.cpp
     hle/d3d12/command_allocator.cpp
+    hle/d3d12/command_list.h
     hle/d3d12/command_list.cpp
+    hle/d3d12/command_list_work.cpp
+    hle/d3d12/barriers.h
+    hle/d3d12/barriers.cpp
     hle/d3d12/frame_pacing.h
     hle/d3d12/frame_pacing.cpp
     hle/dstorage/dstorage.cpp

@@ -42,6 +42,14 @@ void log_printf(LogLevel level, const char* channel, const char* fmt, ...);
 
 bool log_once_flag(volatile long* flag);
 
+// Logs a warning the first time this call site is reached, for paths that can repeat every frame.
+#define LOG_W_ONCE(ch, ...)                                                                                  \
+    do {                                                                                                     \
+        static volatile long s_logged_ = 0;                                                                  \
+        if (log_once_flag(&s_logged_))                                                                       \
+            LOG_W(ch, __VA_ARGS__);                                                                          \
+    } while (0)
+
 // For HLE functions that are knowingly incomplete. Logs once per call site, never silent.
 #define UNIMPLEMENTED(ch)                                                                                    \
     do {                                                                                                     \

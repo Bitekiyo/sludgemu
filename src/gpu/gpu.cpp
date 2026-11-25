@@ -1,5 +1,7 @@
 #include "gpu/gpu.h"
 
+#include <stdlib.h>
+
 #include "common/log.h"
 
 static GpuOptions g_options;
@@ -116,9 +118,132 @@ IDXGIFactory6* gpu_factory() {
     return g_factory;
 }
 
-// Nothing submits GPU work yet, so nothing can still be in use. Command submission replaces this
-// with fence-tracked deferred release.
+// --- submission and deferred release ----------------------------------------------------------------
+//
+// Each queue that runs translated work counts its submissions on a fence. A retired object waits
+// until every queue has finished what it had submitted when the object was retired.
+
+#define GPU_MAX_QUEUES 16
+
+struct GpuQueueSlot {
+    ID3D12CommandQueue* queue; // nullptr: free slot
+    ID3D12Fence* fence;
+    u64 submitted;
+};
+
+struct RetiredObject {
+    IUnknown* object;
+    u64 after[GPU_MAX_QUEUES]; // per queue: the submission that must complete first
+};
+
+static SRWLOCK g_submit_lock = SRWLOCK_INIT;
+static GpuQueueSlot g_queues[GPU_MAX_QUEUES];
+static RetiredObject* g_retired = nullptr;
+static u32 g_retired_count = 0;
+static u32 g_retired_capacity = 0;
+
+// Releases what no queue can still be using. Caller holds g_submit_lock.
+static void collect_locked() {
+    if (!g_retired_count)
+        return;
+    u64 completed[GPU_MAX_QUEUES];
+    for (u32 q = 0; q < GPU_MAX_QUEUES; q++)
+        completed[q] = g_queues[q].queue ? g_queues[q].fence->GetCompletedValue() : 0;
+    u32 kept = 0;
+    for (u32 i = 0; i < g_retired_count; i++) {
+        RetiredObject& r = g_retired[i];
+        bool done = true;
+        for (u32 q = 0; q < GPU_MAX_QUEUES && done; q++)
+            done = r.after[q] <= completed[q];
+        if (done)
+            r.object->Release();
+        else
+            g_retired[kept++] = r;
+    }
+    g_retired_count = kept;
+}
+
+u32 gpu_queue_register(ID3D12CommandQueue* queue) {
+    ID3D12Fence* fence = nullptr;
+    if (FAILED(gpu_device()->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)))) {
+        LOG_E("gpu", "cannot create a submission fence");
+        return GPU_NO_QUEUE;
+    }
+    AcquireSRWLockExclusive(&g_submit_lock);
+    u32 slot = GPU_NO_QUEUE;
+    for (u32 q = 0; q < GPU_MAX_QUEUES; q++) {
+        if (!g_queues[q].queue) {
+            g_queues[q] = {queue, fence, 0};
+            slot = q;
+            break;
+        }
+    }
+    ReleaseSRWLockExclusive(&g_submit_lock);
+    if (slot == GPU_NO_QUEUE) {
+        LOG_E("gpu", "more than %u command queues", GPU_MAX_QUEUES);
+        fence->Release();
+    }
+    return slot;
+}
+
+void gpu_queue_unregister(u32 slot) {
+    if (slot >= GPU_MAX_QUEUES)
+        return;
+    AcquireSRWLockExclusive(&g_submit_lock);
+    GpuQueueSlot q = g_queues[slot];
+    g_queues[slot] = {};
+    // Whatever waited on this queue now only waits for it to drain, which happens below.
+    for (u32 i = 0; i < g_retired_count; i++)
+        g_retired[i].after[slot] = 0;
+    ReleaseSRWLockExclusive(&g_submit_lock);
+    if (q.fence->GetCompletedValue() < q.submitted)
+        q.fence->SetEventOnCompletion(q.submitted, nullptr); // blocks until the queue is idle
+    q.fence->Release();
+}
+
+void gpu_queue_submitted(u32 slot) {
+    if (slot >= GPU_MAX_QUEUES)
+        return;
+    AcquireSRWLockExclusive(&g_submit_lock);
+    GpuQueueSlot& q = g_queues[slot];
+    q.queue->Signal(q.fence, ++q.submitted);
+    collect_locked();
+    ReleaseSRWLockExclusive(&g_submit_lock);
+}
+
 void gpu_retire(IUnknown* object) {
-    if (object)
-        object->Release();
+    if (!object)
+        return;
+    AcquireSRWLockExclusive(&g_submit_lock);
+    if (g_retired_count == g_retired_capacity) {
+        u32 capacity = g_retired_capacity ? g_retired_capacity * 2 : 256;
+        RetiredObject* grown = (RetiredObject*)realloc(g_retired, capacity * sizeof(RetiredObject));
+        if (!grown) {
+            // Out of memory: wait for the GPU rather than release something it may be using.
+            ReleaseSRWLockExclusive(&g_submit_lock);
+            LOG_E("gpu", "retire list full; waiting for the GPU to go idle");
+            gpu_wait_idle();
+            object->Release();
+            return;
+        }
+        g_retired = grown;
+        g_retired_capacity = capacity;
+    }
+    RetiredObject& r = g_retired[g_retired_count++];
+    r.object = object;
+    for (u32 q = 0; q < GPU_MAX_QUEUES; q++)
+        r.after[q] = g_queues[q].queue ? g_queues[q].submitted : 0;
+    collect_locked();
+    ReleaseSRWLockExclusive(&g_submit_lock);
+}
+
+void gpu_wait_idle() {
+    AcquireSRWLockExclusive(&g_submit_lock);
+    for (u32 q = 0; q < GPU_MAX_QUEUES; q++) {
+        GpuQueueSlot& s = g_queues[q];
+        if (s.queue && s.fence->GetCompletedValue() < s.submitted)
+            s.fence->SetEventOnCompletion(s.submitted, nullptr);
+    }
+    collect_locked();
+    ReleaseSRWLockExclusive(&g_submit_lock);
 }

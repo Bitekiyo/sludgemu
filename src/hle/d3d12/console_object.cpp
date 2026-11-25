@@ -4,6 +4,7 @@
 #include <stdlib.h>
 
 #include "common/log.h"
+#include "gpu/gpu.h"
 #include "loader/stubs.h"
 
 static void* g_device = nullptr;
@@ -39,8 +40,7 @@ static ULONG WINAPI object_release(void* self) {
         ConsolePrivate* priv = console_private(self);
         if (priv->klass->destroy)
             priv->klass->destroy(self);
-        if (priv->desktop)
-            priv->desktop->Release();
+        gpu_retire(priv->desktop); // the GPU may still be running work that uses it
         free(priv);
     }
     return (ULONG)refs;

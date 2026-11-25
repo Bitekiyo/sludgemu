@@ -38,6 +38,7 @@ struct ConsoleCommandQueue {
     D3D12_COMMAND_LIST_TYPE type;
 
     ID3D12CommandQueue* desktop;
+    u32 slot; // submission tracking (gpu_queue_register)
 };
 
 struct ConsoleFence {
@@ -46,11 +47,18 @@ struct ConsoleFence {
     ID3D12Fence1* desktop;
 };
 
+// The allocation callback lets titles supply console command buffer memory. Recording goes to
+// desktop command lists instead, so it is kept but never called.
+typedef void* (*ConsoleAllocatorCallback)(void* allocator, void* list, u32 xmem_type, usize size, u32 alignment,
+                                          u32 flags, u64 context);
+
 struct ConsoleCommandAllocator {
     ConsoleObjectHeader header;
 
     D3D12_COMMAND_LIST_TYPE type;
     ID3D12CommandAllocator* desktop;
+    ConsoleAllocatorCallback callback;
+    u64 callback_context;
 };
 
 // The command buffer write cursor of a console command list. Inlined title code writes packets only
@@ -64,6 +72,8 @@ struct ConsolePutBuffer {
     u32 reserved[64];
 };
 
+struct ConsoleDescriptorHeap;
+
 struct ConsoleCommandList {
     ConsoleObjectHeader header;
     D3D12_COMMAND_LIST_TYPE type;
@@ -73,7 +83,10 @@ struct ConsoleCommandList {
     u32 compute_root_packet_header[128];
     u32 graphics_pso_shadow[8]; // copy of the bound pipeline state's packet
 
-    ID3D12GraphicsCommandList7* desktop;
+    ID3D12GraphicsCommandList8* desktop;
+    bool recording;
+    bool pipeline_bound;                    // draws and dispatches have a desktop pipeline state
+    ConsoleDescriptorHeap* heaps[2]; // bound shader-visible heaps: views, samplers
 };
 
 struct ConsoleCommandListDesc {
@@ -171,6 +184,7 @@ struct ConsoleDescriptorHeap {
     D3D12_DESCRIPTOR_HEAP_TYPE desktop_type;
     ID3D12DescriptorHeap* cpu;     // CPU-only descriptors (every heap)
     ID3D12DescriptorHeap* visible; // shader-visible descriptors, or nullptr
+    u32 desktop_stride;
     u64 cpu_start;
     u64 visible_cpu_start;
     u64 visible_gpu_start;

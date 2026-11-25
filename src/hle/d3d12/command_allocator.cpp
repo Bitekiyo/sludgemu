@@ -16,8 +16,15 @@ static HRESULT WINAPI allocator_reset(ConsoleCommandAllocator* self) {
     return self->desktop->Reset();
 }
 
+static void WINAPI allocator_set_callback_x(ConsoleCommandAllocator* self, ConsoleAllocatorCallback callback,
+                                            UINT64 context) {
+    self->callback = callback;
+    self->callback_context = context;
+}
+
 static const ConsoleEntry k_allocator_impl[] = {
     CONSOLE_ENTRY(8, allocator_reset),
+    CONSOLE_ENTRY(9, allocator_set_callback_x),
 };
 
 void console_command_allocator_init() {

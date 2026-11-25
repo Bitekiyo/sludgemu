@@ -245,6 +245,7 @@ HRESULT console_create_descriptor_heap(ConsoleDevice* device, const D3D12_DESCRI
     heap->stride = stride;
     heap->desktop_count = d.NumDescriptors;
     heap->desktop_type = d.Type;
+    heap->desktop_stride = g_desktop_stride[d.Type];
     heap->cpu = cpu;
     heap->visible = visible;
     heap->cpu_start = cpu->GetCPUDescriptorHandleForHeapStart().ptr;

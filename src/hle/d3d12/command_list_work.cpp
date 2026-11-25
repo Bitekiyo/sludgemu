@@ -1,0 +1,323 @@
+// Console command list entries that do work: draws, dispatches, copies, clears, queries and memory
+// writes.
+
+#include "common/log.h"
+#include "hle/d3d12/command_list.h"
+
+static D3D12_GPU_VIRTUAL_ADDRESS translate(u64 address, u64 size, GpuAddress* out) {
+    if (!gpu_translate(address, size ? size : 1, out)) {
+        LOG_W_ONCE("d3d12", "GPU address 0x%llx (+%llu) is outside GPU-visible memory", address, size);
+        return 0;
+    }
+    return out->desktop_address;
+}
+
+// --- draws and dispatches ----------------------------------------------------------------------------
+
+// Without a translated pipeline state there is nothing to run.
+static bool can_run(ConsoleCommandList* self) {
+    if (!self->pipeline_bound)
+        LOG_W_ONCE("d3d12", "draws and dispatches are skipped until pipeline states are translated");
+    return self->pipeline_bound;
+}
+
+static void WINAPI list_draw_instanced(ConsoleCommandList* self, UINT vertices, UINT instances,
+                                       UINT first_vertex, UINT first_instance) {
+    if (can_run(self))
+        self->desktop->DrawInstanced(vertices, instances, first_vertex, first_instance);
+}
+
+static void WINAPI list_draw_indexed_instanced(ConsoleCommandList* self, UINT indices, UINT instances,
+                                               UINT first_index, INT base_vertex, UINT first_instance) {
+    if (can_run(self))
+        self->desktop->DrawIndexedInstanced(indices, instances, first_index, base_vertex, first_instance);
+}
+
+// An indexed draw with its own index buffer.
+static void WINAPI list_draw_indexed_x(ConsoleCommandList* self, UINT64 index_buffer, DXGI_FORMAT format,
+                                       UINT indices, UINT first_index) {
+    if (!can_run(self))
+        return;
+    u32 index_size = format == DXGI_FORMAT_R32_UINT ? 4 : 2;
+    GpuAddress a;
+    D3D12_INDEX_BUFFER_VIEW view;
+    view.SizeInBytes = (first_index + indices) * index_size;
+    view.BufferLocation = translate(index_buffer, view.SizeInBytes, &a);
+    view.Format = format;
+    self->desktop->IASetIndexBuffer(&view);
+    self->desktop->DrawIndexedInstanced(indices, 1, first_index, 0, 0);
+}
+
+static void WINAPI list_dispatch(ConsoleCommandList* self, UINT x, UINT y, UINT z) {
+    if (can_run(self))
+        self->desktop->Dispatch(x, y, z);
+}
+
+// The flags tune console wave launch.
+static void WINAPI list_dispatch_x(ConsoleCommandList* self, UINT x, UINT y, UINT z, UINT) {
+    list_dispatch(self, x, y, z);
+}
+
+static void WINAPI list_execute_indirect(ConsoleCommandList*, void*, UINT, void*, UINT64, void*, UINT64) {
+    LOG_W_ONCE("d3d12", "ExecuteIndirect is not translated yet; skipped");
+}
+
+// --- copies ------------------------------------------------------------------------------------------
+
+static void WINAPI list_copy_buffer_region(ConsoleCommandList* self, void* dst, UINT64 dst_offset, void* src,
+                                           UINT64 src_offset, UINT64 size) {
+    u64 dst_base, src_base;
+    ID3D12Resource* d = list_resource(dst, &dst_base);
+    ID3D12Resource* s = list_resource(src, &src_base);
+    if (!d || !s) {
+        LOG_W_ONCE("d3d12", "CopyBufferRegion with a buffer outside GPU-visible memory skipped");
+        return;
+    }
+    self->desktop->CopyBufferRegion(d, dst_base + dst_offset, s, src_base + src_offset, size);
+}
+
+// Buffer footprints move by where the console buffer starts in its desktop buffer.
+static bool copy_location(const D3D12_TEXTURE_COPY_LOCATION* in, D3D12_TEXTURE_COPY_LOCATION* out) {
+    *out = *in;
+    u64 base;
+    out->pResource = list_resource(in->pResource, &base);
+    if (!out->pResource)
+        return false;
+    if (in->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT)
+        out->PlacedFootprint.Offset += base;
+    return true;
+}
+
+static void WINAPI list_copy_texture_region(ConsoleCommandList* self, const D3D12_TEXTURE_COPY_LOCATION* dst,
+                                            UINT x, UINT y, UINT z, const D3D12_TEXTURE_COPY_LOCATION* src,
+                                            const D3D12_BOX* box) {
+    D3D12_TEXTURE_COPY_LOCATION d, s;
+    if (!copy_location(dst, &d) || !copy_location(src, &s)) {
+        LOG_W_ONCE("d3d12", "CopyTextureRegion with a resource without desktop backing skipped");
+        return;
+    }
+    self->desktop->CopyTextureRegion(&d, x, y, z, &s, box);
+}
+
+static void WINAPI list_copy_resource(ConsoleCommandList* self, void* dst, void* src) {
+    ConsoleResource* dr = (ConsoleResource*)dst;
+    u64 dst_base, src_base;
+    ID3D12Resource* d = list_resource(dst, &dst_base);
+    ID3D12Resource* s = list_resource(src, &src_base);
+    if (!d || !s) {
+        LOG_W_ONCE("d3d12", "CopyResource with a resource without desktop backing skipped");
+        return;
+    }
+    // Buffers share desktop buffers, so only their own bytes are copied.
+    if (dr->desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+        self->desktop->CopyBufferRegion(d, dst_base, s, src_base, dr->desc.Width);
+    else
+        self->desktop->CopyResource(d, s);
+}
+
+static void WINAPI list_resolve_subresource(ConsoleCommandList* self, void* dst, UINT dst_subresource,
+                                            void* src, UINT src_subresource, DXGI_FORMAT format) {
+    u64 base;
+    ID3D12Resource* d = list_resource(dst, &base);
+    ID3D12Resource* s = list_resource(src, &base);
+    if (d && s)
+        self->desktop->ResolveSubresource(d, dst_subresource, s, src_subresource, format);
+}
+
+static void WINAPI list_copy_memory_to_memory_x(ConsoleCommandList* self, UINT64 dst, UINT64 src, UINT64 size,
+                                                UINT) {
+    GpuAddress d, s;
+    if (translate(dst, size, &d) && translate(src, size, &s))
+        self->desktop->CopyBufferRegion(d.buffer, d.offset, s.buffer, s.offset, size);
+}
+
+// --- clears ------------------------------------------------------------------------------------------
+
+static void WINAPI list_clear_depth_stencil_view(ConsoleCommandList* self, D3D12_CPU_DESCRIPTOR_HANDLE view,
+                                                 D3D12_CLEAR_FLAGS flags, FLOAT depth, UINT8 stencil,
+                                                 UINT count, const D3D12_RECT* rects) {
+    D3D12_CPU_DESCRIPTOR_HANDLE d;
+    if (list_cpu_descriptor(view.ptr, 1, &d))
+        self->desktop->ClearDepthStencilView(d, flags, depth, stencil, count, rects);
+}
+
+static void WINAPI list_clear_render_target_view(ConsoleCommandList* self, D3D12_CPU_DESCRIPTOR_HANDLE view,
+                                                 const FLOAT color[4], UINT count, const D3D12_RECT* rects) {
+    D3D12_CPU_DESCRIPTOR_HANDLE d;
+    if (list_cpu_descriptor(view.ptr, 1, &d))
+        self->desktop->ClearRenderTargetView(d, color, count, rects);
+}
+
+// UAV clears name the view twice: in a bound shader-visible heap and in a CPU-only one.
+static bool uav_clear_args(ConsoleCommandList* self, D3D12_GPU_DESCRIPTOR_HANDLE gpu,
+                           D3D12_CPU_DESCRIPTOR_HANDLE cpu, void* resource,
+                           D3D12_GPU_DESCRIPTOR_HANDLE* out_gpu, D3D12_CPU_DESCRIPTOR_HANDLE* out_cpu,
+                           ID3D12Resource** out_resource) {
+    u64 base;
+    *out_resource = list_resource(resource, &base);
+    return *out_resource && list_gpu_descriptor(self, gpu.ptr, out_gpu) &&
+           list_cpu_descriptor(cpu.ptr, 1, out_cpu);
+}
+
+static void WINAPI list_clear_uav_uint(ConsoleCommandList* self, D3D12_GPU_DESCRIPTOR_HANDLE gpu,
+                                       D3D12_CPU_DESCRIPTOR_HANDLE cpu, void* resource, const UINT values[4],
+                                       UINT count, const D3D12_RECT* rects) {
+    D3D12_GPU_DESCRIPTOR_HANDLE g;
+    D3D12_CPU_DESCRIPTOR_HANDLE c;
+    ID3D12Resource* r;
+    if (uav_clear_args(self, gpu, cpu, resource, &g, &c, &r))
+        self->desktop->ClearUnorderedAccessViewUint(g, c, r, values, count, rects);
+}
+
+static void WINAPI list_clear_uav_float(ConsoleCommandList* self, D3D12_GPU_DESCRIPTOR_HANDLE gpu,
+                                        D3D12_CPU_DESCRIPTOR_HANDLE cpu, void* resource,
+                                        const FLOAT values[4], UINT count, const D3D12_RECT* rects) {
+    D3D12_GPU_DESCRIPTOR_HANDLE g;
+    D3D12_CPU_DESCRIPTOR_HANDLE c;
+    ID3D12Resource* r;
+    if (uav_clear_args(self, gpu, cpu, resource, &g, &c, &r))
+        self->desktop->ClearUnorderedAccessViewFloat(g, c, r, values, count, rects);
+}
+
+// Discarding is a hint. Buffers share desktop buffers, so only textures pass it on.
+static void WINAPI list_discard_resource(ConsoleCommandList* self, void* resource,
+                                         const D3D12_DISCARD_REGION* region) {
+    ConsoleResource* r = (ConsoleResource*)resource;
+    if (!r || r->desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+        return;
+    u64 base;
+    ID3D12Resource* d = list_resource(resource, &base);
+    if (d)
+        self->desktop->DiscardResource(d, region);
+}
+
+// --- memory writes -----------------------------------------------------------------------------------
+
+// Small immediate writes: 32-bit values at title GPU addresses, ordered against earlier work.
+static void write_values(ConsoleCommandList* self, u64 address, const u32* values, u32 count,
+                         D3D12_WRITEBUFFERIMMEDIATE_MODE mode) {
+    D3D12_WRITEBUFFERIMMEDIATE_PARAMETER params[64];
+    D3D12_WRITEBUFFERIMMEDIATE_MODE modes[64];
+    GpuAddress a;
+    if (count > ARRAY_COUNT(params) || !translate(address, (u64)count * 4, &a))
+        return;
+    for (u32 i = 0; i < count; i++) {
+        params[i].Dest = a.desktop_address + i * 4;
+        params[i].Value = values[i];
+        modes[i] = mode;
+    }
+    self->desktop->WriteBufferImmediate(count, params, modes);
+}
+
+static void WINAPI list_write_32bit_bottom_of_pipe_x(ConsoleCommandList* self, UINT64 dst, UINT value, UINT,
+                                                     UINT) {
+    write_values(self, dst, &value, 1, D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT);
+}
+
+static void WINAPI list_write_64bit_bottom_of_pipe_x(ConsoleCommandList* self, UINT64 dst, UINT64 value, UINT,
+                                                     UINT) {
+    u32 halves[2] = {(u32)value, (u32)(value >> 32)};
+    write_values(self, dst, halves, 2, D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT);
+}
+
+static void WINAPI list_write_32bit_top_of_pipe_x(ConsoleCommandList* self, UINT64 dst, UINT value, UINT) {
+    write_values(self, dst, &value, 1, D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_IN);
+}
+
+static void WINAPI list_write_64bit_top_of_pipe_x(ConsoleCommandList* self, UINT64 dst, UINT64 value, UINT) {
+    u32 halves[2] = {(u32)value, (u32)(value >> 32)};
+    write_values(self, dst, halves, 2, D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_IN);
+}
+
+static void WINAPI list_write_buffer_immediate(ConsoleCommandList* self, UINT count,
+                                               const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER* params,
+                                               const D3D12_WRITEBUFFERIMMEDIATE_MODE* modes) {
+    for (UINT i = 0; i < count; i++) {
+        D3D12_WRITEBUFFERIMMEDIATE_MODE mode = modes ? modes[i] : D3D12_WRITEBUFFERIMMEDIATE_MODE_DEFAULT;
+        write_values(self, params[i].Dest, &params[i].Value, 1, mode);
+    }
+}
+
+// Fills up to what immediate writes cover; larger fills need a compute pass.
+static void fill(ConsoleCommandList* self, u64 dst, u64 size, const u32* pattern, u32 pattern_words) {
+    u32 values[64];
+    u64 words = size / 4;
+    if (size % 4 || words > ARRAY_COUNT(values)) {
+        LOG_W_ONCE("d3d12", "memory fill of %llu bytes is not supported yet; skipped", size);
+        return;
+    }
+    for (u64 i = 0; i < words; i++)
+        values[i] = pattern[i % pattern_words];
+    write_values(self, dst, values, (u32)words, D3D12_WRITEBUFFERIMMEDIATE_MODE_DEFAULT);
+}
+
+static void WINAPI list_fill_32bit_x(ConsoleCommandList* self, UINT64 dst, UINT64 size, UINT value, UINT) {
+    fill(self, dst, size, &value, 1);
+}
+
+static void WINAPI list_fill_64bit_x(ConsoleCommandList* self, UINT64 dst, UINT64 size, UINT64 value, UINT) {
+    u32 halves[2] = {(u32)value, (u32)(value >> 32)};
+    fill(self, dst, size, halves, 2);
+}
+
+// --- queries and predication -------------------------------------------------------------------------
+
+static void WINAPI list_begin_query(ConsoleCommandList* self, ConsoleQueryHeap* heap, D3D12_QUERY_TYPE type,
+                                    UINT index) {
+    if (heap)
+        self->desktop->BeginQuery(heap->desktop, type, index);
+}
+
+static void WINAPI list_end_query(ConsoleCommandList* self, ConsoleQueryHeap* heap, D3D12_QUERY_TYPE type,
+                                  UINT index) {
+    if (heap)
+        self->desktop->EndQuery(heap->desktop, type, index);
+}
+
+static void WINAPI list_resolve_query_data(ConsoleCommandList* self, ConsoleQueryHeap* heap,
+                                           D3D12_QUERY_TYPE type, UINT start, UINT count, void* dst,
+                                           UINT64 dst_offset) {
+    u64 base;
+    ID3D12Resource* d = list_resource(dst, &base);
+    if (heap && d)
+        self->desktop->ResolveQueryData(heap->desktop, type, start, count, d, base + dst_offset);
+}
+
+static void WINAPI list_set_predication(ConsoleCommandList* self, void* buffer, UINT64 offset,
+                                        D3D12_PREDICATION_OP op) {
+    u64 base;
+    ID3D12Resource* b = list_resource(buffer, &base);
+    self->desktop->SetPredication(b, b ? base + offset : 0, op);
+}
+
+const ConsoleEntry k_list_work_entries[] = {
+    CONSOLE_ENTRY(12, list_draw_instanced),
+    CONSOLE_ENTRY(13, list_draw_indexed_instanced),
+    CONSOLE_ENTRY(14, list_dispatch),
+    CONSOLE_ENTRY(15, list_copy_buffer_region),
+    CONSOLE_ENTRY(16, list_copy_texture_region),
+    CONSOLE_ENTRY(17, list_copy_resource),
+    CONSOLE_ENTRY(19, list_resolve_subresource),
+    CONSOLE_ENTRY(28, list_begin_query),
+    CONSOLE_ENTRY(29, list_end_query),
+    CONSOLE_ENTRY(30, list_resolve_query_data),
+    CONSOLE_ENTRY(31, list_set_predication),
+    CONSOLE_ENTRY(51, list_clear_depth_stencil_view),
+    CONSOLE_ENTRY(52, list_clear_render_target_view),
+    CONSOLE_ENTRY(53, list_clear_uav_uint),
+    CONSOLE_ENTRY(54, list_clear_uav_float),
+    CONSOLE_ENTRY(55, list_discard_resource),
+    CONSOLE_ENTRY(61, list_execute_indirect),
+    CONSOLE_ENTRY(62, list_copy_memory_to_memory_x),
+    CONSOLE_ENTRY(63, list_fill_32bit_x),
+    CONSOLE_ENTRY(64, list_fill_64bit_x),
+    CONSOLE_ENTRY(71, list_write_32bit_bottom_of_pipe_x),
+    CONSOLE_ENTRY(72, list_write_64bit_bottom_of_pipe_x),
+    CONSOLE_ENTRY(80, list_dispatch_x),
+    CONSOLE_ENTRY(83, list_draw_indexed_x),
+    CONSOLE_ENTRY(90, list_write_32bit_top_of_pipe_x),
+    CONSOLE_ENTRY(91, list_write_64bit_top_of_pipe_x),
+    CONSOLE_ENTRY(113, list_write_buffer_immediate),
+};
+
+const u32 k_list_work_entry_count = ARRAY_COUNT(k_list_work_entries);
