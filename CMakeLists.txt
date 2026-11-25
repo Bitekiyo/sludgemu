@@ -110,6 +110,7 @@ set(SLUDGE_DXC_DLLS
     ${dxc_pkg_SOURCE_DIR}/build/native/bin/x64/dxil.dll)
 
 add_subdirectory(src)
+add_subdirectory(tools)
 
 enable_testing()
 add_subdirectory(tests)

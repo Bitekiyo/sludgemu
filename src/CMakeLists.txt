@@ -1,3 +1,15 @@
+# Console shader decoding and translation: platform independent, shared by sludgemu, the unit tests
+# and the shader tool.
+add_library(sludge_shader STATIC
+    shader/rdna.h
+    shader/rdna_ops.inc
+    shader/rdna_decode.cpp
+    shader/rdna_disasm.cpp
+)
+target_include_directories(sludge_shader PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(sludge_shader PRIVATE sludge_options)
+target_compile_options(sludge_shader PRIVATE /Zc:threadSafeInit-) # linked into sludgemu.exe (see below)
+
 add_executable(sludgemu WIN32
     main.cpp
 
@@ -126,7 +138,7 @@ endfunction()
 sludge_shader(sludgemu gpu/shaders/present.hlsl vs_main vs_6_0 present_vs)
 sludge_shader(sludgemu gpu/shaders/present.hlsl ps_main ps_6_0 present_ps)
 target_include_directories(sludgemu PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
-target_link_libraries(sludgemu PRIVATE agility sludge_options shell32 user32 synchronization delayimp
+target_link_libraries(sludgemu PRIVATE sludge_shader agility sludge_options shell32 user32 synchronization delayimp
     dstorage libdeflate::libdeflate_static opus addrlib d3d12 dxgi dxc)
 
 # Loaded only when a title uses DirectStorage.
