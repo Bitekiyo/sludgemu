@@ -204,12 +204,20 @@ struct ConsoleCommandList {
     // Descriptor tables the recording uses, mirrored again when the list is submitted: titles may
     // fill tables after recording the draws that use them (the GPU reads them only when it runs).
     struct TableUse {
-        const ConsoleDescriptorHeap* heap;
+        ConsoleDescriptorHeap* heap;
         u32 first;
         u32 count;
+        u32 desktop_first;
     }* tables;
     u32 table_count;
     u32 table_capacity;
+    // Recent relocated tables of this recording, by console slot (see console_descriptor_place).
+    struct Relocation {
+        ConsoleDescriptorHeap* heap;
+        u32 first;
+        u32 count;
+        u32 desktop_first;
+    } relocations[16];
 };
 
 struct ConsoleCommandListDesc {
@@ -306,7 +314,14 @@ struct ConsoleDescriptorHeap {
     D3D12_DESCRIPTOR_HEAP_DESC desc;
     u8* memory;
     u32 stride;
-    u32 desktop_count; // can be smaller than desc.NumDescriptors (desktop limits)
+    // Every console slot has a CPU-only desktop descriptor. Shader-visible heaps are capped on
+    // desktop: when the console heap is larger, its first `identity_count` slots keep their index
+    // in the shader-visible heap, and tables past them are copied into a ring above them when used.
+    u32 visible_count; // shader-visible desktop slots
+    u32 identity_count;
+    u32 relocation_first; // the ring: [relocation_first, relocation_first + relocation_count)
+    u32 relocation_count;
+    volatile long relocation_cursor;
     D3D12_DESCRIPTOR_HEAP_TYPE desktop_type;
     ID3D12DescriptorHeap* cpu;     // CPU-only descriptors (every heap)
     ID3D12DescriptorHeap* visible; // shader-visible descriptors, or nullptr
@@ -314,6 +329,14 @@ struct ConsoleDescriptorHeap {
     u64 cpu_start;
     u64 visible_cpu_start;
     u64 visible_gpu_start;
+    // Shader-visible resource heaps: per shader-visible slot, the constant buffer descriptor the
+    // title wrote itself whose desktop view the slot holds (see console_descriptor_mirror).
+    struct NativeView {
+        u64 address;
+        u64 records;
+        u32 generation; // gpu_window_generation() when made, 0 if the slot holds something else
+        u32 unused;
+    }* native;
 };
 
 // Where a console descriptor handle points.
@@ -321,9 +344,11 @@ struct DescriptorSlot {
     D3D12_DESCRIPTOR_HEAP_TYPE type; // desktop heap type
     u32 desktop_stride;
     D3D12_CPU_DESCRIPTOR_HANDLE cpu;         // CPU-only copy: write and copy from here
-    D3D12_CPU_DESCRIPTOR_HANDLE visible_cpu; // shader-visible copy, 0 if none
+    D3D12_CPU_DESCRIPTOR_HANDLE visible_cpu; // shader-visible copy at the same index, 0 if none
     D3D12_GPU_DESCRIPTOR_HANDLE visible_gpu;
     u8* console; // the console slot
+    ConsoleDescriptorHeap* heap;
+    u32 index;
 };
 
 void console_descriptor_heap_init();
@@ -332,8 +357,13 @@ void console_descriptor_heap_init();
 // and its desktop CPU-only descriptor.
 #define DESCRIPTOR_MARKER_MAGIC 0x47444C53u // "SLDG"
 
-// Brings slots the title copied raw into a shader-visible heap to its desktop descriptors.
-void console_descriptor_mirror(const ConsoleDescriptorHeap* heap, u32 first, u32 count);
+// Brings console slots [first, first + count), which the title may have written or copied itself,
+// to shader-visible desktop slots from `desktop_first`: the same index or a relocation.
+void console_descriptor_mirror(ConsoleDescriptorHeap* heap, u32 first, u32 count, u32 desktop_first);
+
+// Where a table of `count` console slots from `first` is visible to shaders: the same index if the
+// heap shows it there, else room in the relocation ring (to be mirrored into). ~0u if neither.
+u32 console_descriptor_place(ConsoleDescriptorHeap* heap, u32 first, u32 count);
 
 HRESULT console_create_descriptor_heap(ConsoleDevice* device, const D3D12_DESCRIPTOR_HEAP_DESC* desc,
                                        REFIID iid, void** out);

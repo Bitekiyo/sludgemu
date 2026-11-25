@@ -65,7 +65,7 @@ bool list_gpu_descriptor(const ConsoleCommandList* list, u64 handle, D3D12_GPU_D
         if (!heap || handle < (u64)heap->memory)
             continue;
         u64 index = (handle - (u64)heap->memory) / heap->stride;
-        if (index < heap->desktop_count) {
+        if (index < heap->identity_count) {
             out->ptr = heap->visible_gpu_start + index * heap->desktop_stride;
             return true;
         }
@@ -80,7 +80,7 @@ bool list_descriptor_index(const ConsoleCommandList* list, u64 handle, u32* out)
         if (!heap || handle < (u64)heap->memory)
             continue;
         u64 index = (handle - (u64)heap->memory) / heap->stride;
-        if (index < heap->desktop_count) {
+        if (index < heap->desc.NumDescriptors) {
             *out = (u32)index;
             return true;
         }
@@ -162,11 +162,13 @@ static D3D12_PRIMITIVE_TOPOLOGY desktop_topology(D3D12_PRIMITIVE_TOPOLOGY topolo
 }
 
 // Tables used by the recording, mirrored again at submission.
-static void list_note_table(ConsoleCommandList* self, const ConsoleDescriptorHeap* heap, u32 first,
-                            u32 count) {
-    if (self->table_count && self->tables[self->table_count - 1].heap == heap &&
-        self->tables[self->table_count - 1].first == first)
-        return;
+static void list_note_table(ConsoleCommandList* self, ConsoleDescriptorHeap* heap, u32 first, u32 count,
+                            u32 desktop_first) {
+    if (self->table_count) {
+        const ConsoleCommandList::TableUse& last = self->tables[self->table_count - 1];
+        if (last.heap == heap && last.first == first && last.desktop_first == desktop_first)
+            return;
+    }
     if (self->table_count == self->table_capacity) {
         u32 capacity = self->table_capacity ? self->table_capacity * 2 : 256;
         void* grown = realloc(self->tables, capacity * sizeof(*self->tables));
@@ -175,7 +177,21 @@ static void list_note_table(ConsoleCommandList* self, const ConsoleDescriptorHea
         self->tables = (ConsoleCommandList::TableUse*)grown;
         self->table_capacity = capacity;
     }
-    self->tables[self->table_count++] = {heap, first, count};
+    self->tables[self->table_count++] = {heap, first, count, desktop_first};
+}
+
+// Where shaders find a table: its own index, or a relocation, which the list reuses while it binds
+// the same table again (draws often rebind tables between other root changes).
+static u32 list_place_table(ConsoleCommandList* self, ConsoleDescriptorHeap* heap, u32 first, u32 count) {
+    if (first + count <= heap->identity_count)
+        return first;
+    ConsoleCommandList::Relocation& r = self->relocations[first % ARRAY_COUNT(self->relocations)];
+    if (r.heap == heap && r.first == first && r.count == count)
+        return r.desktop_first;
+    u32 desktop_first = console_descriptor_place(heap, first, count);
+    if (desktop_first != ~0u)
+        r = {heap, first, count, desktop_first};
+    return desktop_first;
 }
 
 // Descriptors a table covers by its ranges. Unbounded ranges are taken as reaching a little way:
@@ -217,14 +233,18 @@ void list_flush_user_data(ConsoleCommandList* self, bool graphics) {
             break;
         case ROOT_ARG_TABLE: {
             const ConsoleRootParameter& p = rs->layout.parameters[i];
-            const ConsoleDescriptorHeap* heap = self->state.heaps[p.sampler_table ? 1 : 0];
-            if (heap) {
-                console_descriptor_mirror(heap, (u32)v, table_extent(p));
-                list_note_table(self, heap, (u32)v, table_extent(p));
+            ConsoleDescriptorHeap* heap = self->state.heaps[p.sampler_table ? 1 : 0];
+            u32 desktop_first = heap ? list_place_table(self, heap, (u32)v, table_extent(p)) : ~0u;
+            if (desktop_first != ~0u) {
+                console_descriptor_mirror(heap, (u32)v, table_extent(p), desktop_first);
+                list_note_table(self, heap, (u32)v, table_extent(p), desktop_first);
+            } else {
+                LOG_W_ONCE("d3d12", "descriptor table at slot %llu has no shader-visible place", v);
+                desktop_first = 0;
             }
             if (sgpr < ARRAY_COUNT(image))
-                image[sgpr] = (u32)v * (p.sampler_table ? CONSOLE_DESCRIPTOR_SIZE_SAMPLER
-                                                        : CONSOLE_DESCRIPTOR_SIZE_RESOURCE);
+                image[sgpr] = desktop_first * (p.sampler_table ? CONSOLE_DESCRIPTOR_SIZE_SAMPLER
+                                                               : CONSOLE_DESCRIPTOR_SIZE_RESOURCE);
             break;
         }
         case ROOT_ARG_CONSTANTS: {
@@ -397,6 +417,7 @@ static HRESULT WINAPI list_reset_x(ConsoleCommandList* self, ConsoleCommandAlloc
     release_segment_fences(self);
     memset(&self->state, 0, sizeof(self->state));
     self->table_count = 0;
+    memset(self->relocations, 0, sizeof(self->relocations));
     self->allocator = allocator;
     HRESULT hr = begin_segment(self, 0);
     self->recording = SUCCEEDED(hr);

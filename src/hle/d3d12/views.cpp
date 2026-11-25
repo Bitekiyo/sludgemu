@@ -442,24 +442,29 @@ static bool is_buffer(void* resource) {
     return resource && ((ConsoleResource*)resource)->desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER;
 }
 
-void WINAPI device_create_constant_buffer_view(ConsoleDevice* self,
-                                               const D3D12_CONSTANT_BUFFER_VIEW_DESC* desc,
-                                               D3D12_CPU_DESCRIPTOR_HANDLE dest) {
-    DescriptorSlot slot;
-    if (!console_descriptor_slots(dest.ptr, 1, &slot))
-        return;
-    // Constant buffers become raw buffer views: translated shaders read them as such, which also
-    // spares them desktop's 256-byte alignment for constant buffer views.
+// Constant buffers become raw buffer views: translated shaders read them as such, which also spares
+// them desktop's 256-byte alignment for constant buffer views. No buffer (address 0) reads as zeros.
+void write_constant_buffer_view(u64 address, u64 size, D3D12_CPU_DESCRIPTOR_HANDLE dest) {
     D3D12_SHADER_RESOURCE_VIEW_DESC d = {};
     d.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
     d.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     ID3D12Resource* desktop = nullptr;
-    if (desc && desc->BufferLocation && desc->SizeInBytes)
-        desktop = apply_buffer_view(
-            buffer_view(desc->BufferLocation, 0, desc->SizeInBytes / 4, DXGI_FORMAT_UNKNOWN, 0, true), &d);
+    if (address && size && size / 4 <= 0xFFFFFFFFu)
+        desktop =
+            apply_buffer_view(buffer_view(address, 0, (u32)(size / 4), DXGI_FORMAT_UNKNOWN, 0, true), &d);
     if (!desktop)
         d = null_srv(D3D12_SRV_DIMENSION_BUFFER);
-    self->desktop->CreateShaderResourceView(desktop, &d, slot.cpu);
+    gpu_device()->CreateShaderResourceView(desktop, &d, dest);
+}
+
+void WINAPI device_create_constant_buffer_view(ConsoleDevice* self,
+                                               const D3D12_CONSTANT_BUFFER_VIEW_DESC* desc,
+                                               D3D12_CPU_DESCRIPTOR_HANDLE dest) {
+    (void)self;
+    DescriptorSlot slot;
+    if (!console_descriptor_slots(dest.ptr, 1, &slot))
+        return;
+    write_constant_buffer_view(desc ? desc->BufferLocation : 0, desc ? desc->SizeInBytes : 0, slot.cpu);
     finish_write(slot);
 }
 

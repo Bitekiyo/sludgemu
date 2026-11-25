@@ -9,6 +9,9 @@ bool view_target_format(u64 console_handle, u32* format, u32* samples);
 
 // Device entries that write descriptors (views.cpp). Resources arrive as console objects.
 
+// Writes the desktop view of a console constant buffer at a desktop CPU handle.
+void write_constant_buffer_view(u64 address, u64 size, D3D12_CPU_DESCRIPTOR_HANDLE dest);
+
 void WINAPI device_create_constant_buffer_view(ConsoleDevice* self,
                                                const D3D12_CONSTANT_BUFFER_VIEW_DESC* desc,
                                                D3D12_CPU_DESCRIPTOR_HANDLE dest);

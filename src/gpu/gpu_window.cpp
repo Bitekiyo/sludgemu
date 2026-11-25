@@ -34,6 +34,12 @@ static u32 windows_at_or_below(u64 address) {
     return lo;
 }
 
+static volatile long g_generation = 1;
+
+u32 gpu_window_generation() {
+    return (u32)g_generation;
+}
+
 // The window containing `address`, or nullptr. Lock held.
 static const Window* find_window(u64 address) {
     u32 at = windows_at_or_below(address);
@@ -50,6 +56,8 @@ static void remove_windows_locked(u64 start, u64 end) {
         first--;
     for (u32 i = first; i < last; i++)
         gpu_retire(g_windows.entries[i].buffer);
+    if (last > first && InterlockedIncrement(&g_generation) == 0)
+        InterlockedIncrement(&g_generation);
     memmove(&g_windows.entries[first], &g_windows.entries[last], (g_windows.count - last) * sizeof(Window));
     g_windows.count -= last - first;
 }

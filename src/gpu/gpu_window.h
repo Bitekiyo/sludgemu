@@ -22,3 +22,7 @@ void gpu_window_init();
 // Translates title GPU addresses [address, address + size) to desktop memory. Fails (logged) if
 // the range isn't mapped or isn't inside one block of title memory.
 bool gpu_translate(u64 address, u64 size, GpuAddress* out);
+
+// Changes whenever windows close (never 0): views made of translated addresses before a change may
+// name a closed window.
+u32 gpu_window_generation();

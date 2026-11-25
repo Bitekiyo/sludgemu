@@ -57,7 +57,7 @@ static void WINAPI queue_execute_command_lists(ConsoleCommandQueue* self, UINT c
             continue;
         for (u32 t = 0; t < list->table_count; t++) {
             const ConsoleCommandList::TableUse& use = list->tables[t];
-            console_descriptor_mirror(use.heap, use.first, use.count);
+            console_descriptor_mirror(use.heap, use.first, use.count, use.desktop_first);
         }
         for (u32 s = 0; s < list->segment_count; s++) {
             const ListSegment& seg = list->segments[s];
