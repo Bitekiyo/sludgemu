@@ -199,6 +199,50 @@ static HRESULT WINAPI device_create_committed_resource3(
     return console_create_committed_resource(self, heap, heap_flags, desc, layout, clear, iid, out);
 }
 
+// --- pipeline states ---------------------------------------------------------------------------------
+
+static HRESULT WINAPI device_create_pipeline_state(ConsoleDevice* self,
+                                                   const D3D12_PIPELINE_STATE_STREAM_DESC* desc, REFIID iid,
+                                                   void** out) {
+    return console_create_pipeline_state(self, desc, iid, out);
+}
+
+// The extended descriptions set console wave launch limits.
+static HRESULT WINAPI device_create_compute_pipeline_state_x(ConsoleDevice* self,
+                                                             const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc,
+                                                             UINT, const void*, REFIID iid, void** out) {
+    return console_create_compute_pipeline_state(self, desc, iid, out);
+}
+
+static HRESULT WINAPI device_create_derived_pipeline_state_x(ConsoleDevice* self, void* source, UINT,
+                                                             const void*, REFIID iid, void** out) {
+    return console_derive_pipeline_state(self, source, iid, out);
+}
+
+// The serialized form starts with the root signature, the packet and its size, the same for
+// graphics and compute pipelines; shader code and metadata follow.
+struct ConsoleSerializedPipelineHeader {
+    void* root_signature;
+    void* packet;
+    usize packet_size;
+};
+
+static HRESULT WINAPI device_deserialize_graphics_pipeline_state_x(
+    ConsoleDevice* self, const ConsoleSerializedPipelineHeader* state, REFIID iid, void** out) {
+    if (!state)
+        return E_INVALIDARG;
+    return console_deserialize_pipeline_state(self, false, state->root_signature, state->packet,
+                                              state->packet_size, iid, out);
+}
+
+static HRESULT WINAPI device_deserialize_compute_pipeline_state_x(
+    ConsoleDevice* self, const ConsoleSerializedPipelineHeader* state, REFIID iid, void** out) {
+    if (!state)
+        return E_INVALIDARG;
+    return console_deserialize_pipeline_state(self, true, state->root_signature, state->packet,
+                                              state->packet_size, iid, out);
+}
+
 static HRESULT WINAPI device_create_query_heap(ConsoleDevice* self, const D3D12_QUERY_HEAP_DESC* desc,
                                                REFIID iid, void** out) {
     return console_create_query_heap(self, desc, iid, out);
@@ -250,6 +294,12 @@ static const ConsoleEntry k_device_impl[] = {
     CONSOLE_ENTRY(27, device_create_committed_resource),
     CONSOLE_ENTRY(36, device_create_fence),
     CONSOLE_ENTRY(39, device_create_query_heap),
+    CONSOLE_ENTRY(55, device_create_derived_pipeline_state_x),
+    CONSOLE_ENTRY(57, device_deserialize_graphics_pipeline_state_x),
+    CONSOLE_ENTRY(62, device_create_compute_pipeline_state_x),
+    CONSOLE_ENTRY(63, device_create_derived_pipeline_state_x),
+    CONSOLE_ENTRY(67, device_deserialize_compute_pipeline_state_x),
+    CONSOLE_ENTRY(86, device_create_pipeline_state),
     CONSOLE_ENTRY(41, device_create_command_signature),
     CONSOLE_ENTRY(44, device_create_placed_resource_x),
     CONSOLE_ENTRY(48, device_create_command_queue_x),
@@ -299,6 +349,7 @@ HRESULT console_create_device(void* adapter, const ConsoleDeviceParams* params, 
         console_query_heap_init();
         console_command_signature_init();
         console_root_signature_init();
+        console_pipeline_state_init();
     }
     if (!out)
         return S_FALSE; // capability check only

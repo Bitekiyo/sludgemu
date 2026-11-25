@@ -56,6 +56,7 @@ add_executable(sludgemu WIN32
     hle/d3d12/resource.cpp
     hle/d3d12/descriptor_heap.cpp
     hle/d3d12/query_heap.cpp
+    hle/d3d12/pipeline_state.cpp
     hle/d3d12/command_signature.cpp
     hle/d3d12/root_signature.h
     hle/d3d12/root_signature.cpp

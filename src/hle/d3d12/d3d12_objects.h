@@ -354,6 +354,29 @@ void console_root_signature_init();
 HRESULT console_create_root_signature(ConsoleDevice* device, const void* blob, usize size, REFIID iid,
                                       void** out);
 
+// A pipeline state: the console's packet for it (public; title code copies it into command
+// lists) and what translating it needs. No desktop pipeline exists until shaders are translated.
+struct ConsolePipelineState {
+    ConsoleObjectHeader header;
+    u32 packet[8];
+
+    ConsoleRootSignature* root_signature; // referenced, or nullptr
+    bool compute;
+};
+
+void console_pipeline_state_init();
+
+HRESULT console_create_pipeline_state(ConsoleDevice* device, const D3D12_PIPELINE_STATE_STREAM_DESC* desc,
+                                      REFIID iid, void** out);
+HRESULT console_create_compute_pipeline_state(ConsoleDevice* device,
+                                              const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, REFIID iid,
+                                              void** out);
+// Derived pipelines: a copy of `source` with some fixed-function state changed.
+HRESULT console_derive_pipeline_state(ConsoleDevice* device, void* source, REFIID iid, void** out);
+// Serialized console pipelines: the root signature and the pipeline's packet.
+HRESULT console_deserialize_pipeline_state(ConsoleDevice* device, bool compute, void* root_signature,
+                                           const void* packet, usize packet_size, REFIID iid, void** out);
+
 // Page pools (page_pool.cpp): title memory registered as a source of GPU page mapping copies.
 HRESULT console_register_page_pool(u64 address, u32 page_count, u32 flags, HANDLE* handle);
 HRESULT console_unregister_page_pool(HANDLE handle);

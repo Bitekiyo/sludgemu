@@ -295,8 +295,17 @@ bool crash_arm_write_watch(const char* spec) {
         }
         CloseHandle(snap);
     }
-    LOG_I("watch", "write watch on 0x%llx (%s), armed on %u threads, current value 0x%llx", addr, spec, armed,
-          *(volatile u64*)addr);
+    // The location may not exist yet (memory the title maps later); the watch still applies.
+    MEMORY_BASIC_INFORMATION mbi;
+    bool readable = VirtualQuery((void*)addr, &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT &&
+                    (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ |
+                                    PAGE_EXECUTE_READWRITE)) &&
+                    !(mbi.Protect & PAGE_GUARD);
+    if (readable)
+        LOG_I("watch", "write watch on 0x%llx (%s), armed on %u threads, current value 0x%llx", addr, spec,
+              armed, *(volatile u64*)addr);
+    else
+        LOG_I("watch", "write watch on 0x%llx (%s), armed on %u threads, not mapped yet", addr, spec, armed);
     return armed != 0;
 }
 
