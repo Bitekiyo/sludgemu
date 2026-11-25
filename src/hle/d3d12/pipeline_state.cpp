@@ -72,6 +72,7 @@ static D3D12_STENCIL_OP stencil_op(u32 hw) {
     for (u32 i = 0; i < ARRAY_COUNT(k_stencil_ops); i++)
         if (k_stencil_ops[i] == hw)
             return (D3D12_STENCIL_OP)(i + 1);
+    LOG_W_ONCE("d3d12", "stencil operation %u has no desktop equivalent; kept as KEEP", hw);
     return D3D12_STENCIL_OP_KEEP;
 }
 
@@ -161,10 +162,16 @@ static void decode_fixed_state(const u8* ctx, const u8* metadata, PipelineFixedS
     ds.FrontFace.StencilPassOp = stencil_op((stencil >> 4) & 0xF);
     ds.FrontFace.StencilDepthFailOp = stencil_op((stencil >> 8) & 0xF);
     ds.FrontFace.StencilFunc = (D3D12_COMPARISON_FUNC)(((depth >> 8) & 7) + 1);
-    ds.BackFace.StencilFailOp = stencil_op((stencil >> 12) & 0xF);
-    ds.BackFace.StencilPassOp = stencil_op((stencil >> 16) & 0xF);
-    ds.BackFace.StencilDepthFailOp = stencil_op((stencil >> 20) & 0xF);
-    ds.BackFace.StencilFunc = (D3D12_COMPARISON_FUNC)(((depth >> 20) & 7) + 1);
+    // Back faces have their own stencil state only when enabled for them (bit 7); otherwise the
+    // front state applies to both (vector fills draw both windings with culling off).
+    if ((depth >> 7) & 1) {
+        ds.BackFace.StencilFailOp = stencil_op((stencil >> 12) & 0xF);
+        ds.BackFace.StencilPassOp = stencil_op((stencil >> 16) & 0xF);
+        ds.BackFace.StencilDepthFailOp = stencil_op((stencil >> 20) & 0xF);
+        ds.BackFace.StencilFunc = (D3D12_COMPARISON_FUNC)(((depth >> 20) & 7) + 1);
+    } else {
+        ds.BackFace = ds.FrontFace;
+    }
 
     D3D12_RASTERIZER_DESC& rs = f->rasterizer;
     u32 mode = reg(ctx, CTX_MODE_CONTROL);
