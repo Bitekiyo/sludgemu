@@ -5,15 +5,17 @@
 // arrays and flowgraphs in APU memory, and driven by an audio control processor (ACP) that takes
 // commands and sends messages back every audio frame.
 //
-// The APU heap and the context arrays are real. The ACP side keeps time and keeps the protocol
-// going (commands complete, notifications are written, frame and flowgraph messages arrive on
-// schedule), but doesn't process audio yet, so output is silent.
+// The APU heap and the context arrays are real. The ACP keeps time (frame messages every 256
+// samples at 48 kHz), completes commands and drives the XMA decoder (xma.cpp), which decodes into
+// the titles' output rings as they drain them. SHAPE flowgraphs complete without processing; titles
+// seen so far use the hardware only for XMA and mix on the CPU.
 
 #include <windows.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "common/log.h"
+#include "hle/audio/apu.h"
 #include "hle/hle.h"
 
 // --- APU heap ------------------------------------------------------------------------------------
@@ -162,6 +164,10 @@ static void* WINAPI ApuMapApuAddress(ApuAddress address) {
     return g_apu.memory + (address - APU_ADDRESS_BASE);
 }
 
+void* apu_ptr(u32 apu_address) {
+    return ApuMapApuAddress(apu_address);
+}
+
 static bool WINAPI ApuIsVirtualAddressValid(const void* virtual_address, u32 alignment) {
     ApuAddress a = ApuMapVirtualAddress(virtual_address);
     return a && (!alignment || a % alignment == 0);
@@ -227,6 +233,7 @@ static HRESULT WINAPI AcpHalAllocateShapeContexts(ShapeContexts* request) {
         }
         g_context_arrays[k] = request->arrays[k];
     }
+    xma_set_contexts(request->arrays[SHAPE_XMA], request->count[SHAPE_XMA]);
     LOG_I("apu", "SHAPE contexts: %u SRC, %u EQ/comp, %u filter/volume, %u DMA, %u XMA, %u PCM",
           request->count[0], request->count[1], request->count[2], request->count[3], request->count[4],
           request->count[5]);
@@ -236,6 +243,7 @@ static HRESULT WINAPI AcpHalAllocateShapeContexts(ShapeContexts* request) {
 static HRESULT WINAPI AcpHalReleaseShapeContexts() {
     if (g_connections)
         return ACP_E_STILL_CONNECTED;
+    xma_set_contexts(nullptr, 0);
     bool any = false;
     for (u32 k = 0; k < SHAPE_KINDS; k++) {
         if (g_context_arrays[k]) {
@@ -279,11 +287,20 @@ static HRESULT WINAPI ApuCreateHeap(u32 cached_size, u32 noncached_size) {
 
 // --- audio control processor ---------------------------------------------------------------------
 
-#define ACP_COMMAND_LOAD_SHAPE_FLOWGRAPH 1
-#define ACP_COMMAND_REGISTER_MESSAGE     2
-#define ACP_COMMAND_UNREGISTER_MESSAGE   3
-#define ACP_COMMAND_START_FLOWGRAPH      4
-#define ACP_COMMAND_LAST                 27
+#define ACP_COMMAND_LOAD_SHAPE_FLOWGRAPH                   1
+#define ACP_COMMAND_REGISTER_MESSAGE                       2
+#define ACP_COMMAND_UNREGISTER_MESSAGE                     3
+#define ACP_COMMAND_START_FLOWGRAPH                        4
+#define ACP_COMMAND_ENABLE_XMA_CONTEXT                     5
+#define ACP_COMMAND_ENABLE_XMA_CONTEXTS                    6
+#define ACP_COMMAND_DISABLE_XMA_CONTEXT                    7
+#define ACP_COMMAND_DISABLE_XMA_CONTEXTS                   8
+#define ACP_COMMAND_UPDATE_XMA_CONTEXT                     14
+#define ACP_COMMAND_INCREMENT_XMA_WRITE_BUFFER_OFFSET_READ 18
+#define ACP_COMMAND_UPDATE_XMA_READ_BUFFER                 19
+#define ACP_COMMAND_UPDATE_ALL_CONTEXTS                    20
+#define ACP_COMMAND_UPDATE_XMA_CONTEXTS                    27
+#define ACP_COMMAND_LAST                                   27
 
 #define ACP_MESSAGE_AUDIO_FRAME_START   0x01
 #define ACP_MESSAGE_FLOWGRAPH_COMPLETED 0x02
@@ -353,6 +370,101 @@ struct Acp {
 
 static LARGE_INTEGER g_qpc_frequency;
 
+#pragma pack(push, 1)
+struct XmaUpdate {
+    u32 index;
+    u32 mask;
+    ApuAddress context;
+};
+struct XmaReadBufferUpdate {
+    u32 index;
+    u32 buffer;
+    u32 size; // 2 KB blocks
+    u32 change_size;
+    u32 change_address;
+    ApuAddress address;
+};
+struct XmaUpdateEntry {
+    u32 index;
+    ApuAddress ptr_read0;
+    ApuAddress ptr_read1;
+    u16 size_read0;
+    u16 size_read1;
+    u16 write_buffer_offset_read;
+    u16 valid_buffer;
+};
+struct ContextUpdates {
+    u32 entry_count;
+    ApuAddress entries;
+    u32 index_count;
+    ApuAddress indices; // u16 each
+};
+#pragma pack(pop)
+static_assert(sizeof(XmaUpdateEntry) == 20, "XMA update entry layout");
+
+// Runs the entries of an update list: directly, or through an index array.
+static void update_xma_entries(u32 entry_count, ApuAddress entries, u32 index_count, ApuAddress indices) {
+    const XmaUpdateEntry* e = (const XmaUpdateEntry*)apu_ptr(entries);
+    const u16* idx = index_count ? (const u16*)apu_ptr(indices) : nullptr;
+    if (!e || (index_count && !idx))
+        return;
+    u32 n = index_count ? index_count : entry_count;
+    for (u32 i = 0; i < n; i++) {
+        const XmaUpdateEntry& u = e[idx ? idx[i] : i];
+        xma_update_entry(u.index, u.ptr_read0, u.ptr_read1, u.size_read0, u.size_read1,
+                         u.write_buffer_offset_read, u.valid_buffer);
+    }
+}
+
+// The XMA commands; returns whether `type` was one.
+static bool run_xma_command(u32 type, const void* data) {
+    switch (type) {
+    case ACP_COMMAND_ENABLE_XMA_CONTEXT:
+    case ACP_COMMAND_DISABLE_XMA_CONTEXT:
+        xma_enable(*(const u32*)data, type == ACP_COMMAND_ENABLE_XMA_CONTEXT);
+        return true;
+    case ACP_COMMAND_ENABLE_XMA_CONTEXTS:
+    case ACP_COMMAND_DISABLE_XMA_CONTEXTS: {
+        const u32* bits = (const u32*)data;
+        for (u32 w = 0; w < k_context_max[SHAPE_XMA] / 32; w++)
+            for (u32 b = 0; b < 32; b++)
+                if (bits[w] & (1u << b))
+                    xma_enable(w * 32 + b, type == ACP_COMMAND_ENABLE_XMA_CONTEXTS);
+        return true;
+    }
+    case ACP_COMMAND_UPDATE_XMA_CONTEXT: {
+        const XmaUpdate* u = (const XmaUpdate*)data;
+        xma_update(u->index, u->mask, apu_ptr(u->context));
+        return true;
+    }
+    case ACP_COMMAND_INCREMENT_XMA_WRITE_BUFFER_OFFSET_READ: {
+        const u32* u = (const u32*)data; // context index, increment
+        xma_increment_write_read(u[0], u[1]);
+        return true;
+    }
+    case ACP_COMMAND_UPDATE_XMA_READ_BUFFER: {
+        const XmaReadBufferUpdate* u = (const XmaReadBufferUpdate*)data;
+        xma_update_read_buffer(u->index, u->buffer, u->size, u->change_size != 0, u->change_address != 0,
+                               u->address);
+        return true;
+    }
+    case ACP_COMMAND_UPDATE_XMA_CONTEXTS: {
+        const ContextUpdates* u = (const ContextUpdates*)data;
+        update_xma_entries(u->entry_count, u->entries, u->index_count, u->indices);
+        return true;
+    }
+    case ACP_COMMAND_UPDATE_ALL_CONTEXTS: {
+        // Seven counts, seven entry arrays, seven index counts, seven index arrays; XMA is the last
+        // of each.
+        const u32* u = (const u32*)data;
+        if (u[6])
+            update_xma_entries(u[6], u[13], u[20], u[27]);
+        return true;
+    }
+    }
+    return false;
+}
+
 static u32 elapsed_us(const Acp* self) {
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
@@ -380,6 +492,7 @@ static void post_message(Acp* self, u32 type, const void* data, u32 size) {
 // One audio frame: the frame message, then the flowgraph's run (processed instantly, as nothing is
 // rendered yet).
 static void run_frame(Acp* self) {
+    xma_run();
     AcquireSRWLockExclusive(&self->lock);
     self->frame++;
     post_message(self, ACP_MESSAGE_AUDIO_FRAME_START, &self->frame, sizeof(self->frame));
@@ -463,9 +576,7 @@ static HRESULT STDMETHODCALLTYPE acp_connect(Acp* self, u32 command_count, u32 m
     SetThreadPriority(self->thread, THREAD_PRIORITY_TIME_CRITICAL);
     self->connected = true;
     InterlockedIncrement(&g_connections);
-    LOG_I("apu",
-          "ACP connected (%u commands, %u messages); audio processing is not implemented, output is silent",
-          command_count, message_count);
+    LOG_I("apu", "ACP connected (%u commands, %u messages)", command_count, message_count);
     return S_OK;
 }
 
@@ -510,7 +621,9 @@ static HRESULT STDMETHODCALLTYPE acp_submit_command(Acp* self, u32 type, u64 id,
         self->flowgraph_running = true;
         break;
     default:
-        // Context updates and pointer increments only matter to audio processing.
+        if (data && run_xma_command(type, data))
+            xma_run(); // titles poll the contexts; let them see progress right away
+        // Other context updates only matter to SHAPE processing, which titles don't use yet.
         break;
     }
     if (id) {
