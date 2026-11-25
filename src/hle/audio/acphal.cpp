@@ -489,10 +489,10 @@ static void post_message(Acp* self, u32 type, const void* data, u32 size) {
     self->message_count++;
 }
 
-// One audio frame: the frame message, then the flowgraph's run (processed instantly, as nothing is
-// rendered yet).
+// One audio frame: the frame message, the flowgraph's run (completed instantly, as SHAPE doesn't
+// process audio), then XMA decoding, which fills the output rings titles drained since the last
+// frame.
 static void run_frame(Acp* self) {
-    xma_run();
     AcquireSRWLockExclusive(&self->lock);
     self->frame++;
     post_message(self, ACP_MESSAGE_AUDIO_FRAME_START, &self->frame, sizeof(self->frame));
@@ -502,6 +502,7 @@ static void run_frame(Acp* self) {
             self->flowgraph = 0;
     }
     ReleaseSRWLockExclusive(&self->lock);
+    xma_run();
 }
 
 // Frames follow the clock, not the timer: late wakeups catch up, so time never drifts.
@@ -621,9 +622,10 @@ static HRESULT STDMETHODCALLTYPE acp_submit_command(Acp* self, u32 type, u64 id,
         self->flowgraph_running = true;
         break;
     default:
-        if (data && run_xma_command(type, data))
-            xma_run(); // titles poll the contexts; let them see progress right away
-        // Other context updates only matter to SHAPE processing, which titles don't use yet.
+        // XMA commands update the contexts; decoding follows on the next audio frame, as on the
+        // hardware. Other context updates only matter to SHAPE processing.
+        if (data)
+            run_xma_command(type, data);
         break;
     }
     if (id) {
