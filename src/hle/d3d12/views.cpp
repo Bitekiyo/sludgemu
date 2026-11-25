@@ -308,6 +308,9 @@ static D3D12_SHADER_RESOURCE_VIEW_DESC null_srv(D3D12_SRV_DIMENSION dimension) {
     case D3D12_SRV_DIMENSION_TEXTURECUBEARRAY:
         d.TextureCubeArray.NumCubes = 1;
         break;
+    case D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE:
+        d.Format = DXGI_FORMAT_UNKNOWN; // acceleration structures have none; location 0 is null
+        break;
     default:
         break;
     }
@@ -509,6 +512,20 @@ static D3D12_UNORDERED_ACCESS_VIEW_DESC whole_buffer_uav(const ConsoleResource* 
 }
 
 // Failed views leave a null descriptor of the same kind rather than a stale one.
+// The desktop texture a shader resource view of `r` reads, with the view's format made desktop's; or
+// nullptr with `d` made a null view.
+static ID3D12Resource* texture_srv(ConsoleDevice* self, const ConsoleResource* r,
+                                   D3D12_SHADER_RESOURCE_VIEW_DESC* d) {
+    ID3D12Resource* desktop = texture_view_target(r);
+    if (desktop && !texture_plane_ok(self->desktop, r, desktop, srv_plane(*d), d->Format))
+        desktop = nullptr;
+    if (!desktop || !texture_view_format(r, d->Format, true, &d->Format)) {
+        *d = null_srv(d->ViewDimension);
+        return nullptr;
+    }
+    return desktop;
+}
+
 void WINAPI device_create_shader_resource_view(ConsoleDevice* self, void* resource,
                                                const D3D12_SHADER_RESOURCE_VIEW_DESC* desc,
                                                D3D12_CPU_DESCRIPTOR_HANDLE dest) {
@@ -529,13 +546,7 @@ void WINAPI device_create_shader_resource_view(ConsoleDevice* self, void* resour
         if (!r && !desc)
             return; // the console API requires one or the other
         d = desc ? *desc : whole_texture_srv(r->desc);
-        desktop = texture_view_target(r);
-        if (desktop && !texture_plane_ok(self->desktop, r, desktop, srv_plane(d), d.Format))
-            desktop = nullptr;
-        if (!desktop || !texture_view_format(r, d.Format, true, &d.Format)) {
-            desktop = nullptr;
-            d = null_srv(d.ViewDimension);
-        }
+        desktop = texture_srv(self, r, &d);
     }
     self->desktop->CreateShaderResourceView(desktop, &d, slot.cpu);
     finish_write(slot);
@@ -650,6 +661,7 @@ static void copy_range(ConsoleDevice* self, u64 dest, u64 src, u32 count, D3D12_
     }
     self->desktop->CopyDescriptorsSimple(count, d.cpu, s.cpu, d.type);
     console_descriptor_publish(d, count);
+    console_descriptor_copy_keepers(d, s, count);
     memmove(d.console, s.console, (usize)count * console_descriptor_size(type));
 }
 
@@ -723,18 +735,32 @@ void WINAPI device_create_placed_raw_srv_x(ConsoleDevice* self, const D3D12_RESO
         return;
     D3D12_SHADER_RESOURCE_VIEW_DESC d = desc->view;
     ID3D12Resource* desktop = nullptr;
+    ConsoleResource* texture = nullptr;
     if (resource_desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
         d.ViewDimension == D3D12_SRV_DIMENSION_BUFFER) {
         desktop = apply_buffer_view(buffer_view(desc->location, d.Buffer.FirstElement, d.Buffer.NumElements,
                                                 d.Format, d.Buffer.StructureByteStride,
                                                 (d.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) != 0),
                                     &d);
+    } else if (resource_desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
+        if (desc->image_format)
+            LOG_W_ONCE("d3d12",
+                       "views of placed textures with a hardware format (%u) read the texture's own format",
+                       desc->image_format);
+        texture = console_placed_texture(desc->location, console_desc1_from_desc(*resource_desc));
+        if (texture)
+            desktop = texture_srv(self, texture, &d);
+        else
+            d = null_srv(d.ViewDimension);
     } else {
-        unsupported_placed_texture_view("shader resource");
         d = null_srv(d.ViewDimension);
     }
     self->desktop->CreateShaderResourceView(desktop, &d, slot.cpu);
     finish_write(slot);
+    if (texture) {
+        console_descriptor_keep(slot, texture);
+        console_release(texture);
+    }
 }
 
 void WINAPI device_create_placed_raw_uav_x(ConsoleDevice* self, const D3D12_RESOURCE_DESC* resource_desc,

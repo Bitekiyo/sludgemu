@@ -14,6 +14,7 @@ static const GUID* const k_resource_iids[] = {&__uuidof(ID3D12Object),    &__uui
                                               &__uuidof(ID3D12Resource1), &__uuidof(ID3D12Resource2)};
 
 static void resource_destroy(void* object);
+static void forget_placed_texture(ConsoleResource* r);
 
 static const ConsoleClass k_resource_class = {"ID3D12Resource", k_resource_iids, ARRAY_COUNT(k_resource_iids),
                                               resource_destroy};
@@ -105,6 +106,9 @@ static ID3D12Resource* create_texture(ConsoleResource* r) {
               r->desc.MipLevels, r->desc.Format, r->desc.Flags, (unsigned long)hr);
         return nullptr;
     }
+    gpu_set_name(texture, "%s at 0x%llx (dim %d, %llux%ux%u, format %d)",
+                 r->placed_view ? "texture of placed memory" : "texture", r->gpu_address, r->desc.Dimension,
+                 r->desc.Width, r->desc.Height, r->desc.DepthOrArraySize, r->desc.Format);
     return texture;
 }
 
@@ -155,6 +159,8 @@ ID3D12Resource* console_resource_desktop(ConsoleResource* r, u64* offset) {
 
 static void resource_destroy(void* object) {
     ConsoleResource* r = (ConsoleResource*)object;
+    if (r->placed_view)
+        forget_placed_texture(r);
     if (texture_sync_tracks(r->desc))
         texture_sync_remove(r);
     gpu_retire(r->texture);
@@ -324,4 +330,87 @@ HRESULT console_create_placed_resource(ConsoleDevice* device, u64 gpu_address,
                                   D3D12_MEMORY_POOL_UNKNOWN, 1, 1};
     ConsoleResource* r = new_resource(gpu_address, desc, heap, D3D12_HEAP_FLAG_NONE, initial_layout, clear);
     return console_return(r, iid, out);
+}
+
+// --- textures of placed memory ----------------------------------------------------------------------
+
+static struct {
+    ConsoleResource** entries; // sorted by address; the slots keeping them hold the references
+    u32 count;
+    u32 capacity;
+    SRWLOCK lock;
+} g_placed = {nullptr, 0, 0, SRWLOCK_INIT};
+
+static u32 placed_lower_bound(u64 address) {
+    u32 lo = 0, hi = g_placed.count;
+    while (lo < hi) {
+        u32 mid = lo + (hi - lo) / 2;
+        if (g_placed.entries[mid]->gpu_address < address)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return lo;
+}
+
+// Whether two descriptions lay out the same texture (the placement alignment doesn't matter).
+static bool same_texture(const D3D12_RESOURCE_DESC1& a, const D3D12_RESOURCE_DESC1& b) {
+    return a.Dimension == b.Dimension && a.Width == b.Width && a.Height == b.Height &&
+           a.DepthOrArraySize == b.DepthOrArraySize && a.MipLevels == b.MipLevels && a.Format == b.Format &&
+           a.SampleDesc.Count == b.SampleDesc.Count && a.SampleDesc.Quality == b.SampleDesc.Quality &&
+           a.Layout == b.Layout && a.Flags == b.Flags;
+}
+
+static void forget_placed_texture(ConsoleResource* r) {
+    AcquireSRWLockExclusive(&g_placed.lock);
+    for (u32 i = placed_lower_bound(r->gpu_address);
+         i < g_placed.count && g_placed.entries[i]->gpu_address == r->gpu_address; i++) {
+        if (g_placed.entries[i] == r) {
+            memmove(&g_placed.entries[i], &g_placed.entries[i + 1],
+                    (g_placed.count - i - 1) * sizeof(ConsoleResource*));
+            g_placed.count--;
+            break;
+        }
+    }
+    ReleaseSRWLockExclusive(&g_placed.lock);
+}
+
+ConsoleResource* console_placed_texture(u64 gpu_address, const D3D12_RESOURCE_DESC1& desc) {
+    D3D12_RESOURCE_ALLOCATION_INFO info = console_resource_allocation_info(desc);
+    if (!gpu_address || info.SizeInBytes == UINT64_MAX)
+        return nullptr;
+    AcquireSRWLockExclusive(&g_placed.lock);
+    u32 at = placed_lower_bound(gpu_address);
+    for (u32 i = at; i < g_placed.count && g_placed.entries[i]->gpu_address == gpu_address; i++) {
+        ConsoleResource* r = g_placed.entries[i];
+        // One being destroyed (its last slot was just rewritten) is left to go.
+        if (same_texture(r->desc, desc) && console_try_add_ref(r)) {
+            ReleaseSRWLockExclusive(&g_placed.lock);
+            texture_sync_mark(gpu_address, info.SizeInBytes);
+            return r;
+        }
+    }
+    if (g_placed.count == g_placed.capacity) {
+        u32 capacity = g_placed.capacity ? g_placed.capacity * 2 : 1024;
+        ConsoleResource** grown =
+            (ConsoleResource**)realloc(g_placed.entries, capacity * sizeof(ConsoleResource*));
+        if (!grown) {
+            ReleaseSRWLockExclusive(&g_placed.lock);
+            LOG_E("d3d12", "out of memory tracking textures of placed memory");
+            return nullptr;
+        }
+        g_placed.entries = grown;
+        g_placed.capacity = capacity;
+    }
+    D3D12_HEAP_PROPERTIES heap = {D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+                                  D3D12_MEMORY_POOL_UNKNOWN, 1, 1};
+    ConsoleResource* r =
+        new_resource(gpu_address, &desc, heap, D3D12_HEAP_FLAG_NONE, D3D12_BARRIER_LAYOUT_COMMON, nullptr);
+    r->placed_view = true;
+    memmove(&g_placed.entries[at + 1], &g_placed.entries[at],
+            (g_placed.count - at) * sizeof(ConsoleResource*));
+    g_placed.entries[at] = r;
+    g_placed.count++;
+    ReleaseSRWLockExclusive(&g_placed.lock);
+    return r;
 }

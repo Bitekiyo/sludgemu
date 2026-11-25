@@ -123,7 +123,40 @@ bool console_descriptor_slots(u64 handle, u32 count, DescriptorSlot* out) {
     return ok;
 }
 
+static void set_keeper(ConsoleDescriptorHeap* heap, u32 index, ConsoleResource* resource) {
+    if (!heap->keepers) {
+        if (!resource)
+            return;
+        ConsoleResource* volatile* keepers =
+            (ConsoleResource* volatile*)calloc(heap->desc.NumDescriptors, sizeof(ConsoleResource*));
+        if (!keepers)
+            FATAL("out of memory tracking descriptors");
+        if (InterlockedCompareExchangePointer((void* volatile*)&heap->keepers, (void*)keepers, nullptr))
+            free((void*)keepers); // another thread was first
+    }
+    if (resource && !console_try_add_ref(resource))
+        resource = nullptr; // being destroyed: no other slot keeps it any more
+    ConsoleResource* old =
+        (ConsoleResource*)InterlockedExchangePointer((void* volatile*)&heap->keepers[index], resource);
+    if (old)
+        console_release(old);
+}
+
+void console_descriptor_keep(const DescriptorSlot& slot, ConsoleResource* resource) {
+    set_keeper(slot.heap, slot.index, resource);
+}
+
+void console_descriptor_copy_keepers(const DescriptorSlot& dest, const DescriptorSlot& src, u32 count) {
+    if (!src.heap->keepers)
+        return; // nothing kept there; the destination's keepers went when it was written
+    for (u32 i = 0; i < count; i++)
+        set_keeper(dest.heap, dest.index + i, src.heap->keepers[src.index + i]);
+}
+
 void console_descriptor_publish(const DescriptorSlot& slot, u32 count) {
+    if (slot.heap->keepers)
+        for (u32 i = 0; i < count; i++)
+            set_keeper(slot.heap, slot.index + i, nullptr);
     if (!slot.visible_cpu.ptr)
         return;
     gpu_device()->CopyDescriptorsSimple(count, slot.visible_cpu, slot.cpu, slot.type);
@@ -219,6 +252,12 @@ static void descriptor_heap_destroy(void* object) {
     gpu_retire(heap->cpu);
     gpu_retire(heap->visible);
     free(heap->native);
+    if (heap->keepers) {
+        for (u32 i = 0; i < heap->desc.NumDescriptors; i++)
+            if (heap->keepers[i])
+                console_release(heap->keepers[i]);
+        free((void*)heap->keepers);
+    }
     if (heap->memory)
         xmem_free(heap->memory, descriptor_memory_attributes((u64)heap->desc.NumDescriptors * heap->stride));
 }

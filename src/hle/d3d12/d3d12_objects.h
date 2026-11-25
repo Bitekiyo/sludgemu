@@ -273,6 +273,8 @@ struct ConsoleResource {
 
     SRWLOCK lock;            // guards creating the desktop texture
     ID3D12Resource* texture; // textures only
+
+    bool placed_view; // made for views of placed memory, never seen by the title (console_placed_texture)
 };
 
 void console_resource_init();
@@ -292,6 +294,13 @@ HRESULT console_create_committed_resource(ConsoleDevice* device, const D3D12_HEA
                                           D3D12_HEAP_FLAGS heap_flags, const D3D12_RESOURCE_DESC1* desc,
                                           D3D12_BARRIER_LAYOUT initial_layout, const D3D12_CLEAR_VALUE* clear,
                                           REFIID iid, void** out);
+
+// Titles also describe textures by a description and an address alone, in views of placed memory
+// (the console runtime only writes the hardware descriptor). Such a texture gets a resource of ours,
+// shared by every view of the same memory and description, which the descriptor slots holding those
+// views keep alive (console_descriptor_keep). Returns it with a reference for the caller; its
+// contents are uploaded from the memory again, as a view is made once the memory holds them.
+ConsoleResource* console_placed_texture(u64 gpu_address, const D3D12_RESOURCE_DESC1& desc);
 
 // The desktop resource backing `resource` (created on first use) and the offset of the title
 // resource's first byte in it. nullptr if it can't be created.
@@ -339,6 +348,9 @@ struct ConsoleDescriptorHeap {
         u32 generation; // gpu_window_generation() when made, 0 if the slot holds something else
         u32 unused;
     }* native;
+    // Per slot, the resource without a title reference a view in it keeps (console_descriptor_keep);
+    // allocated with the first one.
+    ConsoleResource* volatile* keepers;
 };
 
 // Where a console descriptor handle points.
@@ -382,8 +394,16 @@ HRESULT console_create_descriptor_heap(ConsoleDevice* device, const D3D12_DESCRI
 // they are not all inside one live heap and within what its desktop mirror holds.
 bool console_descriptor_slots(u64 handle, u32 count, DescriptorSlot* out);
 
-// After writing `count` descriptors at slot.cpu, updates the shader-visible copy.
+// After writing `count` descriptors at slot.cpu, updates the shader-visible copy. Every write
+// through the API comes here, which ends what the slots kept.
 void console_descriptor_publish(const DescriptorSlot& slot, u32 count);
+
+// The view just written to `slot` is of `resource` (a placed texture): the slot keeps a reference to
+// it until it is written again. Titles stop using such a texture by reusing its slots.
+void console_descriptor_keep(const DescriptorSlot& slot, ConsoleResource* resource);
+
+// After copying `count` descriptors from `src` to `dest`: the copies keep what the sources keep.
+void console_descriptor_copy_keepers(const DescriptorSlot& dest, const DescriptorSlot& src, u32 count);
 
 struct ConsoleQueryHeap {
     ConsoleObjectHeader header;
