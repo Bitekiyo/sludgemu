@@ -2,6 +2,106 @@
 
 #include "hle/xgameruntime/runtime_api.h"
 
+#include <mmdeviceapi.h>
+
+#include "common/log.h"
+
+// --- audio endpoints -------------------------------------------------------------------------------
+//
+// A user's default audio endpoints are the devices for voice chat (their headset on console). Here
+// they are the host's default communication devices. Endpoint IDs are host device IDs, which titles
+// hand to the host's audio APIs unchanged.
+
+enum AudioEndpointKind : u32 {
+    ENDPOINT_COMMUNICATION_RENDER = 0,
+    ENDPOINT_COMMUNICATION_CAPTURE = 1,
+};
+
+#define ENDPOINT_ID_MAX 56 // UTF-16 code units, terminator included
+
+struct EndpointQuery {
+    EDataFlow flow;
+    wchar_t id[ENDPOINT_ID_MAX];
+    HRESULT hr;
+};
+
+// On a thread of its own, so its COM apartment can't clash with the calling title thread's.
+static DWORD WINAPI query_endpoint(void* param) {
+    EndpointQuery* q = (EndpointQuery*)param;
+    q->hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    if (FAILED(q->hr))
+        return 0;
+    IMMDeviceEnumerator* devices = nullptr;
+    IMMDevice* device = nullptr;
+    wchar_t* id = nullptr;
+    q->hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&devices));
+    if (SUCCEEDED(q->hr))
+        q->hr = devices->GetDefaultAudioEndpoint(q->flow, eCommunications, &device);
+    if (SUCCEEDED(q->hr))
+        q->hr = device->GetId(&id);
+    if (SUCCEEDED(q->hr)) {
+        if (wcslen(id) < ENDPOINT_ID_MAX)
+            wcscpy(q->id, id);
+        else
+            q->hr = HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+    }
+    CoTaskMemFree(id);
+    if (device)
+        device->Release();
+    if (devices)
+        devices->Release();
+    CoUninitialize();
+    return 0;
+}
+
+static HRESULT WINAPI XUserGetDefaultAudioEndpointUtf16(RuntimeSelf, u64 user, u32 kind, usize capacity,
+                                                        wchar_t* endpoint, usize* used) {
+    if (!endpoint || kind > ENDPOINT_COMMUNICATION_CAPTURE)
+        return E_INVALIDARG;
+    EndpointQuery q = {};
+    q.flow = kind == ENDPOINT_COMMUNICATION_RENDER ? eRender : eCapture;
+    q.hr = E_FAIL;
+    HANDLE thread = CreateThread(nullptr, 0, query_endpoint, &q, 0, nullptr);
+    if (!thread)
+        return E_OUTOFMEMORY;
+    WaitForSingleObject(thread, INFINITE);
+    CloseHandle(thread);
+    if (FAILED(q.hr)) {
+        // No such device (nothing plugged in, say): titles treat that as no endpoint.
+        LOG_I("xgr", "XUserGetDefaultAudioEndpointUtf16(user %llu, kind %u): none (0x%08lx)", user, kind,
+              (unsigned long)q.hr);
+        return q.hr;
+    }
+    usize n = wcslen(q.id) + 1;
+    if (capacity < n)
+        return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+    memcpy(endpoint, q.id, n * sizeof(wchar_t));
+    if (used)
+        *used = n;
+    return S_OK;
+}
+
+struct RegistrationToken {
+    u64 value;
+};
+
+// Default device changes aren't reported yet; titles keep the endpoint they asked for.
+static HRESULT WINAPI XUserRegisterForDefaultAudioEndpointUtf16Changed(RuntimeSelf, void* queue,
+                                                                       void* context, void* callback,
+                                                                       RegistrationToken* token) {
+    if (!callback || !token)
+        return E_INVALIDARG;
+    static volatile LONG64 next = 0;
+    token->value = (u64)InterlockedIncrement64(&next);
+    LOG_W_ONCE("xgr", "default audio endpoint changes are not reported yet");
+    return S_OK;
+}
+
+static bool WINAPI XUserUnregisterForDefaultAudioEndpointUtf16Changed(RuntimeSelf, RegistrationToken token,
+                                                                      bool wait) {
+    return true;
+}
+
 // --- interface tables ----------------------------------------------------------------------------
 
 static const GUID k_XUser_provider = {
@@ -85,9 +185,11 @@ static const RuntimeMethod k_XUserDevice_methods[] = {
     {3, "XUserFindForDevice", nullptr},
     {4, "XUserRegisterForDeviceAssociationChanged", nullptr},
     {5, "XUserUnregisterForDeviceAssociationChanged", nullptr},
-    {6, "XUserGetDefaultAudioEndpointUtf16", nullptr},
-    {7, "XUserRegisterForDefaultAudioEndpointUtf16Changed", nullptr},
-    {8, "XUserUnregisterForDefaultAudioEndpointUtf16Changed", nullptr},
+    {6, "XUserGetDefaultAudioEndpointUtf16", (void*)&XUserGetDefaultAudioEndpointUtf16},
+    {7, "XUserRegisterForDefaultAudioEndpointUtf16Changed",
+     (void*)&XUserRegisterForDefaultAudioEndpointUtf16Changed},
+    {8, "XUserUnregisterForDefaultAudioEndpointUtf16Changed",
+     (void*)&XUserUnregisterForDefaultAudioEndpointUtf16Changed},
     {9, "XUserFindControllerForUserWithUiAsync", nullptr},
     {10, "XUserFindControllerForUserWithUiResult", nullptr},
 };
