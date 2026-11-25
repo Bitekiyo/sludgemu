@@ -1,6 +1,7 @@
 #include "gpu/presenter.h"
 
 #include <dxgi1_6.h>
+#include <stdlib.h>
 
 #include "common/log.h"
 #include "gpu/gpu.h"
@@ -152,6 +153,33 @@ static bool setup(Presenter* p, ID3D12CommandQueue* queue) {
     LOG_I("present", "swap chain %ux%u, %s", p->width, p->height,
           p->tearing ? "tearing allowed" : "no tearing");
     return true;
+}
+
+// RenderDoc: under renderdoccmd, SLUDGE_RENDERDOC_FRAME=<n> captures the frame after the n-th
+// present. Title rendering runs on its own queues, so the capture spans the whole frame.
+typedef int(__cdecl* RenderDocGetApi)(int version, void** api);
+#define RENDERDOC_API_VERSION_1_1_2 10102
+#define RENDERDOC_TRIGGER_CAPTURE   15 // entry of the API function table
+
+static void renderdoc_frame() {
+    static void** s_api = nullptr;
+    static u64 s_capture_frame = 0;
+    static u64 s_frame = 0;
+    static bool s_checked = false;
+    if (!s_checked) {
+        s_checked = true;
+        char value[32];
+        HMODULE renderdoc = GetModuleHandleW(L"renderdoc.dll");
+        RenderDocGetApi get_api =
+            renderdoc ? (RenderDocGetApi)GetProcAddress(renderdoc, "RENDERDOC_GetAPI") : nullptr;
+        if (get_api && GetEnvironmentVariableA("SLUDGE_RENDERDOC_FRAME", value, sizeof(value)) &&
+            get_api(RENDERDOC_API_VERSION_1_1_2, (void**)&s_api) == 1) {
+            s_capture_frame = strtoull(value, nullptr, 10);
+            LOG_I("present", "RenderDoc: capturing frame %llu", (unsigned long long)s_capture_frame);
+        }
+    }
+    if (s_api && ++s_frame == s_capture_frame)
+        ((void(__cdecl*)())s_api[RENDERDOC_TRIGGER_CAPTURE])();
 }
 
 static void wait_frame(Presenter* p, u64 value) {
@@ -337,6 +365,7 @@ u64 presenter_present(ID3D12CommandQueue* queue, const PresentPlane* planes, u32
     if (SUCCEEDED(hr)) {
         ID3D12CommandList* list = p->list;
         queue->ExecuteCommandLists(1, &list);
+        renderdoc_frame(); // called under the presenter lock
         hr = p->swap_chain->Present(1, 0);
         if (FAILED(hr) && !gpu_device_lost(hr))
             LOG_E("present", "Present failed (0x%08lx)", (unsigned long)hr);
