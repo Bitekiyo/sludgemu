@@ -17,14 +17,23 @@ struct RangeSlot {
     MemRegion* regions; // placeholder ranges only; sorted by first_page, regions[0].first_page == 0
     u32 region_count;
     u32 region_capacity;
-    u32* anchors; // placeholder ranges: per slice of MEM_CHUNK_PAGES pages, the first real frame of
-                  // the chunk the slice prefers, or MEM_INVALID_PFN
+    u32* anchors; // placeholder ranges: per slice of REGION_PAGES pages, the first real frame of the
+                  // region the slice prefers, or MEM_INVALID_PFN
     u32* pending; // placeholder ranges, once frames are mapped: per page, the frame ID mapped there but
                   // not backed yet (see "Lazy backing"), or MEM_INVALID_PFN
 };
 
 #define MAX_RANGES 8192
 #define MAX_CHUNKS 256
+
+// Placeholder ranges lay their frames out in regions of real memory, one per slice of this many
+// pages (see preferred_real). Chunks hold several regions.
+#define REGION_PAGES 512u
+#define MAX_REGIONS  (MAX_CHUNKS * (MEM_CHUNK_PAGES / REGION_PAGES))
+
+// Title commits at least this large are committed lazily, this much at a time.
+#define LAZY_COMMIT_MIN     MiB(16)
+#define LAZY_COMMIT_GRANULE MiB(1)
 
 // Win32 functions from newer API sets, resolved at runtime.
 typedef PVOID(WINAPI* VirtualAlloc2Fn)(HANDLE, PVOID, SIZE_T, ULONG, ULONG, MEM_EXTENDED_PARAMETER*, ULONG);
@@ -40,9 +49,9 @@ struct MemoryState {
     // Physical memory is a set of committed sections ("chunks") created as pages get allocated, so
     // the commit charge follows actual use.
     HANDLE chunks[MAX_CHUNKS];
-    bool chunk_anchored[MAX_CHUNKS]; // preferred by a slice of some placeholder range (see bind_frame)
-    u32 chunk_count;                 // chunks covering all of physical memory (created or not)
-    u8* linear;                      // every chunk is mapped here, real frame r at r * MEM_PAGE_SIZE
+    bool region_claimed[MAX_REGIONS]; // preferred by a slice of a placeholder range (see preferred_real)
+    u32 chunk_count;                  // chunks covering all of physical memory (created or not)
+    u8* linear;                       // every chunk is mapped here, real frame r at r * MEM_PAGE_SIZE
     u64 total_pages;
 
     // The page frame numbers titles get are IDs. An ID is bound to a real frame (a page of the
@@ -132,8 +141,8 @@ bool mem_init(u64 physical_bytes) {
     g_mem.id_to_real = (u32*)(g_mem.dirty_bitmap + words);
     g_mem.real_to_id = g_mem.id_to_real + g_mem.total_pages;
     memset(g_mem.id_to_real, 0xFF, g_mem.total_pages * 4);
-    // Frame 0 is never handed out. Titles map page number 0 where they have no page (console
-    // mapping calls accept it), so it stays a spare frame instead of naming a live one.
+    // Frame 0 is never handed out: titles map page number 0 where they want no page (see
+    // map_span_locked), so it must not name a frame.
     bit_set(g_mem.id_bitmap, 0);
     g_mem.used_pages = 1;
     g_mem.id_hint = 1;
@@ -196,34 +205,39 @@ static void create_chunk(u32 index) {
     LOG_D("memory", "physical chunk %u committed (%llu MiB)", index, MEM_CHUNK_SIZE >> 20);
 }
 
-// Claims a chunk that has no real frame bound and no range slice preferring it, for a slice.
-// Returns its first real frame, or MEM_INVALID_PFN. phys_lock held.
-static u32 claim_free_chunk() {
-    const u64 words_per_chunk = MEM_CHUNK_PAGES / 64;
-    for (u32 c = 0; c < g_mem.chunk_count; c++) {
-        if (g_mem.chunk_anchored[c])
-            continue;
-        const u64* w = g_mem.real_bitmap + c * words_per_chunk;
-        u64 any = 0;
-        for (u64 i = 0; i < words_per_chunk; i++)
-            any |= w[i];
-        if (!any) {
-            g_mem.chunk_anchored[c] = true;
-            return c * (u32)MEM_CHUNK_PAGES;
+// Claims a region that has no real frame bound and no range slice preferring it, for a slice:
+// first in chunks that exist already, which keeps commit charge close to what is used. Returns its
+// first real frame, or MEM_INVALID_PFN. phys_lock held.
+static u32 claim_free_region() {
+    const u32 regions = (u32)(g_mem.total_pages / REGION_PAGES);
+    const u32 per_chunk = (u32)(MEM_CHUNK_PAGES / REGION_PAGES);
+    for (int pass = 0; pass < 2; pass++) {
+        for (u32 r = 0; r < regions; r++) {
+            bool created = g_mem.chunks[r / per_chunk] != nullptr;
+            if (g_mem.region_claimed[r] || created != (pass == 0))
+                continue;
+            const u64* w = g_mem.real_bitmap + (u64)r * (REGION_PAGES / 64);
+            u64 any = 0;
+            for (u32 i = 0; i < REGION_PAGES / 64; i++)
+                any |= w[i];
+            if (!any) {
+                g_mem.region_claimed[r] = true;
+                return r * REGION_PAGES;
+            }
         }
     }
     return MEM_INVALID_PFN;
 }
 
-// A free real frame, preferring chunks no range slice has claimed. phys_lock held.
+// A free real frame, preferring regions no range slice has claimed. phys_lock held.
 static u32 find_free_real() {
     for (int pass = 0; pass < 2; pass++) {
         u64 i = g_mem.real_hint;
         for (u64 scanned = 0; scanned < g_mem.total_pages; scanned++, i++) {
             if (i >= g_mem.total_pages)
                 i = 0;
-            if (pass == 0 && g_mem.chunk_anchored[i / MEM_CHUNK_PAGES]) {
-                u64 skip = MEM_CHUNK_PAGES - i % MEM_CHUNK_PAGES - 1; // to the end of this chunk
+            if (pass == 0 && g_mem.region_claimed[i / REGION_PAGES]) {
+                u64 skip = REGION_PAGES - i % REGION_PAGES - 1; // to the end of this region
                 scanned += skip;
                 i += skip;
                 continue;
@@ -585,7 +599,7 @@ void* mem_reserve_placeholder(u64 size, const MemAddressLimits& limits, u32 rang
         return nullptr;
     }
     MemRegion* regions = (MemRegion*)malloc(sizeof(MemRegion));
-    u64 slices = ((size >> MEM_PAGE_SHIFT) + MEM_CHUNK_PAGES - 1) / MEM_CHUNK_PAGES;
+    u64 slices = ((size >> MEM_PAGE_SHIFT) + REGION_PAGES - 1) / REGION_PAGES;
     u32* anchors = (u32*)malloc(slices * sizeof(u32));
     if (!regions || !anchors)
         FATAL("out of memory tracking mappings");
@@ -615,6 +629,12 @@ void* mem_reserve_placeholder(u64 size, const MemAddressLimits& limits, u32 rang
 void* mem_alloc_virtual(void* base, u64 size, u32 alloc_type, u32 protect, const MemAddressLimits& limits,
                         u32 range_flags, u64 xflags) {
     void* p;
+    // A title's big commits are pools it fills over time: reserve them, commit as they're touched.
+    bool lazy = !base && (alloc_type & MEM_COMMIT) && size >= LAZY_COMMIT_MIN;
+    if (lazy) {
+        alloc_type = (alloc_type & ~MEM_COMMIT) | MEM_RESERVE;
+        range_flags |= MEM_RANGE_LAZY;
+    }
     if (base) {
         // Committing inside an existing reservation (or a fixed-address request): no constraints.
         p = VirtualAlloc(base, size, alloc_type, protect);
@@ -630,7 +650,7 @@ void* mem_alloc_virtual(void* base, u64 size, u32 alloc_type, u32 protect, const
         return nullptr;
     // Fresh reservations are tracked; commits into an existing tracked range are not new ranges.
     if (!base || !mem_is_tracked(base)) {
-        if (range_flags & MEM_RANGE_GPU)
+        if (range_flags & (MEM_RANGE_GPU | MEM_RANGE_LAZY))
             add_range((u8*)p, ALIGN_UP(size, MEM_PAGE_SIZE), range_flags, protect, xflags, nullptr, nullptr);
     }
     return p;
@@ -644,17 +664,18 @@ static bool frame_allocated(u64 pfn) {
 }
 
 // Where a frame mapped at `page` of a placeholder range should live in real memory. Each slice of
-// MEM_CHUNK_PAGES pages of the range claims a whole free chunk when it first needs one and lays its
-// pages out in it in address order, so pages the title maps next to each other are next to each
-// other in memory, whatever order it maps them in. That is what lets the GPU see a range of title
-// memory as one block (see MemBlock). Without a chunk to claim, a page follows its predecessor.
-// Range lock and phys_lock held.
+// REGION_PAGES pages of the range claims a free region when it first needs one and lays its pages
+// out in it in address order, so pages the title maps next to each other are next to each other in
+// memory, whatever order it maps them in. That is what lets the GPU see a range of title memory as
+// one block (see MemBlock); slices touched in order usually get neighbouring regions, which extends
+// blocks across them. Without a region to claim, a page follows its predecessor. Range lock and
+// phys_lock held.
 static u32 preferred_real(RangeSlot* s, u32 page, u32 previous) {
-    u32 slice = page / (u32)MEM_CHUNK_PAGES;
+    u32 slice = page / REGION_PAGES;
     if (s->anchors[slice] == MEM_INVALID_PFN)
-        s->anchors[slice] = claim_free_chunk();
+        s->anchors[slice] = claim_free_region();
     if (s->anchors[slice] != MEM_INVALID_PFN)
-        return s->anchors[slice] + page % (u32)MEM_CHUNK_PAGES;
+        return s->anchors[slice] + page % REGION_PAGES;
     if (previous == MEM_INVALID_PFN && page > 0) {
         const MemRegion& r = s->regions[region_find(s, page - 1)];
         if (r.pfn != REGION_PLACEHOLDER)
@@ -663,13 +684,13 @@ static u32 preferred_real(RangeSlot* s, u32 page, u32 previous) {
     return previous == MEM_INVALID_PFN ? MEM_INVALID_PFN : previous + 1;
 }
 
-// Gives up the range's claims on chunks. Range lock held.
+// Gives up the range's claims on regions. Range lock held.
 static void release_anchors(RangeSlot* s) {
-    u32 slices = (range_pages(s) + (u32)MEM_CHUNK_PAGES - 1) / (u32)MEM_CHUNK_PAGES;
+    u32 slices = (range_pages(s) + REGION_PAGES - 1) / REGION_PAGES;
     AcquireSRWLockExclusive(&g_mem.phys_lock);
     for (u32 i = 0; i < slices; i++) {
         if (s->anchors[i] != MEM_INVALID_PFN)
-            g_mem.chunk_anchored[s->anchors[i] / MEM_CHUNK_PAGES] = false;
+            g_mem.region_claimed[s->anchors[i] / REGION_PAGES] = false;
     }
     ReleaseSRWLockExclusive(&g_mem.phys_lock);
     free(s->anchors);
@@ -712,12 +733,12 @@ static void back_and_map_locked(RangeSlot* s, u32 first, u32 count, const u32* i
 // commit charge. So a mapped frame stays pending, its page a placeholder, until the page is first
 // touched: by the CPU (an access fault, see on_access_fault) or by us for the GPU and for kernel I/O
 // (mem_prepare). Then the pending frames of the page's whole slice are backed together, which keeps
-// the slice's frames consecutive in one chunk for the GPU and makes later touches nearby free.
+// the slice's frames consecutive in one region for the GPU and makes later touches nearby free.
 
 // Backs the pending frames of the slice holding `page`. Range lock held exclusively.
 static void back_slice_locked(RangeSlot* s, u32 page) {
-    u32 lo = page - page % (u32)MEM_CHUNK_PAGES;
-    u32 hi = lo + (u32)MEM_CHUNK_PAGES < range_pages(s) ? lo + (u32)MEM_CHUNK_PAGES : range_pages(s);
+    u32 lo = page - page % REGION_PAGES;
+    u32 hi = lo + REGION_PAGES < range_pages(s) ? lo + REGION_PAGES : range_pages(s);
     for (u32 p = lo; p < hi;) {
         if (s->pending[p] == MEM_INVALID_PFN) {
             p++;
@@ -750,6 +771,20 @@ static bool back_range_locked(RangeSlot* s, const u8* addr, u64 size) {
     return any;
 }
 
+// Commits the granules of a lazily committed range under [addr, addr + size). Commits already
+// there stay. Range lock held.
+static bool commit_lazy_locked(const RangeSlot* s, const u8* addr, u64 size) {
+    const u8* range_end = s->info.base + s->info.size;
+    u8* lo = (u8*)ALIGN_DOWN((uptr)addr, LAZY_COMMIT_GRANULE);
+    u8* hi = (u8*)ALIGN_UP((uptr)(addr + size), LAZY_COMMIT_GRANULE);
+    lo = lo > s->info.base ? lo : s->info.base;
+    hi = hi < range_end ? hi : (u8*)range_end;
+    if (VirtualAlloc(lo, (u64)(hi - lo), MEM_COMMIT, mapping_protect(s)))
+        return true;
+    LOG_E("memory", "cannot commit title memory %p+0x%llx (%lu)", lo, (u64)(hi - lo), GetLastError());
+    return false;
+}
+
 void mem_prepare(const void* addr, u64 size) {
     const u8* p = (const u8*)addr;
     const u8* end = p + size;
@@ -759,14 +794,32 @@ void mem_prepare(const void* addr, u64 size) {
         if (!s)
             break;
         const u8* range_end = s->info.base + s->info.size;
+        u64 n = (u64)((end < range_end ? end : range_end) - p);
         if (s->info.flags & MEM_RANGE_PLACEHOLDER)
-            back_range_locked(s, p, (u64)((end < range_end ? end : range_end) - p));
+            back_range_locked(s, p, n);
+        else if (s->info.flags & MEM_RANGE_LAZY)
+            commit_lazy_locked(s, p, n);
         p = range_end;
     }
     ReleaseSRWLockExclusive(&g_mem.range_lock);
 }
 
-// CPU access to a pending page: back it and retry the access.
+// Whether the page holding `addr` now allows the faulting access (0 read, 1 write, 8 execute).
+static bool access_allowed(const void* addr, ULONG_PTR access) {
+    MEMORY_BASIC_INFORMATION mbi;
+    if (!VirtualQuery(addr, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT || (mbi.Protect & PAGE_GUARD))
+        return false;
+    const u32 writable = PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    const u32 readable = writable | PAGE_READONLY | PAGE_EXECUTE_READ;
+    const u32 executable = PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    u32 p = mbi.Protect & 0xFF;
+    return access == 1 ? (p & writable) != 0 : access == 8 ? (p & executable) != 0 : (p & readable) != 0;
+}
+
+// CPU access to title memory we haven't backed yet: back it and retry the access. Remapping a
+// placeholder range can also leave a page briefly unmapped (a view is split by unmapping it and
+// mapping its pieces again) while other threads use it; holding the range lock waits that out, and
+// the access is retried if the page is there now.
 static LONG CALLBACK on_access_fault(EXCEPTION_POINTERS* ep) {
     const EXCEPTION_RECORD* e = ep->ExceptionRecord;
     if (e->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || e->NumberParameters < 2)
@@ -774,7 +827,17 @@ static LONG CALLBACK on_access_fault(EXCEPTION_POINTERS* ep) {
     const u8* addr = (const u8*)e->ExceptionInformation[1];
     AcquireSRWLockExclusive(&g_mem.range_lock);
     RangeSlot* s = find_range_locked(addr);
-    bool backed = s && (s->info.flags & MEM_RANGE_PLACEHOLDER) && back_range_locked(s, addr, 1);
+    bool backed = false;
+    if (s && (s->info.flags & MEM_RANGE_PLACEHOLDER)) {
+        backed = back_range_locked(s, addr, 1) || access_allowed(addr, e->ExceptionInformation[0]);
+    } else if (s && (s->info.flags & MEM_RANGE_LAZY)) {
+        // Only reserved pages are ours to commit. Another thread may have committed the page since
+        // this one faulted; a fault on memory that allows the access now is simply retried.
+        MEMORY_BASIC_INFORMATION mbi;
+        backed = (VirtualQuery(addr, &mbi, sizeof(mbi)) && mbi.State == MEM_RESERVE &&
+                  commit_lazy_locked(s, addr, 1)) ||
+                 access_allowed(addr, e->ExceptionInformation[0]);
+    }
     ReleaseSRWLockExclusive(&g_mem.range_lock);
     return backed ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
 }
@@ -794,7 +857,7 @@ static bool map_span_locked(void* va, u64 count, const u64* pfns) {
     }
     // Validate everything before changing anything.
     for (u64 i = 0; pfns && i < count; i++) {
-        if (pfns[i] != MEM_INVALID_PFN && !frame_allocated(pfns[i])) {
+        if (pfns[i] != MEM_INVALID_PFN && pfns[i] != 0 && !frame_allocated(pfns[i])) {
             LOG_E("memory", "page 0x%llx mapped at %p is not an allocated page frame", pfns[i],
                   (u8*)va + (i << MEM_PAGE_SHIFT));
             return false;
@@ -809,7 +872,9 @@ static bool map_span_locked(void* va, u64 count, const u64* pfns) {
     // Whatever was mapped there goes; the new frames wait for their first touch.
     unmap_run(s, first, (u32)count);
     for (u64 i = 0; s->pending && i < count; i++) {
-        bool frame = pfns && pfns[i] != MEM_INVALID_PFN;
+        // Titles release slots by mapping page number 0 over them (console page numbers start
+        // above it), so 0 unmaps like a missing array.
+        bool frame = pfns && pfns[i] != MEM_INVALID_PFN && pfns[i] != 0;
         s->pending[first + i] = frame ? (u32)(pfns[i] >> MEM_PAGE_NUMBER_SHIFT) : MEM_INVALID_PFN;
     }
     return true;

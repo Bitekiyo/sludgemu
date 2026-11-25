@@ -183,6 +183,7 @@ bool gpu_translate(u64 address, u64 size, GpuAddress* out) {
         return false;
     }
     block = window_extent(block, address, size);
+    mem_prepare(block.base, block.size); // a heap over title memory needs all of it committed
     ID3D12Resource* buffer = open_window(block);
     if (!buffer)
         return false;

@@ -34,6 +34,7 @@ enum MemRangeFlags : u32 {
     MEM_RANGE_PLACEHOLDER = 1u << 1, // reserved for physical page mapping
     MEM_RANGE_CPU_ACCESS = 1u << 2,  // CPU may access (not GPU-only)
     MEM_RANGE_OWNS_PAGES = 1u << 3,  // physical pages were allocated with the range; freed on release
+    MEM_RANGE_LAZY = 1u << 4,        // committed by the title but reserved here, committed when touched
 };
 
 // Description of a tracked range. Ranges can be released by another thread at any time, so they
@@ -91,7 +92,8 @@ void* mem_alloc_physical_backed(u64 size, const MemAddressLimits& limits, u32 ra
                                 u64 xflags);
 
 // Reserves (+ optionally commits) ordinary memory with address constraints. Returns nullptr on
-// failure. Ranges with MEM_RANGE_GPU are registered.
+// failure. Ranges with MEM_RANGE_GPU are registered. Large commits are only reserved and get
+// committed as they are touched, like mapped physical frames (see mem_map_physical).
 void* mem_alloc_virtual(void* base, u64 size, u32 alloc_type, u32 protect, const MemAddressLimits& limits,
                         u32 range_flags, u64 xflags);
 
@@ -105,7 +107,8 @@ void* mem_alloc_virtual(void* base, u64 size, u32 alloc_type, u32 protect, const
 bool mem_map_physical(void* va, u64 count, const u64* pfns);
 bool mem_map_physical_scatter(void* const* vas, u64 count, const u64* pfns);
 
-// Backs any frames mapped but not yet backed under [addr, addr + size) (see mem_map_physical).
+// Backs anything committed or mapped by the title but not backed yet under [addr, addr + size) (see
+// mem_alloc_virtual and mem_map_physical).
 void mem_prepare(const void* addr, u64 size);
 
 // Releases a range created by the functions above. Returns false if `base` isn't one of ours.
