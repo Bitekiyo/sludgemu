@@ -9,6 +9,10 @@
 bool list_gpu_descriptor(const ConsoleCommandList* list, u64 handle, D3D12_GPU_DESCRIPTOR_HANDLE* out);
 
 // The desktop CPU-only handle for `count` console descriptors starting at `handle`.
+// A console shader-visible descriptor's index in the bound heaps (desktop and console heaps match).
+bool list_descriptor_index(const ConsoleCommandList* list, u64 handle, u32* out);
+// Root arguments to the desktop list as user data, if they changed.
+void list_flush_user_data(ConsoleCommandList* self, bool graphics);
 bool list_cpu_descriptor(u64 handle, u32 count, D3D12_CPU_DESCRIPTOR_HANDLE* out);
 
 // The desktop resource behind a console resource and where the console resource starts in it.

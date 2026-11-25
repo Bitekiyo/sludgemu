@@ -216,33 +216,21 @@ static HRESULT WINAPI device_create_compute_pipeline_state_x(ConsoleDevice* self
     return console_create_compute_pipeline_state(self, desc, iid, out);
 }
 
-static HRESULT WINAPI device_create_derived_pipeline_state_x(ConsoleDevice* self, void* source, UINT,
-                                                             const void*, REFIID iid, void** out) {
-    return console_derive_pipeline_state(self, source, iid, out);
+static HRESULT WINAPI device_create_derived_pipeline_state_x(ConsoleDevice* self, void* source, UINT count,
+                                                             const void* descs, REFIID iid, void** out) {
+    return console_derive_pipeline_state(self, source, count, descs, iid, out);
 }
 
-// The serialized form starts with the root signature, the packet and its size, the same for
-// graphics and compute pipelines; shader code and metadata follow.
-struct ConsoleSerializedPipelineHeader {
-    void* root_signature;
-    void* packet;
-    usize packet_size;
-};
-
-static HRESULT WINAPI device_deserialize_graphics_pipeline_state_x(
-    ConsoleDevice* self, const ConsoleSerializedPipelineHeader* state, REFIID iid, void** out) {
-    if (!state)
-        return E_INVALIDARG;
-    return console_deserialize_pipeline_state(self, false, state->root_signature, state->packet,
-                                              state->packet_size, iid, out);
+static HRESULT WINAPI device_deserialize_graphics_pipeline_state_x(ConsoleDevice* self,
+                                                                   const ConsoleSerializedPipeline* state,
+                                                                   REFIID iid, void** out) {
+    return console_deserialize_pipeline_state(self, false, state, iid, out);
 }
 
-static HRESULT WINAPI device_deserialize_compute_pipeline_state_x(
-    ConsoleDevice* self, const ConsoleSerializedPipelineHeader* state, REFIID iid, void** out) {
-    if (!state)
-        return E_INVALIDARG;
-    return console_deserialize_pipeline_state(self, true, state->root_signature, state->packet,
-                                              state->packet_size, iid, out);
+static HRESULT WINAPI device_deserialize_compute_pipeline_state_x(ConsoleDevice* self,
+                                                                  const ConsoleSerializedPipeline* state,
+                                                                  REFIID iid, void** out) {
+    return console_deserialize_pipeline_state(self, true, state, iid, out);
 }
 
 static HRESULT WINAPI device_create_query_heap(ConsoleDevice* self, const D3D12_QUERY_HEAP_DESC* desc,

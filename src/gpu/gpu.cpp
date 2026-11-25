@@ -3,6 +3,7 @@
 #include <stdlib.h>
 
 #include "common/log.h"
+#include "gpu/shader_programs.h"
 
 static GpuOptions g_options;
 static ID3D12Device13* g_device = nullptr;
@@ -215,6 +216,7 @@ static BOOL CALLBACK create_device(PINIT_ONCE, void*, void**) {
     if (g_options.debug_layer)
         route_debug_messages(g_device);
     watch_for_removal(g_device);
+    shader_programs_init();
     return TRUE;
 }
 

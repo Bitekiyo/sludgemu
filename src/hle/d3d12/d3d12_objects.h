@@ -1,5 +1,6 @@
 #pragma once
 
+#include "shader/console_pipeline.h"
 #include <windows.h>
 #include <d3d12.h>
 
@@ -100,8 +101,19 @@ struct ConsolePutBuffer {
 struct ConsoleDescriptorHeap;
 struct ConsoleRootSignature;
 struct ConsoleFence;
+struct ConsolePipelineState;
 
-// Root arguments as recorded on the desktop list (already translated).
+// The output formats a draw renders to: desktop pipelines are made per set.
+struct PipelineOutputs {
+    u8 render_target_formats[8];
+    u8 render_target_count;
+    u8 depth_format;
+    u8 sample_count;
+    u8 unused;
+};
+
+// Root arguments: tables as desktop heap indices, root descriptors as desktop GPU addresses. They
+// reach the desktop list before each draw or dispatch, as the user data translated shaders read.
 enum RootArgKind : u8 {
     ROOT_ARG_NONE,
     ROOT_ARG_TABLE,
@@ -124,7 +136,10 @@ struct ListState {
     ConsoleDescriptorHeap* heaps[2]; // bound shader-visible heaps: views, samplers
     RootArgs graphics;
     RootArgs compute;
-    ID3D12PipelineState* pipeline; // nullptr until pipeline states are translated
+    bool user_data_dirty[2];        // graphics, compute: root arguments changed since the last flush
+    ConsolePipelineState* pipeline; // set by the title (not referenced: the title keeps it alive)
+    ID3D12PipelineState* bound;     // the desktop pipeline set on the desktop list
+    PipelineOutputs outputs;        // formats of the bound targets
     D3D12_PRIMITIVE_TOPOLOGY topology;
     u32 vertex_buffer_mask;
     D3D12_VERTEX_BUFFER_VIEW vertex_buffers[D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT];
@@ -183,7 +198,18 @@ struct ConsoleCommandList {
     ConsoleCommandAllocator* allocator; // the allocator of the current recording
     ID3D12Device13* device;
     bool recording;
+    u32 skipped_draws; // draws and dispatches without a desktop pipeline yet
     ListState state;
+
+    // Descriptor tables the recording uses, mirrored again when the list is submitted: titles may
+    // fill tables after recording the draws that use them (the GPU reads them only when it runs).
+    struct TableUse {
+        const ConsoleDescriptorHeap* heap;
+        u32 first;
+        u32 count;
+    }* tables;
+    u32 table_count;
+    u32 table_capacity;
 };
 
 struct ConsoleCommandListDesc {
@@ -302,6 +328,13 @@ struct DescriptorSlot {
 
 void console_descriptor_heap_init();
 
+// Console descriptor slots written by us start with this marker, then the slot's descriptor type
+// and its desktop CPU-only descriptor.
+#define DESCRIPTOR_MARKER_MAGIC 0x47444C53u // "SLDG"
+
+// Brings slots the title copied raw into a shader-visible heap to its desktop descriptors.
+void console_descriptor_mirror(const ConsoleDescriptorHeap* heap, u32 first, u32 count);
+
 HRESULT console_create_descriptor_heap(ConsoleDevice* device, const D3D12_DESCRIPTOR_HEAP_DESC* desc,
                                        REFIID iid, void** out);
 
@@ -342,7 +375,12 @@ HRESULT console_create_command_signature(ConsoleDevice* device, const D3D12_COMM
 // Root signatures have at most 64 DWORDs of arguments, so at most 64 parameters.
 #define ROOT_MAX_PARAMETERS 64
 
-// A root signature, kept in its desktop form plus the description for translating root arguments.
+// A root signature. Translated shaders read the console's user data (the root arguments as they lie
+// in user SGPRs) from root constants, and root descriptors from root SRVs/UAVs; the desktop
+// signature has that layout (see shader/translate.h).
+#define ROOT_USER_DATA_SPACE      100 // root constants (b0) and root descriptors (t<n>/u<n>, n = parameter)
+#define ROOT_STATIC_SAMPLER_SPACE 102
+
 struct ConsoleRootSignature {
     ConsoleObjectHeader header;
 
@@ -350,6 +388,11 @@ struct ConsoleRootSignature {
     ID3D12VersionedRootSignatureDeserializer* deserializer;
     ID3D12RootSignature* desktop;
     u8 constant_offset[ROOT_MAX_PARAMETERS]; // root constants: where each parameter's values start
+
+    ConsoleRootLayout layout;                  // for shader translation
+    u8 user_dwords;                            // user data dwords in the desktop root constants
+    u8 user_sgpr[ROOT_MAX_PARAMETERS];         // each parameter's first user SGPR
+    s8 desktop_parameter[ROOT_MAX_PARAMETERS]; // root descriptors: their desktop root parameter
 };
 
 void console_root_signature_init();
@@ -357,14 +400,83 @@ void console_root_signature_init();
 HRESULT console_create_root_signature(ConsoleDevice* device, const void* blob, usize size, REFIID iid,
                                       void** out);
 
-// A pipeline state: the console's packet for it (public; title code copies it into command
-// lists) and what translating it needs. No desktop pipeline exists until shaders are translated.
+// Serialized console pipelines as titles hand them to DeserializeGraphicsPipelineStateX and
+// DeserializeComputePipelineStateX: the root signature, the packet (registers), pipeline metadata,
+// then per stage the GPU code and its (debugging) metadata. Graphics pipelines list the hardware
+// stages pixel, vertex, geometry, export, hull, local and fetch; compute pipelines only compute.
+struct ConsoleSerializedShader {
+    const void* code;
+    usize code_size;
+    const void* metadata;
+    usize metadata_size;
+};
+
+enum ConsoleHardwareStage : u32 {
+    HW_STAGE_PS,
+    HW_STAGE_VS,
+    HW_STAGE_GS,
+    HW_STAGE_ES,
+    HW_STAGE_HS,
+    HW_STAGE_LS,
+    HW_STAGE_FS,
+    HW_STAGE_COUNT,
+};
+
+struct ConsoleSerializedPipeline {
+    void* root_signature;
+    const void* packet;
+    usize packet_size;
+    const void* metadata;
+    usize metadata_size;
+    ConsoleSerializedShader stages[HW_STAGE_COUNT]; // compute: stages[0] is the compute shader
+};
+
+struct ShaderProgram;
+
+// Fixed-function state of a graphics pipeline, decoded from its registers or set by deriving.
+struct PipelineFixedState {
+    D3D12_BLEND_DESC blend;
+    D3D12_RASTERIZER_DESC rasterizer;
+    D3D12_DEPTH_STENCIL_DESC depth_stencil;
+    u32 sample_mask;
+    D3D12_PRIMITIVE_TOPOLOGY_TYPE topology_type;
+    D3D12_INDEX_BUFFER_STRIP_CUT_VALUE strip_cut;
+    u8 element_count;
+    VertexElement elements[SHADER_MAX_VERTEX_ELEMENTS];
+    bool element_per_instance[SHADER_MAX_VERTEX_ELEMENTS];
+    u32 element_step_rate[SHADER_MAX_VERTEX_ELEMENTS];
+};
+
+enum PipelineVariantState : u32 {
+    VARIANT_BUILDING,
+    VARIANT_READY,
+    VARIANT_FAILED,
+};
+
+#define PIPELINE_MAX_VARIANTS 8
+
+struct PipelineVariant {
+    PipelineOutputs outputs;
+    volatile u32 state; // PipelineVariantState
+    ID3D12PipelineState* desktop;
+};
+
+// A pipeline state: the console's packet for it (public; title code copies it into command lists)
+// and its translation: shader programs, fixed-function state and desktop pipelines, made when a
+// draw first uses a set of output formats once the programs are built.
 struct ConsolePipelineState {
     ConsoleObjectHeader header;
     u32 packet[8];
 
     ConsoleRootSignature* root_signature; // referenced, or nullptr
     bool compute;
+    bool translated;            // programs were requested (otherwise draws with it are skipped)
+    ShaderProgram* programs[2]; // graphics: vertex, pixel (may be null); compute: compute
+    PipelineFixedState fixed;
+
+    SRWLOCK lock;
+    u32 variant_count;
+    PipelineVariant variants[PIPELINE_MAX_VARIANTS];
 };
 
 void console_pipeline_state_init();
@@ -374,11 +486,17 @@ HRESULT console_create_pipeline_state(ConsoleDevice* device, const D3D12_PIPELIN
 HRESULT console_create_compute_pipeline_state(ConsoleDevice* device,
                                               const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, REFIID iid,
                                               void** out);
-// Derived pipelines: a copy of `source` with some fixed-function state changed.
-HRESULT console_derive_pipeline_state(ConsoleDevice* device, void* source, REFIID iid, void** out);
-// Serialized console pipelines: the root signature and the pipeline's packet.
-HRESULT console_deserialize_pipeline_state(ConsoleDevice* device, bool compute, void* root_signature,
-                                           const void* packet, usize packet_size, REFIID iid, void** out);
+// Derived pipelines: a copy of `source` with some fixed-function state changed by `descs` (the
+// console's derived state descriptions, `count` of them).
+HRESULT console_derive_pipeline_state(ConsoleDevice* device, void* source, u32 count, const void* descs,
+                                      REFIID iid, void** out);
+HRESULT console_deserialize_pipeline_state(ConsoleDevice* device, bool compute,
+                                           const ConsoleSerializedPipeline* serialized, REFIID iid,
+                                           void** out);
+
+// The desktop pipeline for drawing (or dispatching) with `pso` to `outputs`, or nullptr while it is
+// being made or if it cannot be.
+ID3D12PipelineState* console_pipeline_desktop(ConsolePipelineState* pso, const PipelineOutputs* outputs);
 
 // Page pools (page_pool.cpp): title memory registered as a source of GPU page mapping copies.
 HRESULT console_register_page_pool(u64 address, u32 page_count, u32 flags, HANDLE* handle);

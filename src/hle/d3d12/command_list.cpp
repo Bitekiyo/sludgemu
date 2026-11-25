@@ -12,9 +12,11 @@
 // first starts with the state the list had set (ListState).
 
 #include "hle/d3d12/command_list.h"
+#include "hle/d3d12/views.h"
 
 #include <stddef.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "common/log.h"
@@ -65,6 +67,21 @@ bool list_gpu_descriptor(const ConsoleCommandList* list, u64 handle, D3D12_GPU_D
         u64 index = (handle - (u64)heap->memory) / heap->stride;
         if (index < heap->desktop_count) {
             out->ptr = heap->visible_gpu_start + index * heap->desktop_stride;
+            return true;
+        }
+    }
+    LOG_W_ONCE("d3d12", "descriptor table 0x%llx is not in a bound descriptor heap", handle);
+    return false;
+}
+
+bool list_descriptor_index(const ConsoleCommandList* list, u64 handle, u32* out) {
+    for (u32 i = 0; i < ARRAY_COUNT(list->state.heaps); i++) {
+        const ConsoleDescriptorHeap* heap = list->state.heaps[i];
+        if (!heap || handle < (u64)heap->memory)
+            continue;
+        u64 index = (handle - (u64)heap->memory) / heap->stride;
+        if (index < heap->desktop_count) {
+            *out = (u32)index;
             return true;
         }
     }
@@ -144,46 +161,98 @@ static D3D12_PRIMITIVE_TOPOLOGY desktop_topology(D3D12_PRIMITIVE_TOPOLOGY topolo
     return stand_in;
 }
 
-static void apply_root_args(ID3D12GraphicsCommandList8* l, const RootArgs& args, bool graphics) {
-    if (!args.signature)
+// Tables used by the recording, mirrored again at submission.
+static void list_note_table(ConsoleCommandList* self, const ConsoleDescriptorHeap* heap, u32 first,
+                            u32 count) {
+    if (self->table_count && self->tables[self->table_count - 1].heap == heap &&
+        self->tables[self->table_count - 1].first == first)
         return;
-    if (graphics)
-        l->SetGraphicsRootSignature(args.signature->desktop);
-    else
-        l->SetComputeRootSignature(args.signature->desktop);
-    const D3D12_ROOT_SIGNATURE_DESC1* desc = args.signature->desc;
+    if (self->table_count == self->table_capacity) {
+        u32 capacity = self->table_capacity ? self->table_capacity * 2 : 256;
+        void* grown = realloc(self->tables, capacity * sizeof(*self->tables));
+        if (!grown)
+            return;
+        self->tables = (ConsoleCommandList::TableUse*)grown;
+        self->table_capacity = capacity;
+    }
+    self->tables[self->table_count++] = {heap, first, count};
+}
+
+// Descriptors a table covers by its ranges. Unbounded ranges are taken as reaching a little way:
+// a bindless table can be huge, and the title copies what it uses near the start.
+#define UNBOUNDED_TABLE_EXTENT 64
+
+static u32 table_extent(const ConsoleRootParameter& p) {
+    u32 extent = 0;
+    u32 next = 0;
+    for (u32 r = 0; r < p.range_count; r++) {
+        u32 offset = p.ranges[r].offset == ~0u ? next : p.ranges[r].offset;
+        u32 end = p.ranges[r].count == ~0u ? offset + UNBOUNDED_TABLE_EXTENT : offset + p.ranges[r].count;
+        next = end;
+        if (end > extent)
+            extent = end;
+    }
+    return extent;
+}
+
+// The user data image translated shaders read: root arguments where the console puts them in user
+// SGPRs, descriptor tables as byte offsets into the desktop heaps. Root descriptors go to their own
+// desktop root parameters.
+void list_flush_user_data(ConsoleCommandList* self, bool graphics) {
+    const RootArgs& args = graphics ? self->state.graphics : self->state.compute;
+    const ConsoleRootSignature* rs = args.signature;
+    if (!rs || !rs->desktop || !self->state.user_data_dirty[graphics ? 0 : 1])
+        return;
+    self->state.user_data_dirty[graphics ? 0 : 1] = false;
+    ID3D12GraphicsCommandList8* l = self->desktop;
+    // Compute shaders find root parameters lower than graphics ones.
+    u32 shift = graphics ? 0 : CONSOLE_FIRST_ROOT_SGPR_GRAPHICS - CONSOLE_FIRST_ROOT_SGPR_COMPUTE;
+    u32 image[64] = {};
+    const D3D12_ROOT_SIGNATURE_DESC1* desc = rs->desc;
     for (u32 i = 0; i < desc->NumParameters && i < ROOT_MAX_PARAMETERS; i++) {
+        u32 sgpr = rs->user_sgpr[i] - shift;
         u64 v = args.value[i];
         switch (args.kind[i]) {
         case ROOT_ARG_NONE:
             break;
-        case ROOT_ARG_TABLE:
-            graphics ? l->SetGraphicsRootDescriptorTable(i, {v}) : l->SetComputeRootDescriptorTable(i, {v});
+        case ROOT_ARG_TABLE: {
+            const ConsoleRootParameter& p = rs->layout.parameters[i];
+            const ConsoleDescriptorHeap* heap = self->state.heaps[p.sampler_table ? 1 : 0];
+            if (heap) {
+                console_descriptor_mirror(heap, (u32)v, table_extent(p));
+                list_note_table(self, heap, (u32)v, table_extent(p));
+            }
+            if (sgpr < ARRAY_COUNT(image))
+                image[sgpr] = (u32)v * (p.sampler_table ? CONSOLE_DESCRIPTOR_SIZE_SAMPLER
+                                                        : CONSOLE_DESCRIPTOR_SIZE_RESOURCE);
             break;
+        }
         case ROOT_ARG_CONSTANTS: {
             u32 count = desc->pParameters[i].Constants.Num32BitValues;
-            const u32* values = &args.constants[args.signature->constant_offset[i]];
-            graphics ? l->SetGraphicsRoot32BitConstants(i, count, values, 0)
-                     : l->SetComputeRoot32BitConstants(i, count, values, 0);
+            if (sgpr + count <= ARRAY_COUNT(image))
+                memcpy(&image[sgpr], &args.constants[rs->constant_offset[i]], count * sizeof(u32));
             break;
         }
         case ROOT_ARG_CBV:
-            graphics ? l->SetGraphicsRootConstantBufferView(i, v) : l->SetComputeRootConstantBufferView(i, v);
-            break;
         case ROOT_ARG_SRV:
-            graphics ? l->SetGraphicsRootShaderResourceView(i, v) : l->SetComputeRootShaderResourceView(i, v);
+            if (rs->desktop_parameter[i] >= 0)
+                graphics ? l->SetGraphicsRootShaderResourceView(rs->desktop_parameter[i], v)
+                         : l->SetComputeRootShaderResourceView(rs->desktop_parameter[i], v);
             break;
         case ROOT_ARG_UAV:
-            graphics ? l->SetGraphicsRootUnorderedAccessView(i, v)
-                     : l->SetComputeRootUnorderedAccessView(i, v);
+            if (rs->desktop_parameter[i] >= 0)
+                graphics ? l->SetGraphicsRootUnorderedAccessView(rs->desktop_parameter[i], v)
+                         : l->SetComputeRootUnorderedAccessView(rs->desktop_parameter[i], v);
             break;
         }
     }
+    graphics ? l->SetGraphicsRoot32BitConstants(0, rs->user_dwords, image, 0)
+             : l->SetComputeRoot32BitConstants(0, rs->user_dwords, image, 0);
 }
 
 // Sets everything the list had set on a fresh desktop list.
 static void apply_state(ConsoleCommandList* self) {
-    const ListState& s = self->state;
+    ListState& s = self->state;
     ID3D12GraphicsCommandList8* l = self->desktop;
     if (self->type == D3D12_COMMAND_LIST_TYPE_COPY)
         return;
@@ -194,14 +263,19 @@ static void apply_state(ConsoleCommandList* self) {
             heaps[heap_count++] = s.heaps[i]->visible;
     if (heap_count)
         l->SetDescriptorHeaps(heap_count, heaps);
-    if (s.pipeline)
-        l->SetPipelineState(s.pipeline);
-    apply_root_args(l, s.compute, false);
+    if (s.bound)
+        l->SetPipelineState(s.bound);
+    // Root arguments reach the new list with the next draw or dispatch.
+    if (s.compute.signature && s.compute.signature->desktop)
+        l->SetComputeRootSignature(s.compute.signature->desktop);
+    self->state.user_data_dirty[1] = true;
     if (s.predication)
         l->SetPredication(s.predication, s.predication_offset, s.predication_op);
     if (self->type != D3D12_COMMAND_LIST_TYPE_DIRECT)
         return;
-    apply_root_args(l, s.graphics, true);
+    if (s.graphics.signature && s.graphics.signature->desktop)
+        l->SetGraphicsRootSignature(s.graphics.signature->desktop);
+    self->state.user_data_dirty[0] = true;
     if (s.topology != D3D_PRIMITIVE_TOPOLOGY_UNDEFINED)
         l->IASetPrimitiveTopology(desktop_topology(s.topology));
     for (u32 i = 0; i < D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT; i++)
@@ -289,6 +363,7 @@ static void list_destroy(void* object) {
     for (u32 i = 0; i < self->segment_capacity; i++)
         gpu_retire(self->segments[i].list);
     free(self->segments);
+    free(self->tables);
 }
 
 static ID3D12PipelineState* desktop_pso(void* console_pso) {
@@ -321,6 +396,7 @@ static HRESULT WINAPI list_reset_x(ConsoleCommandList* self, ConsoleCommandAlloc
         self->desktop->Close();
     release_segment_fences(self);
     memset(&self->state, 0, sizeof(self->state));
+    self->table_count = 0;
     self->allocator = allocator;
     HRESULT hr = begin_segment(self, 0);
     self->recording = SUCCEEDED(hr);
@@ -394,10 +470,7 @@ static void WINAPI list_wait_64bit_value_x(ConsoleCommandList* self, UINT64 addr
 // --- pipeline state and root arguments ---------------------------------------------------------------
 
 static void WINAPI list_set_pipeline_state(ConsoleCommandList* self, void* pso) {
-    if (pso)
-        LOG_W_ONCE("d3d12", "SetPipelineState: pipeline states are not translated yet; draws and dispatches "
-                            "are skipped");
-    self->state.pipeline = nullptr;
+    self->state.pipeline = (ConsolePipelineState*)pso; // the desktop one is found at the next draw
 }
 
 static void WINAPI list_set_descriptor_heaps(ConsoleCommandList* self, UINT count,
@@ -426,27 +499,37 @@ static void set_root_signature(RootArgs* args, ConsoleRootSignature* signature) 
 static void WINAPI list_set_compute_root_signature(ConsoleCommandList* self,
                                                    ConsoleRootSignature* signature) {
     set_root_signature(&self->state.compute, signature);
-    self->desktop->SetComputeRootSignature(signature ? signature->desktop : nullptr);
+    self->state.user_data_dirty[1] = true;
+    if (signature && signature->desktop)
+        self->desktop->SetComputeRootSignature(signature->desktop);
 }
 
 static void WINAPI list_set_graphics_root_signature(ConsoleCommandList* self,
                                                     ConsoleRootSignature* signature) {
     set_root_signature(&self->state.graphics, signature);
-    self->desktop->SetGraphicsRootSignature(signature ? signature->desktop : nullptr);
+    self->state.user_data_dirty[0] = true;
+    if (signature && signature->desktop)
+        self->desktop->SetGraphicsRootSignature(signature->desktop);
 }
 
-static bool record_root_arg(RootArgs* args, UINT index, RootArgKind kind, u64 value) {
+static bool record_root_arg(ConsoleCommandList* self, bool graphics, UINT index, RootArgKind kind,
+                            u64 value) {
+    RootArgs* args = graphics ? &self->state.graphics : &self->state.compute;
     if (index >= ROOT_MAX_PARAMETERS)
         return false;
     args->kind[index] = kind;
     args->value[index] = value;
+    self->state.user_data_dirty[graphics ? 0 : 1] = true;
     return true;
 }
 
 // Root constants are kept at their parameter's place among all of the signature's constants.
-static bool record_root_constants(RootArgs* args, UINT index, UINT count, const void* values, UINT offset) {
+static bool record_root_constants(ConsoleCommandList* self, bool graphics, UINT index, UINT count,
+                                  const void* values, UINT offset) {
+    RootArgs* args = graphics ? &self->state.graphics : &self->state.compute;
     if (!args->signature || index >= ROOT_MAX_PARAMETERS)
         return false;
+    self->state.user_data_dirty[graphics ? 0 : 1] = true;
     u32 start = args->signature->constant_offset[index] + offset;
     if (start + count > ARRAY_COUNT(args->constants))
         return false;
@@ -457,78 +540,66 @@ static bool record_root_constants(RootArgs* args, UINT index, UINT count, const 
 
 static void WINAPI list_set_compute_root_descriptor_table(ConsoleCommandList* self, UINT index,
                                                           D3D12_GPU_DESCRIPTOR_HANDLE table) {
-    D3D12_GPU_DESCRIPTOR_HANDLE d;
-    if (list_gpu_descriptor(self, table.ptr, &d) &&
-        record_root_arg(&self->state.compute, index, ROOT_ARG_TABLE, d.ptr))
-        self->desktop->SetComputeRootDescriptorTable(index, d);
+    u32 slot;
+    if (list_descriptor_index(self, table.ptr, &slot))
+        record_root_arg(self, false, index, ROOT_ARG_TABLE, slot);
 }
 
 static void WINAPI list_set_graphics_root_descriptor_table(ConsoleCommandList* self, UINT index,
                                                            D3D12_GPU_DESCRIPTOR_HANDLE table) {
-    D3D12_GPU_DESCRIPTOR_HANDLE d;
-    if (list_gpu_descriptor(self, table.ptr, &d) &&
-        record_root_arg(&self->state.graphics, index, ROOT_ARG_TABLE, d.ptr))
-        self->desktop->SetGraphicsRootDescriptorTable(index, d);
+    u32 slot;
+    if (list_descriptor_index(self, table.ptr, &slot))
+        record_root_arg(self, true, index, ROOT_ARG_TABLE, slot);
 }
 
 static void WINAPI list_set_compute_root_32bit_constant(ConsoleCommandList* self, UINT index, UINT value,
                                                         UINT offset) {
-    if (record_root_constants(&self->state.compute, index, 1, &value, offset))
-        self->desktop->SetComputeRoot32BitConstant(index, value, offset);
+    record_root_constants(self, false, index, 1, &value, offset);
 }
 
 static void WINAPI list_set_graphics_root_32bit_constant(ConsoleCommandList* self, UINT index, UINT value,
                                                          UINT offset) {
-    if (record_root_constants(&self->state.graphics, index, 1, &value, offset))
-        self->desktop->SetGraphicsRoot32BitConstant(index, value, offset);
+    record_root_constants(self, true, index, 1, &value, offset);
 }
 
 static void WINAPI list_set_compute_root_32bit_constants(ConsoleCommandList* self, UINT index, UINT count,
                                                          const void* values, UINT offset) {
-    if (record_root_constants(&self->state.compute, index, count, values, offset))
-        self->desktop->SetComputeRoot32BitConstants(index, count, values, offset);
+    record_root_constants(self, false, index, count, values, offset);
 }
 
 static void WINAPI list_set_graphics_root_32bit_constants(ConsoleCommandList* self, UINT index, UINT count,
                                                           const void* values, UINT offset) {
-    if (record_root_constants(&self->state.graphics, index, count, values, offset))
-        self->desktop->SetGraphicsRoot32BitConstants(index, count, values, offset);
+    record_root_constants(self, true, index, count, values, offset);
 }
 
 static void WINAPI list_set_compute_root_cbv(ConsoleCommandList* self, UINT index, UINT64 address) {
     u64 a = desktop_address(address, 0);
-    if (record_root_arg(&self->state.compute, index, ROOT_ARG_CBV, a))
-        self->desktop->SetComputeRootConstantBufferView(index, a);
+    record_root_arg(self, false, index, ROOT_ARG_CBV, a);
 }
 
 static void WINAPI list_set_graphics_root_cbv(ConsoleCommandList* self, UINT index, UINT64 address) {
     u64 a = desktop_address(address, 0);
-    if (record_root_arg(&self->state.graphics, index, ROOT_ARG_CBV, a))
-        self->desktop->SetGraphicsRootConstantBufferView(index, a);
+    record_root_arg(self, true, index, ROOT_ARG_CBV, a);
 }
 
 static void WINAPI list_set_compute_root_srv(ConsoleCommandList* self, UINT index, UINT64 address) {
     u64 a = desktop_address(address, 0);
-    if (record_root_arg(&self->state.compute, index, ROOT_ARG_SRV, a))
-        self->desktop->SetComputeRootShaderResourceView(index, a);
+    record_root_arg(self, false, index, ROOT_ARG_SRV, a);
 }
 
 static void WINAPI list_set_graphics_root_srv(ConsoleCommandList* self, UINT index, UINT64 address) {
     u64 a = desktop_address(address, 0);
-    if (record_root_arg(&self->state.graphics, index, ROOT_ARG_SRV, a))
-        self->desktop->SetGraphicsRootShaderResourceView(index, a);
+    record_root_arg(self, true, index, ROOT_ARG_SRV, a);
 }
 
 static void WINAPI list_set_compute_root_uav(ConsoleCommandList* self, UINT index, UINT64 address) {
     u64 a = desktop_address(address, 0);
-    if (record_root_arg(&self->state.compute, index, ROOT_ARG_UAV, a))
-        self->desktop->SetComputeRootUnorderedAccessView(index, a);
+    record_root_arg(self, false, index, ROOT_ARG_UAV, a);
 }
 
 static void WINAPI list_set_graphics_root_uav(ConsoleCommandList* self, UINT index, UINT64 address) {
     u64 a = desktop_address(address, 0);
-    if (record_root_arg(&self->state.graphics, index, ROOT_ARG_UAV, a))
-        self->desktop->SetGraphicsRootUnorderedAccessView(index, a);
+    record_root_arg(self, true, index, ROOT_ARG_UAV, a);
 }
 
 // --- input assembly, rasterizer and output merger ----------------------------------------------------
@@ -639,6 +710,26 @@ static void WINAPI list_om_set_render_targets(ConsoleCommandList* self, UINT cou
     s.has_depth = depth && list_cpu_descriptor(depth->ptr, 1, &s.depth);
     s.render_target_count = count;
     s.has_targets = true;
+    // Output formats for the desktop pipelines draws need.
+    PipelineOutputs& o = s.outputs;
+    memset(&o, 0, sizeof(o));
+    o.render_target_count = (u8)count;
+    o.sample_count = 1;
+    for (UINT i = 0; i < count; i++) {
+        u64 handle = single_range ? targets[0].ptr + i * CONSOLE_DESCRIPTOR_SIZE_RTV : targets[i].ptr;
+        u32 format = 0, samples = 1;
+        if (view_target_format(handle, &format, &samples)) {
+            o.render_target_formats[i] = (u8)format;
+            o.sample_count = (u8)samples;
+        }
+    }
+    if (s.has_depth) {
+        u32 format = 0, samples = 1;
+        if (view_target_format(depth->ptr, &format, &samples)) {
+            o.depth_format = (u8)format;
+            o.sample_count = (u8)samples;
+        }
+    }
     self->desktop->OMSetRenderTargets(count, count ? s.render_targets : nullptr, FALSE,
                                       s.has_depth ? &s.depth : nullptr);
 }

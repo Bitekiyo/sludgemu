@@ -1,5 +1,10 @@
 #pragma once
 
+#include "common/types.h"
+
+// The desktop format and sample count of the render target or depth view in a console slot.
+bool view_target_format(u64 console_handle, u32* format, u32* samples);
+
 #include "hle/d3d12/d3d12_objects.h"
 
 // Device entries that write descriptors (views.cpp). Resources arrive as console objects.

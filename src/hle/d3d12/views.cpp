@@ -17,12 +17,45 @@ struct SlotMarker {
     u32 type;
     u64 desktop_cpu;
 };
-#define SLOT_MARKER_MAGIC 0x47444C53u // "SLDG"
+#define SLOT_MARKER_MAGIC DESCRIPTOR_MARKER_MAGIC
+
+// Render target and depth views also note the desktop format and sample count after the marker
+// (their console slots are far larger), which desktop pipelines are made for.
+struct TargetMarker {
+    SlotMarker slot;
+    u32 format;
+    u32 samples;
+};
+static_assert(sizeof(TargetMarker) <= CONSOLE_DESCRIPTOR_SIZE_RTV, "target marker fits");
 
 static void finish_write(const DescriptorSlot& slot) {
     SlotMarker marker = {SLOT_MARKER_MAGIC, (u32)slot.type, slot.cpu.ptr};
     memcpy(slot.console, &marker, sizeof(marker)); // every console descriptor is at least 16 bytes
     console_descriptor_publish(slot, 1);
+}
+
+static void finish_target_write(const DescriptorSlot& slot, DXGI_FORMAT format, ID3D12Resource* desktop) {
+    TargetMarker marker = {{SLOT_MARKER_MAGIC, (u32)slot.type, slot.cpu.ptr}, (u32)format, 1};
+    if (desktop)
+        marker.samples = desktop->GetDesc().SampleDesc.Count;
+    else
+        marker.format = DXGI_FORMAT_UNKNOWN;
+    memcpy(slot.console, &marker, sizeof(marker));
+    console_descriptor_publish(slot, 1);
+}
+
+bool view_target_format(u64 console_handle, u32* format, u32* samples) {
+    DescriptorSlot slot;
+    if (!console_descriptor_slots(console_handle, 1, &slot) ||
+        (slot.type != D3D12_DESCRIPTOR_HEAP_TYPE_RTV && slot.type != D3D12_DESCRIPTOR_HEAP_TYPE_DSV))
+        return false;
+    TargetMarker marker;
+    memcpy(&marker, slot.console, sizeof(marker));
+    if (marker.slot.magic != SLOT_MARKER_MAGIC)
+        return false;
+    *format = marker.format;
+    *samples = marker.samples;
+    return true;
 }
 
 // Bytes per element of the formats typed buffer views use; 0 for others.
@@ -101,25 +134,82 @@ static u32 buffer_element_bytes(DXGI_FORMAT format, u32 structure_stride, bool r
     return buffer_format_bytes(format);
 }
 
-// Where the elements a buffer view covers live on desktop: the window holding those bytes and the
-// index of the view's first element in it. nullptr (logged) if they aren't GPU-visible as one
-// block, or the window doesn't start on an element boundary, which desktop views can't express.
-static ID3D12Resource* buffer_view_target(u64 buffer_address, u64 first_element, u32 num_elements,
-                                          u32 element_bytes, u64* desktop_first_element) {
+static D3D12_SHADER_RESOURCE_VIEW_DESC null_srv(D3D12_SRV_DIMENSION dimension);
+static D3D12_UNORDERED_ACCESS_VIEW_DESC null_uav(D3D12_UAV_DIMENSION dimension);
+
+// A buffer view on desktop: where its bytes live (the window holding them) and how the view reads
+// them. Typed views keep their format. Structured and raw views become raw views: translated
+// shaders address all of them in bytes, with the console's own strides.
+struct BufferView {
+    ID3D12Resource* buffer; // nullptr (logged) if desktop can't show the view
+    DXGI_FORMAT format;
+    u64 first_element;
+    u32 element_count;
+    bool raw;
+};
+
+static BufferView buffer_view(u64 buffer_address, u64 first_element, u32 num_elements, DXGI_FORMAT format,
+                              u32 structure_stride, bool raw) {
+    BufferView v = {};
+    u32 element_bytes = buffer_element_bytes(format, structure_stride, raw);
     if (element_bytes == 0) {
         LOG_E("d3d12", "buffer view of 0x%llx with an unsupported format", buffer_address);
-        return nullptr;
+        return v;
     }
+    u64 bytes = (u64)num_elements * element_bytes;
     GpuAddress a;
-    if (!gpu_translate(buffer_address + first_element * element_bytes, (u64)num_elements * element_bytes, &a))
-        return nullptr;
-    if (a.offset % element_bytes != 0) {
-        LOG_E("d3d12", "buffer view of 0x%llx: its window starts mid-element (%u-byte elements)",
-              buffer_address, element_bytes);
+    if (!gpu_translate(buffer_address + first_element * element_bytes, bytes, &a))
+        return v;
+    v.raw = raw || structure_stride != 0;
+    if (v.raw) {
+        if (a.offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT != 0) {
+            LOG_E("d3d12",
+                  "buffer view of 0x%llx: its window starts at a byte offset raw views cannot (%llu)",
+                  buffer_address, (unsigned long long)a.offset);
+            return v;
+        }
+        v.format = DXGI_FORMAT_R32_TYPELESS;
+        v.first_element = a.offset / 4;
+        v.element_count = (u32)(ALIGN_UP(bytes, 4) / 4);
+    } else {
+        if (a.offset % element_bytes != 0) {
+            LOG_E("d3d12", "buffer view of 0x%llx: its window starts mid-element (%u-byte elements)",
+                  buffer_address, element_bytes);
+            return v;
+        }
+        v.format = format;
+        v.first_element = a.offset / element_bytes;
+        v.element_count = num_elements;
+    }
+    v.buffer = a.buffer;
+    return v;
+}
+
+// Failed views become null views, whose descriptions must still be valid.
+static ID3D12Resource* apply_buffer_view(const BufferView& v, D3D12_SHADER_RESOURCE_VIEW_DESC* d) {
+    if (!v.buffer) {
+        *d = null_srv(D3D12_SRV_DIMENSION_BUFFER);
         return nullptr;
     }
-    *desktop_first_element = a.offset / element_bytes;
-    return a.buffer;
+    d->Format = v.format;
+    d->Buffer.FirstElement = v.first_element;
+    d->Buffer.NumElements = v.element_count;
+    d->Buffer.StructureByteStride = 0;
+    d->Buffer.Flags = v.raw ? D3D12_BUFFER_SRV_FLAG_RAW : D3D12_BUFFER_SRV_FLAG_NONE;
+    return v.buffer;
+}
+
+static ID3D12Resource* apply_buffer_view(const BufferView& v, D3D12_UNORDERED_ACCESS_VIEW_DESC* d) {
+    if (!v.buffer) {
+        *d = null_uav(D3D12_UAV_DIMENSION_BUFFER);
+        return nullptr;
+    }
+    d->Format = v.format;
+    d->Buffer.FirstElement = v.first_element;
+    d->Buffer.NumElements = v.element_count;
+    d->Buffer.StructureByteStride = 0;
+    d->Buffer.Flags = v.raw ? D3D12_BUFFER_UAV_FLAG_RAW : D3D12_BUFFER_UAV_FLAG_NONE;
+    return v.buffer;
 }
 
 // --- texture views -----------------------------------------------------------------------------------
@@ -358,24 +448,18 @@ void WINAPI device_create_constant_buffer_view(ConsoleDevice* self,
     DescriptorSlot slot;
     if (!console_descriptor_slots(dest.ptr, 1, &slot))
         return;
-    D3D12_CONSTANT_BUFFER_VIEW_DESC d = {};
-    GpuAddress a = {};
-    bool valid = desc && desc->BufferLocation && gpu_translate(desc->BufferLocation, desc->SizeInBytes, &a);
-    if (valid && (a.desktop_address & (D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT - 1))) {
-        LOG_E("d3d12", "constant buffer view at 0x%llx is not 256-byte aligned", desc->BufferLocation);
-        valid = false;
-    }
-    if (valid) {
-        // Console views can end anywhere; desktop sizes are whole 256-byte units. Round up, but
-        // never past the window, where the GPU would read unmapped memory.
-        u64 size = ALIGN_UP((u64)desc->SizeInBytes, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
-        if (size > a.available)
-            size = ALIGN_DOWN(a.available, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
-        d.BufferLocation = a.desktop_address;
-        d.SizeInBytes = (u32)size;
-        valid = size != 0;
-    }
-    self->desktop->CreateConstantBufferView(valid ? &d : nullptr, slot.cpu);
+    // Constant buffers become raw buffer views: translated shaders read them as such, which also
+    // spares them desktop's 256-byte alignment for constant buffer views.
+    D3D12_SHADER_RESOURCE_VIEW_DESC d = {};
+    d.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    d.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    ID3D12Resource* desktop = nullptr;
+    if (desc && desc->BufferLocation && desc->SizeInBytes)
+        desktop = apply_buffer_view(
+            buffer_view(desc->BufferLocation, 0, desc->SizeInBytes / 4, DXGI_FORMAT_UNKNOWN, 0, true), &d);
+    if (!desktop)
+        d = null_srv(D3D12_SRV_DIMENSION_BUFFER);
+    self->desktop->CreateShaderResourceView(desktop, &d, slot.cpu);
     finish_write(slot);
 }
 
@@ -421,10 +505,10 @@ void WINAPI device_create_shader_resource_view(ConsoleDevice* self, void* resour
     if (is_buffer(resource)) {
         const ConsoleResource* r = (const ConsoleResource*)resource;
         d = desc ? *desc : whole_buffer_srv(r);
-        u32 element = buffer_element_bytes(d.Format, d.Buffer.StructureByteStride,
-                                           (d.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) != 0);
-        desktop = buffer_view_target(r->gpu_address, d.Buffer.FirstElement, d.Buffer.NumElements, element,
-                                     &d.Buffer.FirstElement);
+        desktop = apply_buffer_view(buffer_view(r->gpu_address, d.Buffer.FirstElement, d.Buffer.NumElements,
+                                                d.Format, d.Buffer.StructureByteStride,
+                                                (d.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) != 0),
+                                    &d);
     } else {
         const ConsoleResource* r = (const ConsoleResource*)resource;
         if (!r && !desc)
@@ -453,10 +537,13 @@ void WINAPI device_create_unordered_access_view(ConsoleDevice* self, void* resou
     if (is_buffer(resource)) {
         const ConsoleResource* r = (const ConsoleResource*)resource;
         d = desc ? desktop_uav_desc(desc) : whole_buffer_uav(r);
-        u32 element = buffer_element_bytes(d.Format, d.Buffer.StructureByteStride,
-                                           (d.Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW) != 0);
-        desktop = buffer_view_target(r->gpu_address, d.Buffer.FirstElement, d.Buffer.NumElements, element,
-                                     &d.Buffer.FirstElement);
+        desktop = apply_buffer_view(buffer_view(r->gpu_address, d.Buffer.FirstElement, d.Buffer.NumElements,
+                                                d.Format, d.Buffer.StructureByteStride,
+                                                (d.Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW) != 0),
+                                    &d);
+        // Raw views have no counters: translated shaders reach the counter memory themselves.
+        if (d.Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW)
+            counter = nullptr;
         if (desktop && counter) {
             GpuAddress c;
             u64 at = ((const ConsoleResource*)counter)->gpu_address + d.Buffer.CounterOffsetInBytes;
@@ -504,7 +591,7 @@ void WINAPI device_create_render_target_view(ConsoleDevice* self, void* resource
         d = null_rtv(d.ViewDimension);
     }
     self->desktop->CreateRenderTargetView(desktop, &d, slot.cpu);
-    finish_write(slot);
+    finish_target_write(slot, d.Format, desktop);
 }
 
 void WINAPI device_create_depth_stencil_view(ConsoleDevice* self, void* resource,
@@ -523,7 +610,7 @@ void WINAPI device_create_depth_stencil_view(ConsoleDevice* self, void* resource
         d = null_dsv(d.ViewDimension);
     }
     self->desktop->CreateDepthStencilView(desktop, &d, slot.cpu);
-    finish_write(slot);
+    finish_target_write(slot, d.Format, desktop);
 }
 
 void WINAPI device_create_sampler(ConsoleDevice* self, const D3D12_SAMPLER_DESC* desc,
@@ -623,12 +710,13 @@ void WINAPI device_create_placed_raw_srv_x(ConsoleDevice* self, const D3D12_RESO
     ID3D12Resource* desktop = nullptr;
     if (resource_desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
         d.ViewDimension == D3D12_SRV_DIMENSION_BUFFER) {
-        u32 element = buffer_element_bytes(d.Format, d.Buffer.StructureByteStride,
-                                           (d.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) != 0);
-        desktop = buffer_view_target(desc->location, d.Buffer.FirstElement, d.Buffer.NumElements, element,
-                                     &d.Buffer.FirstElement);
+        desktop = apply_buffer_view(buffer_view(desc->location, d.Buffer.FirstElement, d.Buffer.NumElements,
+                                                d.Format, d.Buffer.StructureByteStride,
+                                                (d.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) != 0),
+                                    &d);
     } else {
         unsupported_placed_texture_view("shader resource");
+        d = null_srv(d.ViewDimension);
     }
     self->desktop->CreateShaderResourceView(desktop, &d, slot.cpu);
     finish_write(slot);
@@ -644,11 +732,11 @@ void WINAPI device_create_placed_raw_uav_x(ConsoleDevice* self, const D3D12_RESO
     ID3D12Resource* desktop_counter = nullptr;
     if (resource_desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
         d.ViewDimension == D3D12_UAV_DIMENSION_BUFFER) {
-        u32 element = buffer_element_bytes(d.Format, d.Buffer.StructureByteStride,
-                                           (d.Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW) != 0);
-        desktop = buffer_view_target(desc->location, d.Buffer.FirstElement, d.Buffer.NumElements, element,
-                                     &d.Buffer.FirstElement);
-        if (desktop && desc->counter_location) {
+        desktop = apply_buffer_view(buffer_view(desc->location, d.Buffer.FirstElement, d.Buffer.NumElements,
+                                                d.Format, d.Buffer.StructureByteStride,
+                                                (d.Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW) != 0),
+                                    &d);
+        if (desktop && desc->counter_location && !(d.Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW)) {
             GpuAddress c;
             if (gpu_translate(desc->counter_location + d.Buffer.CounterOffsetInBytes, 4, &c)) {
                 desktop_counter = c.buffer;
@@ -659,6 +747,7 @@ void WINAPI device_create_placed_raw_uav_x(ConsoleDevice* self, const D3D12_RESO
         }
     } else {
         unsupported_placed_texture_view("unordered access");
+        d = null_uav(d.ViewDimension);
     }
     if (!desktop_counter)
         d.Buffer.CounterOffsetInBytes = 0;

@@ -15,29 +15,39 @@ static D3D12_GPU_VIRTUAL_ADDRESS translate(u64 address, u64 size, GpuAddress* ou
 
 // --- draws and dispatches ----------------------------------------------------------------------------
 
-// Without a translated pipeline state there is nothing to run.
-static bool can_run(ConsoleCommandList* self) {
-    if (!self->state.pipeline)
-        LOG_W_ONCE("d3d12", "draws and dispatches are skipped until pipeline states are translated");
-    return self->state.pipeline != nullptr;
+// The desktop pipeline and user data for a draw or dispatch. Draws are skipped while the pipeline's
+// translation is being built (or when it failed).
+static bool prepare(ConsoleCommandList* self, bool graphics) {
+    ListState& s = self->state;
+    ID3D12PipelineState* desktop = console_pipeline_desktop(s.pipeline, graphics ? &s.outputs : nullptr);
+    if (!desktop) {
+        self->skipped_draws++;
+        return false;
+    }
+    if (desktop != s.bound) {
+        self->desktop->SetPipelineState(desktop);
+        s.bound = desktop;
+    }
+    list_flush_user_data(self, graphics);
+    return true;
 }
 
 static void WINAPI list_draw_instanced(ConsoleCommandList* self, UINT vertices, UINT instances,
                                        UINT first_vertex, UINT first_instance) {
-    if (can_run(self))
+    if (prepare(self, true))
         self->desktop->DrawInstanced(vertices, instances, first_vertex, first_instance);
 }
 
 static void WINAPI list_draw_indexed_instanced(ConsoleCommandList* self, UINT indices, UINT instances,
                                                UINT first_index, INT base_vertex, UINT first_instance) {
-    if (can_run(self))
+    if (prepare(self, true))
         self->desktop->DrawIndexedInstanced(indices, instances, first_index, base_vertex, first_instance);
 }
 
 // An indexed draw with its own index buffer.
 static void WINAPI list_draw_indexed_x(ConsoleCommandList* self, UINT64 index_buffer, DXGI_FORMAT format,
                                        UINT indices, UINT first_index) {
-    if (!can_run(self))
+    if (!prepare(self, true))
         return;
     u32 index_size = format == DXGI_FORMAT_R32_UINT ? 4 : 2;
     GpuAddress a;
@@ -50,7 +60,7 @@ static void WINAPI list_draw_indexed_x(ConsoleCommandList* self, UINT64 index_bu
 }
 
 static void WINAPI list_dispatch(ConsoleCommandList* self, UINT x, UINT y, UINT z) {
-    if (can_run(self))
+    if (prepare(self, false))
         self->desktop->Dispatch(x, y, z);
 }
 

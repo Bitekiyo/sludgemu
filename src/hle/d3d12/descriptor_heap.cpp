@@ -119,6 +119,31 @@ void console_descriptor_publish(const DescriptorSlot& slot, u32 count) {
         gpu_device()->CopyDescriptorsSimple(count, slot.visible_cpu, slot.cpu, slot.type);
 }
 
+// Titles build descriptor tables by copying descriptor memory themselves. A slot copied that way
+// carries the marker of the descriptor it came from (see views.cpp), naming that descriptor's
+// desktop copy, which goes to the slot's shader-visible desktop descriptor. Copied on every call:
+// the source may have been rewritten since.
+void console_descriptor_mirror(const ConsoleDescriptorHeap* heap, u32 first, u32 count) {
+    if (!heap->visible || first >= heap->desktop_count)
+        return;
+    if (count > heap->desktop_count - first)
+        count = heap->desktop_count - first;
+    ID3D12Device* device = gpu_device();
+    for (u32 i = first; i < first + count; i++) {
+        const u8* console = heap->memory + (u64)i * heap->stride;
+        u32 magic, type;
+        u64 source;
+        memcpy(&magic, console, 4);
+        memcpy(&type, console + 4, 4);
+        memcpy(&source, console + 8, 8);
+        u64 own = heap->cpu_start + (u64)i * heap->desktop_stride;
+        if (magic != DESCRIPTOR_MARKER_MAGIC || type != (u32)heap->desktop_type || source == own)
+            continue; // not a descriptor of ours, or written in place (and published then)
+        D3D12_CPU_DESCRIPTOR_HANDLE dst = {heap->visible_cpu_start + (u64)i * heap->desktop_stride};
+        device->CopyDescriptorsSimple(1, dst, {source}, heap->desktop_type);
+    }
+}
+
 // --- object ------------------------------------------------------------------------------------------
 
 static void descriptor_heap_destroy(void* object) {

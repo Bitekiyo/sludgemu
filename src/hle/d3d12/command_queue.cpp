@@ -2,6 +2,8 @@
 
 #include <stddef.h>
 
+#include <string.h>
+
 #include "common/log.h"
 #include "gpu/gpu.h"
 #include "gpu/presenter.h"
@@ -53,6 +55,10 @@ static void WINAPI queue_execute_command_lists(ConsoleCommandQueue* self, UINT c
         ConsoleCommandList* list = lists[i];
         if (!list)
             continue;
+        for (u32 t = 0; t < list->table_count; t++) {
+            const ConsoleCommandList::TableUse& use = list->tables[t];
+            console_descriptor_mirror(use.heap, use.first, use.count);
+        }
         for (u32 s = 0; s < list->segment_count; s++) {
             const ListSegment& seg = list->segments[s];
             if (b.count == SUBMIT_BATCH)

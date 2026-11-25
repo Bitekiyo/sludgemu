@@ -111,6 +111,8 @@ add_executable(sludgemu WIN32
     gpu/gpu.cpp
     gpu/gpu_window.h
     gpu/gpu_window.cpp
+    gpu/shader_programs.h
+    gpu/shader_programs.cpp
     gpu/formats.h
     gpu/formats.cpp
     gpu/console_layout.h
