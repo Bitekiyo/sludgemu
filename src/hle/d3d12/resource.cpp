@@ -3,6 +3,7 @@
 #include "common/log.h"
 #include "hle/d3d12/barriers.h"
 #include "hle/d3d12/d3d12_objects.h"
+#include "hle/d3d12/texture_sync.h"
 #include "hle/d3d12/d3d12_tables.h"
 #include "gpu/console_layout.h"
 #include "gpu/formats.h"
@@ -154,6 +155,8 @@ ID3D12Resource* console_resource_desktop(ConsoleResource* r, u64* offset) {
 
 static void resource_destroy(void* object) {
     ConsoleResource* r = (ConsoleResource*)object;
+    if (texture_sync_tracks(r->desc))
+        texture_sync_remove(r);
     gpu_retire(r->texture);
     if (r->owned_memory)
         xmem_free(r->owned_memory, r->owned_attributes);
@@ -267,6 +270,8 @@ static ConsoleResource* new_resource(u64 gpu_address, const D3D12_RESOURCE_DESC1
         r->clear_value = *clear;
     }
     InitializeSRWLock(&r->lock);
+    if (texture_sync_tracks(r->desc))
+        texture_sync_add(r);
     return r;
 }
 

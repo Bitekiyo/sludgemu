@@ -130,6 +130,13 @@ struct MemBlock {
 // The block holding `addr`. False if `addr` isn't tracked or isn't mapped.
 bool mem_backing_block(const void* addr, MemBlock* out);
 
+// The frames mapped at `count` pages from `va` in a placeholder range, by page number
+// (MEM_INVALID_PFN where nothing is mapped). False if the pages aren't all in one placeholder range.
+bool mem_frames_at(const void* va, u64 count, u64* pfns);
+
+// Whether every page of [addr, addr + size) is tracked and has memory: committed, or mapped frames.
+bool mem_is_mapped(const void* addr, u64 size);
+
 // Called after page mappings change in [base, base + size) of a tracked range, or when the range is
 // released. Called without memory locks held, possibly from any thread; must be cheap.
 typedef void (*MemMappingListener)(const u8* base, u64 size);

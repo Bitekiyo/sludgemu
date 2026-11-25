@@ -1,6 +1,7 @@
 // Console barriers on desktop enhanced barriers.
 
 #include "hle/d3d12/barriers.h"
+#include "hle/d3d12/texture_sync.h"
 
 #include "common/log.h"
 
@@ -46,6 +47,8 @@ D3D12_BARRIER_LAYOUT console_desktop_layout(u32 layout) {
 }
 
 D3D12_BARRIER_LAYOUT console_texture_layout(const ConsoleResource* r, D3D12_BARRIER_LAYOUT layout) {
+    if (texture_sync_tracks(r->desc))
+        return D3D12_BARRIER_LAYOUT_COMMON; // contents come from title memory (texture_sync.h)
     if (!console_texture_loses_uav(r->desc))
         return layout;
     switch (layout) {
@@ -285,6 +288,8 @@ static void record_texture_group(ID3D12GraphicsCommandList7* list, const D3D12_B
         b.LayoutAfter = console_texture_layout(r, console_desktop_layout(b.LayoutAfter));
         b.AccessBefore = texture_access(r, b.AccessBefore);
         b.AccessAfter = texture_access(r, b.AccessAfter);
+        if (texture_sync_tracks(r->desc))
+            b.Flags &= ~D3D12_TEXTURE_BARRIER_FLAG_DISCARD; // their contents are kept
         out[n++] = b;
         if (n == BARRIER_BATCH) {
             D3D12_BARRIER_GROUP group = {D3D12_BARRIER_TYPE_TEXTURE, n};

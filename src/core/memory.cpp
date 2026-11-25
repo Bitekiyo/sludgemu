@@ -539,6 +539,61 @@ bool mem_backing_block(const void* addr, MemBlock* out) {
     return ok;
 }
 
+// The frame ID mapped at `page` (pending or backed), or MEM_INVALID_PFN. Range lock held, phys_lock
+// held shared.
+static u32 frame_at_locked(const RangeSlot* s, u32 page) {
+    if (s->pending && s->pending[page] != MEM_INVALID_PFN)
+        return s->pending[page];
+    const MemRegion& r = s->regions[region_find(s, page)];
+    if (r.pfn == REGION_PLACEHOLDER)
+        return MEM_INVALID_PFN;
+    return g_mem.real_to_id[r.pfn + (page - r.first_page)];
+}
+
+bool mem_frames_at(const void* va, u64 count, u64* pfns) {
+    AcquireSRWLockShared(&g_mem.range_lock);
+    RangeSlot* s = find_range_locked(va);
+    u64 first = s ? (u64)((const u8*)va - s->info.base) >> MEM_PAGE_SHIFT : 0;
+    bool ok = s && (s->info.flags & MEM_RANGE_PLACEHOLDER) && first + count <= range_pages(s);
+    if (ok) {
+        AcquireSRWLockShared(&g_mem.phys_lock);
+        for (u64 i = 0; i < count; i++) {
+            u32 id = frame_at_locked(s, (u32)(first + i));
+            pfns[i] = id == MEM_INVALID_PFN ? MEM_INVALID_PFN : (u64)id << MEM_PAGE_NUMBER_SHIFT;
+        }
+        ReleaseSRWLockShared(&g_mem.phys_lock);
+    }
+    ReleaseSRWLockShared(&g_mem.range_lock);
+    return ok;
+}
+
+bool mem_is_mapped(const void* addr, u64 size) {
+    const u8* p = (const u8*)addr;
+    const u8* end = p + size;
+    bool ok = true;
+    AcquireSRWLockShared(&g_mem.range_lock);
+    AcquireSRWLockShared(&g_mem.phys_lock);
+    while (ok && p < end) {
+        RangeSlot* s = find_range_locked(p);
+        if (!s) {
+            ok = false;
+            break;
+        }
+        const u8* range_end = s->info.base + s->info.size;
+        const u8* stop = end < range_end ? end : range_end;
+        if (s->info.flags & MEM_RANGE_PLACEHOLDER) {
+            u32 first = (u32)((u64)(p - s->info.base) >> MEM_PAGE_SHIFT);
+            u32 last = (u32)(((u64)(stop - s->info.base) + MEM_PAGE_SIZE - 1) >> MEM_PAGE_SHIFT);
+            for (u32 page = first; ok && page < last; page++)
+                ok = frame_at_locked(s, page) != MEM_INVALID_PFN;
+        }
+        p = stop;
+    }
+    ReleaseSRWLockShared(&g_mem.phys_lock);
+    ReleaseSRWLockShared(&g_mem.range_lock);
+    return ok;
+}
+
 void mem_set_mapping_listener(MemMappingListener listener) {
     g_mem.mapping_listener = listener;
 }

@@ -10,6 +10,7 @@
 #include "hle/d3d12/frame_pacing.h"
 #include "hle/d3d12/d3d12_objects.h"
 #include "hle/d3d12/d3d12_tables.h"
+#include "hle/d3d12/texture_sync.h"
 
 static_assert(offsetof(ConsoleCommandQueue, type) == 0x10, "command queue layout");
 
@@ -30,6 +31,72 @@ static void queue_destroy(void* object) {
         gpu_retire(queue->writers[i].list);
         gpu_retire(queue->writers[i].allocator);
     }
+    gpu_retire(queue->uploader.list);
+    gpu_retire(queue->uploader.allocator);
+}
+
+// Texture contents waiting for upload from title memory go first, from a list of the queue's own.
+static void upload_textures(ConsoleCommandQueue* self) {
+    if (self->type == D3D12_COMMAND_LIST_TYPE_COPY || !texture_sync_pending())
+        return;
+    AcquireSRWLockExclusive(&self->writer_lock); // titles may submit to a queue from several threads
+    QueueSignalWriter& w = self->uploader;
+    HRESULT hr;
+    if (!w.list) {
+        ID3D12Device13* device = gpu_device();
+        hr = device->CreateCommandAllocator(self->type, IID_PPV_ARGS(&w.allocator));
+        if (SUCCEEDED(hr))
+            hr = device->CreateCommandList(0, self->type, w.allocator, nullptr, IID_PPV_ARGS(&w.list));
+    } else {
+        gpu_queue_wait(self->slot, w.submission); // its allocator may still be in use
+        hr = w.allocator->Reset();
+        if (SUCCEEDED(hr))
+            hr = w.list->Reset(w.allocator, nullptr);
+    }
+    if (FAILED(hr)) {
+        ReleaseSRWLockExclusive(&self->writer_lock);
+        if (!gpu_device_lost(hr))
+            LOG_E("d3d12", "cannot record texture uploads (0x%08lx)", (unsigned long)hr);
+        return;
+    }
+    ID3D12Resource* upload = texture_sync_record(w.list);
+    if (SUCCEEDED(w.list->Close()) && upload) {
+        ID3D12CommandList* list = w.list;
+        self->desktop->ExecuteCommandLists(1, &list);
+        w.submission = gpu_queue_submitted(self->slot);
+    }
+    ReleaseSRWLockExclusive(&self->writer_lock);
+    if (upload)
+        gpu_retire(upload);
+}
+
+static HRESULT WINAPI queue_copy_page_mappings_x(ConsoleCommandQueue*, D3D12_GPU_VIRTUAL_ADDRESS destination,
+                                                 UINT range_count, const ConsolePageRange* ranges,
+                                                 D3D12_GPU_VIRTUAL_ADDRESS pool, UINT pool_pages,
+                                                 UINT flags) {
+    return console_copy_page_mappings(destination, range_count, ranges, pool, pool_pages, flags);
+}
+
+static HRESULT WINAPI queue_clear_page_mappings_x(ConsoleCommandQueue*, D3D12_GPU_VIRTUAL_ADDRESS destination,
+                                                  UINT page_count, UINT flags) {
+    ConsolePageRange r = {PAGE_RANGE_NULL, 0, page_count};
+    return console_copy_page_mappings(destination, 1, &r, 0, 0, flags);
+}
+
+static HRESULT WINAPI queue_copy_page_mappings_batch_x(ConsoleCommandQueue*, UINT batch_count,
+                                                       const ConsolePageBatch* batches,
+                                                       D3D12_GPU_VIRTUAL_ADDRESS pool, UINT pool_pages,
+                                                       UINT flags) {
+    if (!batches && batch_count)
+        return E_INVALIDARG;
+    HRESULT result = S_OK;
+    for (UINT i = 0; i < batch_count; i++) {
+        HRESULT hr = console_copy_page_mappings(batches[i].destination, batches[i].range_count,
+                                                batches[i].ranges, pool, pool_pages, flags);
+        if (FAILED(hr))
+            result = hr;
+    }
+    return result;
 }
 
 // Lists submitted per desktop call; longer submissions are split, which keeps their order.
@@ -49,6 +116,7 @@ static void flush(ID3D12CommandQueue* queue, SubmitBatch* b) {
 // Each console list runs its parts in order, with the fence signals and waits between them.
 static void WINAPI queue_execute_command_lists(ConsoleCommandQueue* self, UINT count,
                                                ConsoleCommandList* const* lists) {
+    upload_textures(self);
     SubmitBatch b;
     b.count = 0;
     for (UINT i = 0; i < count; i++) {
@@ -178,6 +246,7 @@ static HRESULT WINAPI queue_present_x(ConsoleCommandQueue* self, UINT plane_coun
     (void)parameters; // immediate flips, tearing and VRR preferences
     if (plane_count > PRESENT_MAX_PLANES || (plane_count && !planes))
         return E_INVALIDARG;
+    texture_sync_check_linear(); // their uploads go with the next frame's first submission
     PresentPlane out[PRESENT_MAX_PLANES] = {};
     for (UINT i = 0; i < plane_count; i++) {
         const ConsolePresentPlane& in = planes[i];
@@ -227,6 +296,9 @@ static const ConsoleEntry k_queue_impl[] = {
     CONSOLE_ENTRY(18, queue_get_timestamp_frequency),
     CONSOLE_ENTRY(19, queue_get_clock_calibration),
     CONSOLE_ENTRY(28, queue_get_desc),
+    CONSOLE_ENTRY(29, queue_copy_page_mappings_x),
+    CONSOLE_ENTRY(30, queue_clear_page_mappings_x),
+    CONSOLE_ENTRY(31, queue_copy_page_mappings_batch_x),
     CONSOLE_ENTRY(32, queue_present_x),
     CONSOLE_ENTRY(35, queue_execute_command_lists_2x),
 };

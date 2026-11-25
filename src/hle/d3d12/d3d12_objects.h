@@ -52,6 +52,7 @@ struct ConsoleCommandQueue {
     SRWLOCK writer_lock;
     u32 next_writer;
     QueueSignalWriter writers[QUEUE_SIGNAL_WRITERS];
+    QueueSignalWriter uploader; // texture uploads (texture_sync.h); writer_lock guards it too
 };
 
 // Console fences also have a GPU address holding their value, which command lists write to signal
@@ -558,3 +559,25 @@ void console_pipeline_report_skip(ConsolePipelineState* pso, bool graphics);
 // Page pools (page_pool.cpp): title memory registered as a source of GPU page mapping copies.
 HRESULT console_register_page_pool(u64 address, u32 page_count, u32 flags, HANDLE* handle);
 HRESULT console_unregister_page_pool(HANDLE handle);
+
+// GPU page mapping copies: destination ranges get frames of a page pool (by page index), one page
+// repeated, no pages, or are skipped. Pages are 64 KiB, or 2 MiB with PAGE_MAPPING_FLAG_2MB_PAGES.
+enum ConsolePageRangeType : u32 {
+    PAGE_RANGE_INCREMENTING = 0,
+    PAGE_RANGE_CONSTANT = 1,
+    PAGE_RANGE_NULL = 2,
+    PAGE_RANGE_SKIP = 3,
+};
+struct ConsolePageRange {
+    ConsolePageRangeType type;
+    u32 first_page; // in the pool
+    u32 page_count;
+};
+struct ConsolePageBatch {
+    u64 destination;
+    u32 range_count;
+    const ConsolePageRange* ranges;
+};
+#define PAGE_MAPPING_FLAG_2MB_PAGES 0x2
+HRESULT console_copy_page_mappings(u64 destination, u32 range_count, const ConsolePageRange* ranges, u64 pool,
+                                   u32 pool_pages, u32 flags);

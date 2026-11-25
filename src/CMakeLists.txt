@@ -93,6 +93,8 @@ add_executable(sludgemu WIN32
     hle/d3d12/root_signature.h
     hle/d3d12/root_signature.cpp
     hle/d3d12/page_pool.cpp
+    hle/d3d12/texture_sync.h
+    hle/d3d12/texture_sync.cpp
     hle/d3d12/views.h
     hle/d3d12/views.cpp
     hle/d3d12/command_allocator.cpp
