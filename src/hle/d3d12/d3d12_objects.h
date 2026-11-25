@@ -355,6 +355,14 @@ struct DescriptorSlot {
 
 void console_descriptor_heap_init();
 
+// Constant buffer views in the console's own descriptor format: the buffer address with a 16-byte
+// stride in the top bits of the first quadword, the size in 16-byte records with a fixed format word
+// on top of the second. Titles write these themselves (the console runtime inlines their creation),
+// and we write them too, so copies of descriptor memory carry the view itself.
+#define NATIVE_CBV_STRIDE_BITS  0x0010ull     // top 16 bits of the first quadword
+#define NATIVE_CBV_FORMAT_BITS  0x0002403Cull // top 32 bits of the second quadword
+#define NATIVE_CBV_ADDRESS_MASK 0x0000FFFFFFFFFFFFull
+
 // Console descriptor slots written by us start with this marker, then the slot's descriptor type
 // and its desktop CPU-only descriptor.
 #define DESCRIPTOR_MARKER_MAGIC 0x47444C53u // "SLDG"

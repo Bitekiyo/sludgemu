@@ -142,9 +142,6 @@ void console_descriptor_publish(const DescriptorSlot& slot, u32 count) {
 // stride in its top bits, and whose second is the size in 16-byte records with a fixed format word
 // on top. Their desktop views are made here, and remade only when the descriptor or the memory
 // windows change.
-#define NATIVE_CBV_STRIDE_BITS  0x0010ull     // top 16 bits of the first quadword
-#define NATIVE_CBV_FORMAT_BITS  0x0002403Cull // top 32 bits of the second quadword
-#define NATIVE_CBV_ADDRESS_MASK 0x0000FFFFFFFFFFFFull
 
 static void mirror_native_constant_buffer(ConsoleDescriptorHeap* heap, u32 desktop_index, u64 address,
                                           u64 records) {

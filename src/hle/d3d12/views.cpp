@@ -457,15 +457,25 @@ void write_constant_buffer_view(u64 address, u64 size, D3D12_CPU_DESCRIPTOR_HAND
     gpu_device()->CreateShaderResourceView(desktop, &d, dest);
 }
 
+// Titles copy descriptor memory to build tables, and a copy must keep the view as it was then, even
+// once the source slot holds another view. So the console slot gets the view itself, in the console's
+// format; mirroring a table makes desktop views of such descriptors (see console_descriptor_mirror).
 void WINAPI device_create_constant_buffer_view(ConsoleDevice* self,
                                                const D3D12_CONSTANT_BUFFER_VIEW_DESC* desc,
                                                D3D12_CPU_DESCRIPTOR_HANDLE dest) {
-    (void)self;
     DescriptorSlot slot;
     if (!console_descriptor_slots(dest.ptr, 1, &slot))
         return;
-    write_constant_buffer_view(desc ? desc->BufferLocation : 0, desc ? desc->SizeInBytes : 0, slot.cpu);
-    finish_write(slot);
+    u64 address = desc ? desc->BufferLocation : 0;
+    u64 size = desc ? desc->SizeInBytes : 0;
+    write_constant_buffer_view(address, size, slot.cpu);
+    u64 records = size ? (size + 15) / 16 : 1;
+    if (!address)
+        address = self->null_constant_buffer_address; // reads as zeros
+    u64 native[2] = {(address & NATIVE_CBV_ADDRESS_MASK) | (NATIVE_CBV_STRIDE_BITS << 48),
+                     (records & 0xFFFFFFFFull) | (NATIVE_CBV_FORMAT_BITS << 32)};
+    memcpy(slot.console, native, sizeof(native));
+    console_descriptor_publish(slot, 1);
 }
 
 // The console UAV description is the desktop one without its later union members, so it is shorter:
