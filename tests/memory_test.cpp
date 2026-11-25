@@ -330,7 +330,7 @@ int main() {
         printf("FAIL: mem_init\n");
         return 1;
     }
-    mem_set_mapping_listener(on_mapping_changed);
+    mem_add_mapping_listener(on_mapping_changed);
     test_placeholder_release();
     test_runs_and_remaps();
     test_out_of_order_slices_form_one_block();

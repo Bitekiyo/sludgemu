@@ -59,15 +59,16 @@ static void upload_textures(ConsoleCommandQueue* self) {
             LOG_E("d3d12", "cannot record texture uploads (0x%08lx)", (unsigned long)hr);
         return;
     }
-    ID3D12Resource* upload = texture_sync_record(w.list);
-    if (SUCCEEDED(w.list->Close()) && upload) {
+    TextureUploadSources sources;
+    bool recorded = texture_sync_record(w.list, &sources);
+    if (SUCCEEDED(w.list->Close()) && recorded) {
         ID3D12CommandList* list = w.list;
         self->desktop->ExecuteCommandLists(1, &list);
         w.submission = gpu_queue_submitted(self->slot);
     }
     ReleaseSRWLockExclusive(&self->writer_lock);
-    if (upload)
-        gpu_retire(upload);
+    for (u32 i = 0; i < sources.count; i++)
+        gpu_retire(sources.resources[i]);
 }
 
 static HRESULT WINAPI queue_copy_page_mappings_x(ConsoleCommandQueue*, D3D12_GPU_VIRTUAL_ADDRESS destination,
@@ -248,7 +249,7 @@ static HRESULT WINAPI queue_present_x(ConsoleCommandQueue* self, UINT plane_coun
     (void)parameters; // immediate flips, tearing and VRR preferences
     if (plane_count > PRESENT_MAX_PLANES || (plane_count && !planes))
         return E_INVALIDARG;
-    texture_sync_check_linear(); // their uploads go with the next frame's first submission
+    texture_sync_new_frame(); // linear textures are uploaded with the next frame's first submission
     PresentPlane out[PRESENT_MAX_PLANES] = {};
     for (UINT i = 0; i < plane_count; i++) {
         const ConsolePresentPlane& in = planes[i];

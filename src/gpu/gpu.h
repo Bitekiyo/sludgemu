@@ -40,6 +40,9 @@ u64 gpu_queue_completed(u32 slot);
 // Blocks until the queue finished submission `number`.
 void gpu_queue_wait(u32 slot, u64 number);
 
+// Names a desktop object for the debug layer's messages (printf-style); nothing without the layer.
+void gpu_set_name(ID3D12Object* object, const char* format, ...);
+
 // Releases a desktop object once no queue can still be using it: after every queue finished what
 // it had been given when the object was retired.
 void gpu_retire(IUnknown* object);

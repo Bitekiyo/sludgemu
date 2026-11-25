@@ -138,9 +138,10 @@ bool mem_frames_at(const void* va, u64 count, u64* pfns);
 bool mem_is_mapped(const void* addr, u64 size);
 
 // Called after page mappings change in [base, base + size) of a tracked range, or when the range is
-// released. Called without memory locks held, possibly from any thread; must be cheap.
+// released. Called without memory locks held, possibly from any thread; must be cheap. Listeners are
+// added once each, from one thread at a time.
 typedef void (*MemMappingListener)(const u8* base, u64 size);
-void mem_set_mapping_listener(MemMappingListener listener);
+void mem_add_mapping_listener(MemMappingListener listener);
 
 // Changes the host protection used for future mappings in the range containing `addr`.
 void mem_set_range_protect(const void* addr, u32 protect);

@@ -41,6 +41,8 @@ typedef PVOID(WINAPI* MapViewOfFile3Fn)(HANDLE, HANDLE, PVOID, ULONG64, SIZE_T, 
                                         MEM_EXTENDED_PARAMETER*, ULONG);
 typedef BOOL(WINAPI* UnmapViewOfFile2Fn)(HANDLE, PVOID, ULONG);
 
+#define MAX_MAPPING_LISTENERS 4
+
 struct MemoryState {
     VirtualAlloc2Fn virtual_alloc2;
     MapViewOfFile3Fn map_view3;
@@ -75,7 +77,8 @@ struct MemoryState {
     u64 gpu_lowest;
     u64 gpu_highest;
 
-    MemMappingListener mapping_listener;
+    MemMappingListener mapping_listeners[MAX_MAPPING_LISTENERS];
+    volatile long mapping_listener_count;
 };
 
 static MemoryState g_mem;
@@ -594,13 +597,18 @@ bool mem_is_mapped(const void* addr, u64 size) {
     return ok;
 }
 
-void mem_set_mapping_listener(MemMappingListener listener) {
-    g_mem.mapping_listener = listener;
+void mem_add_mapping_listener(MemMappingListener listener) {
+    long n = g_mem.mapping_listener_count;
+    if (n == MAX_MAPPING_LISTENERS)
+        FATAL("too many memory mapping listeners");
+    g_mem.mapping_listeners[n] = listener;
+    InterlockedExchange(&g_mem.mapping_listener_count, n + 1); // publishes the entry
 }
 
 static void notify_mapping_changed(const u8* base, u64 size) {
-    if (g_mem.mapping_listener)
-        g_mem.mapping_listener(base, size);
+    long n = g_mem.mapping_listener_count;
+    for (long i = 0; i < n; i++)
+        g_mem.mapping_listeners[i](base, size);
 }
 
 bool mem_is_tracked(const void* addr) {

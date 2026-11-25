@@ -175,6 +175,7 @@ static ID3D12Resource* open_window(const MemBlock& block) {
               block.size, (unsigned long)hr);
         return nullptr;
     }
+    gpu_set_name(buffer, "window over title memory %p+0x%llx", block.base, block.size);
     // RenderDoc sees CPU writes to buffer memory only through mappings it knows of; mapping windows
     // keeps captures faithful to what the title wrote during the frame (constant buffers above all).
     if (g_capture_tool) {
@@ -246,5 +247,5 @@ static void on_mapping_changed(const u8* base, u64 size) {
 
 void gpu_window_init() {
     g_capture_tool = GetModuleHandleW(L"renderdoc.dll") != nullptr;
-    mem_set_mapping_listener(on_mapping_changed);
+    mem_add_mapping_listener(on_mapping_changed);
 }

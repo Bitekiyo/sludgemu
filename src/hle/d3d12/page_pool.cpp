@@ -7,7 +7,6 @@
 #include "common/log.h"
 #include "core/memory.h"
 #include "hle/d3d12/d3d12_objects.h"
-#include "hle/d3d12/texture_sync.h"
 
 #define MAX_PAGE_POOLS 64
 
@@ -114,8 +113,6 @@ HRESULT console_copy_page_mappings(u64 destination, u32 range_count, const Conso
             result = E_INVALIDARG;
             break;
         }
-        if (SUCCEEDED(result) && r.type != PAGE_RANGE_SKIP)
-            texture_sync_mark(dest, bytes);
         dest += bytes;
     }
     free(frames);

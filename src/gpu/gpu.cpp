@@ -1,5 +1,7 @@
 #include "gpu/gpu.h"
 
+#include <stdarg.h>
+#include <stdio.h>
 #include <stdlib.h>
 
 #include "common/log.h"
@@ -351,6 +353,22 @@ void gpu_queue_wait(u32 slot, u64 number) {
     if (fence->GetCompletedValue() < number)
         fence->SetEventOnCompletion(number, nullptr);
     fence->Release();
+}
+
+void gpu_set_name(ID3D12Object* object, const char* format, ...) {
+    if (!g_options.debug_layer || !object)
+        return;
+    char name[128];
+    va_list args;
+    va_start(args, format);
+    vsnprintf(name, sizeof(name), format, args);
+    va_end(args);
+    wchar_t wide[128];
+    u32 i = 0;
+    for (; name[i] && i + 1 < ARRAY_COUNT(wide); i++)
+        wide[i] = (wchar_t)(u8)name[i];
+    wide[i] = 0;
+    object->SetName(wide);
 }
 
 void gpu_retire(IUnknown* object) {

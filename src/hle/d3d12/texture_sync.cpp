@@ -14,8 +14,7 @@ struct SyncEntry {
     u64 end;
     ConsoleResource* resource; // registered while alive (texture_sync_remove before destruction)
     bool dirty;
-    bool linear;     // laid out for CPU writes: checked for new contents every frame
-    u64 sample_hash; // linear textures: of the contents last uploaded
+    bool linear; // laid out for CPU writes: uploaded every frame
 };
 
 static struct {
@@ -71,8 +70,11 @@ void texture_sync_add(ConsoleResource* r) {
     // Console layouts store a swizzle mode; mode 0 is linear.
     bool linear =
         r->desc.Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR || r->desc.Layout == CONSOLE_LAYOUT_SWIZZLE;
-    g_sync.entries[at] = {r->gpu_address, r->gpu_address + info.SizeInBytes, r, false, linear, 0};
+    // Its memory may hold the contents already; if it isn't mapped yet, the upload is skipped and the
+    // mapping marks it again.
+    g_sync.entries[at] = {r->gpu_address, r->gpu_address + info.SizeInBytes, r, true, linear};
     g_sync.count++;
+    InterlockedIncrement(&g_sync.dirty);
     ReleaseSRWLockExclusive(&g_sync.lock);
 }
 
@@ -111,30 +113,22 @@ void texture_sync_mark(u64 address, u64 size) {
     ReleaseSRWLockExclusive(&g_sync.lock);
 }
 
-// A sample of the contents: two words of every KiB. Changes are caught as long as they touch the
-// sampled words, which whole new frames (video, CPU-drawn images) do.
-static u64 sample_hash(u64 start, u64 end) {
-    u64 h = 0xcbf29ce484222325ull;
-    for (u64 at = start; at + 16 <= end; at += 1024) {
-        const u64* p = (const u64*)at;
-        h = (h ^ p[0]) * 0x100000001b3ull;
-        h = (h ^ p[1]) * 0x100000001b3ull;
-    }
-    return h;
+static void on_mapping_changed(const u8* base, u64 size) {
+    texture_sync_mark((u64)base, size);
 }
 
-void texture_sync_check_linear() {
+void texture_sync_init() {
+    mem_add_mapping_listener(on_mapping_changed);
+}
+
+void texture_sync_new_frame() {
     AcquireSRWLockExclusive(&g_sync.lock);
     for (u32 i = 0; i < g_sync.count; i++) {
         SyncEntry& e = g_sync.entries[i];
-        if (!e.linear || e.dirty || !mem_is_mapped((const void*)e.start, e.end - e.start))
-            continue;
-        u64 h = sample_hash(e.start, e.end);
-        if (h == e.sample_hash)
-            continue;
-        e.sample_hash = h;
-        e.dirty = true;
-        InterlockedIncrement(&g_sync.dirty);
+        if (e.linear && !e.dirty) {
+            e.dirty = true;
+            InterlockedIncrement(&g_sync.dirty);
+        }
     }
     ReleaseSRWLockExclusive(&g_sync.lock);
 }
@@ -229,38 +223,139 @@ static void texture_barrier(ID3D12GraphicsCommandList8* list, ID3D12Resource* te
     list->Barrier(1, &g);
 }
 
+// Copies from buffers into textures need 512-byte aligned offsets and 256-byte aligned row pitches,
+// unless the device lifts that.
+static bool unrestricted_copy_pitch() {
+    static volatile long s_known = 0; // 1: restricted, 2: unrestricted
+    if (!s_known) {
+        D3D12_FEATURE_DATA_D3D12_OPTIONS13 o = {};
+        bool lifted =
+            SUCCEEDED(gpu_device()->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS13, &o, sizeof(o))) &&
+            o.UnrestrictedBufferTextureCopyPitchSupported;
+        InterlockedExchange(&s_known, lifted ? 2 : 1);
+    }
+    return s_known == 2;
+}
+
+// Holds a reference to a resource the recorded copies use. False if there is no room for another.
+static bool keep_source(TextureUploadSources* sources, ID3D12Resource* resource) {
+    for (u32 i = 0; i < sources->count; i++)
+        if (sources->resources[i] == resource)
+            return true;
+    if (sources->count == TEXTURE_UPLOAD_SOURCES - 1)
+        return false; // the last entry is for the upload buffer
+    resource->AddRef();
+    sources->resources[sources->count++] = resource;
+    return true;
+}
+
+// A linear texture of one array slice, copied by the GPU straight from title memory through its
+// window: each mip is a footprint at its offset and pitch in the console layout. False (nothing
+// recorded) if the layout isn't one copies can take.
+static bool copy_from_title_memory(ID3D12GraphicsCommandList8* list, ConsoleResource* r, u64 size,
+                                   TextureUploadSources* sources) {
+    const D3D12_RESOURCE_DESC1& d = r->desc;
+    if (d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D || d.DepthOrArraySize != 1)
+        return false;
+    FormatInfo console = format_info(d.Format);
+    FormatInfo desktop = format_info(format_desktop_resource(d.Format));
+    if (!console.bytes_per_element || console.bytes_per_element != desktop.bytes_per_element ||
+        console.block_width != desktop.block_width)
+        return false;
+    ConsoleTextureDesc t = layout_desc(d);
+    ConsoleTextureLayout layout;
+    if (!console_texture_layout(t, &layout) || layout.plane_count != 1)
+        return false;
+    const ConsolePlaneLayout& p = layout.planes[0];
+    bool unrestricted = unrestricted_copy_pitch();
+    GpuAddress window;
+    if (!gpu_translate(r->gpu_address, size, &window))
+        return false;
+    for (u32 m = 0; m < layout.mip_levels; m++) {
+        u64 at = window.offset + p.base_offset + p.mips[m].offset;
+        if (p.mips[m].swizzle_mode != 0 ||
+            (!unrestricted && (at % D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT ||
+                               p.mips[m].pitch_bytes % D3D12_TEXTURE_DATA_PITCH_ALIGNMENT)))
+            return false;
+    }
+    u64 unused;
+    ID3D12Resource* texture = console_resource_desktop(r, &unused);
+    if (!texture || sources->count + 2 >= TEXTURE_UPLOAD_SOURCES)
+        return false;
+    keep_source(sources, window.buffer);
+    keep_source(sources, texture);
+    texture_barrier(list, texture, true);
+    for (u32 m = 0; m < layout.mip_levels; m++) {
+        const ConsoleMipLayout& mip = p.mips[m];
+        u32 w = (u32)(d.Width >> m), h = d.Height >> m;
+        u32 bw = ((w ? w : 1) + console.block_width - 1) / console.block_width;
+        u32 bh = ((h ? h : 1) + console.block_height - 1) / console.block_height;
+        D3D12_TEXTURE_COPY_LOCATION dst = {texture, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+        dst.SubresourceIndex = m;
+        D3D12_TEXTURE_COPY_LOCATION src = {window.buffer, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+        src.PlacedFootprint.Offset = window.offset + p.base_offset + mip.offset;
+        src.PlacedFootprint.Footprint = {format_desktop_resource(d.Format), bw * console.block_width,
+                                         bh * console.block_height, 1, mip.pitch_bytes};
+        list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    }
+    texture_barrier(list, texture, false);
+    return true;
+}
+
 #define MAX_SUBRESOURCES 512
 #define MAX_UPLOADS      64
 
-ID3D12Resource* texture_sync_record(ID3D12GraphicsCommandList8* list) {
+bool texture_sync_record(ID3D12GraphicsCommandList8* list, TextureUploadSources* sources) {
+    sources->count = 0;
     if (!texture_sync_pending())
-        return nullptr;
+        return false;
     static SubresourceCopy s_copies[MAX_UPLOADS][MAX_SUBRESOURCES]; // under g_sync.lock
     ConsoleResource* uploads[MAX_UPLOADS];
     u32 copy_counts[MAX_UPLOADS];
     u32 upload_count = 0;
     u64 total = 0;
+    bool copied = false;
 
     AcquireSRWLockExclusive(&g_sync.lock);
-    // Choose the uploads: dirty textures whose memory is mapped, within the budget.
-    for (u32 i = 0; i < g_sync.count && upload_count < MAX_UPLOADS && total < UPLOAD_BUDGET; i++) {
+    // Linear textures the GPU can copy from title memory are copied now; the others are uploaded
+    // from the CPU within the budget, and the rest wait for the next submission.
+    for (u32 i = 0; i < g_sync.count; i++) {
         SyncEntry& e = g_sync.entries[i];
         if (!e.dirty)
             continue;
+        bool mapped = mem_is_mapped((const void*)e.start, e.end - e.start);
+        if (mapped && e.linear && copy_from_title_memory(list, e.resource, e.end - e.start, sources))
+            mapped = false, copied = true; // done
+        else if (mapped && (upload_count == MAX_UPLOADS || total >= UPLOAD_BUDGET))
+            continue;
         e.dirty = false;
         InterlockedDecrement(&g_sync.dirty);
-        if (!mem_is_mapped((const void*)e.start, e.end - e.start))
-            continue; // nothing to read yet (pages arrive with a later mapping)
+        if (!mapped)
+            continue; // copied, or nothing to read yet (pages arrive with a later mapping)
+        if (e.linear)
+            LOG_W_ONCE(
+                "d3d12",
+                "linear textures the GPU can't copy from title memory (texture at 0x%llx, %llux%u x%u, "
+                "format %d) are uploaded by the CPU every frame",
+                e.start, e.resource->desc.Width, e.resource->desc.Height, e.resource->desc.DepthOrArraySize,
+                e.resource->desc.Format);
         u64 offset = total;
-        if (!plan_texture(e.resource, s_copies[upload_count], MAX_SUBRESOURCES, &copy_counts[upload_count],
-                          &offset))
+        u64 unused;
+        ID3D12Resource* texture = console_resource_desktop(e.resource, &unused);
+        if (!texture || !plan_texture(e.resource, s_copies[upload_count], MAX_SUBRESOURCES,
+                                      &copy_counts[upload_count], &offset))
             continue;
+        if (!keep_source(sources, texture)) {
+            e.dirty = true; // no room left: with the next submission
+            InterlockedIncrement(&g_sync.dirty);
+            continue;
+        }
         total = offset;
         uploads[upload_count++] = e.resource;
     }
     if (!upload_count) {
         ReleaseSRWLockExclusive(&g_sync.lock);
-        return nullptr;
+        return copied;
     }
 
     ID3D12Resource* buffer = nullptr;
@@ -277,8 +372,10 @@ ID3D12Resource* texture_sync_record(ID3D12GraphicsCommandList8* list) {
     HRESULT hr = gpu_device()->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
                                                        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
                                                        IID_PPV_ARGS(&buffer));
-    if (SUCCEEDED(hr))
+    if (SUCCEEDED(hr)) {
+        gpu_set_name(buffer, "texture upload (%llu KiB)", total >> 10);
         hr = buffer->Map(0, nullptr, (void**)&mapped);
+    }
     if (FAILED(hr)) {
         LOG_E("d3d12", "cannot create a %llu MiB texture upload buffer (0x%08lx)", total >> 20,
               (unsigned long)hr);
@@ -293,7 +390,7 @@ ID3D12Resource* texture_sync_record(ID3D12GraphicsCommandList8* list) {
                     break;
                 }
         ReleaseSRWLockExclusive(&g_sync.lock);
-        return nullptr;
+        return copied;
     }
 
     for (u32 u = 0; u < upload_count; u++) {
@@ -323,5 +420,6 @@ ID3D12Resource* texture_sync_record(ID3D12GraphicsCommandList8* list) {
     }
     ReleaseSRWLockExclusive(&g_sync.lock);
     buffer->Unmap(0, nullptr);
-    return buffer;
+    sources->resources[sources->count++] = buffer; // room was left for it
+    return true;
 }

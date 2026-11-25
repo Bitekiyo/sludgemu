@@ -12,6 +12,7 @@
 #include "hle/d3d12/d3d12_objects.h"
 #include "hle/d3d12/d3d12_tables.h"
 #include "hle/d3d12/frame_pacing.h"
+#include "hle/d3d12/texture_sync.h"
 #include "hle/d3d12/views.h"
 
 static_assert(offsetof(ConsoleDevice, null_constant_buffer_address) == 0x10, "device layout");
@@ -334,6 +335,7 @@ HRESULT console_create_device(void* adapter, const ConsoleDeviceParams* params, 
         console_command_allocator_init();
         console_command_list_init();
         gpu_window_init();
+        texture_sync_init();
         console_resource_init();
         console_descriptor_heap_init();
         console_query_heap_init();
