@@ -108,6 +108,8 @@ static const char* operand_u32(Translator& t, const RdnaOperand& o, OperandType 
 }
 
 const char* src_u32(Translator& t, const RdnaInst& in, u32 i, OperandType type, u32 part) {
+    if (t.dpp_active && i == 0 && part == 0)
+        return "dpp0_";
     const RdnaOperand& o = in.src[i];
     if (o.kind == OPND_SPECIAL && (o.reg == SRC_VCC_LO || o.reg == SRC_EXEC_LO))
         t.sgpr_used[o.reg] = 1;
@@ -156,7 +158,7 @@ void write_vgpr(Translator& t, const RdnaInst& in, u32 reg, const char* value) {
         else
             value = bits;
     }
-    emit(t, "if (EXEC) %s = %s;", dst, value);
+    emit(t, t.dpp_has_mask ? "if (EXEC && dpp_en_) %s = %s;" : "if (EXEC) %s = %s;", dst, value);
 }
 
 void write_sgpr(Translator& t, const RdnaOperand& dst, u32 part, const char* value) {
@@ -267,6 +269,11 @@ static bool emit_export(Translator& t, const RdnaInst& in) {
         if (target == EXP_POS0) {
             t.position_exported = 1;
             emit(t, "output.position = float4(%s, %s, %s, %s);", c[0], c[1], c[2], c[3]);
+        } else if (target == EXP_POS0 + 1) {
+            t.vs_clip_mask |= e.enable & 0xF;
+            for (u32 i = 0; i < 4; i++)
+                if (e.enable & (1u << i))
+                    emit(t, "output.clip.%c = %s;", "xyzw"[i], c[i]);
         } else if (target >= EXP_PARAM0) {
             u32 n = target - EXP_PARAM0;
             t.out->vs_param_mask |= 1u << n;
@@ -369,7 +376,7 @@ static void emit_block(Translator& t, u32 b) {
     for (u32 i = blk.first; i < blk.end && !t.failed; i++) {
         const RdnaInst& in = t.program.insts[i];
         emit_instruction(t, in);
-        tags_transfer(t, t.tags, in);
+        tags_transfer(t, t.tags, in, i);
     }
 }
 
@@ -444,6 +451,12 @@ static const char k_preamble[] =
     "uint wave_first(uint m) { uint4 b = WaveActiveBallot(m != 0u); return b.x ? firstbitlow(b.x) : b.y ? "
     "32u + "
     "firstbitlow(b.y) : b.z ? 64u + firstbitlow(b.z) : b.w ? 96u + firstbitlow(b.w) : 0xffffffffu; }\n"
+    "uint wave_last(uint m) { uint4 b = WaveActiveBallot(m != 0u); return b.w ? 96u + firstbithigh(b.w) : "
+    "b.z ? "
+    "64u + firstbithigh(b.z) : b.y ? 32u + firstbithigh(b.y) : b.x ? firstbithigh(b.x) : 0xffffffffu; }\n"
+    // The first clear bit of a console mask `width` bits wide: lanes the desktop wave lacks count as clear.
+    "uint wave_first_zero(uint m, uint width) { uint4 b = WaveActiveBallot(m != 0u); uint lo = ~b.x, hi = "
+    "width > 32u ? ~b.y : 0u; return lo ? firstbitlow(lo) : hi ? 32u + firstbitlow(hi) : 0xffffffffu; }\n"
     "uint read_first(uint v, uint m) { uint lane = wave_first(m); return WaveReadLaneAt(v, lane == "
     "0xffffffffu ? "
     "0u : lane); }\n"
@@ -483,6 +496,10 @@ static const char k_preamble[] =
     "9u); else if (e == 0u) bit = m == 0u ? (neg ? 5u : 6u) : (neg ? 4u : 7u); else bit = neg ? 3u : 8u; "
     "return "
     "((c >> bit) & 1u) != 0u; }\n"
+    "bool cmp_class_f16(uint u, uint c) { u &= 0xffffu; bool neg = (u >> 15) != 0u; uint e = (u >> 10) & "
+    "0x1fu; uint m = u & 0x3ffu; uint bit; if (e == 0x1fu) bit = m != 0u ? ((m & 0x200u) ? 1u : 0u) : (neg ? "
+    "2u : 9u); else if (e == 0u) bit = m == 0u ? (neg ? 5u : 6u) : (neg ? 4u : 7u); else bit = neg ? 3u : "
+    "8u; return ((c >> bit) & 1u) != 0u; }\n"
     "float frexp_mant(float f) { float e; float m = frexp(f, e); return m; }\n"
     "int frexp_exp(float f) { float e; frexp(f, e); return (int)e; }\n"
     "float cube_ma(float3 v) { float3 a = abs(v); return 2.0f * (a.z >= a.x && a.z >= a.y ? v.z : a.y >= a.x "
@@ -603,6 +620,20 @@ static void write_declarations(Translator& t, Text& h) {
         else
             h.put("ByteAddressBuffer g_root%u : register(t%u, space100);\n", i, p.root_register);
     }
+    for (u32 i = 0; i < t.pc_pool_count; i++) {
+        const PcPool& p = t.pc_pools[i];
+        // One more element, zero, for reads past the end (see register_pc_pool).
+        h.put("static const uint g_pc_%u_end = %uu;\n", i, p.dwords);
+        h.put("static const uint g_pc_%u[%u] = {", i, p.dwords + 1);
+        for (u32 w = 0; w < p.dwords; w++) {
+            u32 v = 0;
+            u32 off = p.base_off + w * 4;
+            if (off + 4 <= t.code_size)
+                memcpy(&v, t.code + off, 4);
+            h.put("0x%08xu, ", v);
+        }
+        h.put("0u};\n");
+    }
     if (t.needs_descriptor_info)
         h.put("ByteAddressBuffer g_descriptor_info : register(t0, space101);\n");
     for (u32 i = 0; i < t.out->sampler_count; i++)
@@ -621,6 +652,8 @@ static void write_declarations(Translator& t, Text& h) {
                       element_hlsl_type(t.vs_fetch_components[i], t.fetch_typed[i], t.fetch_class[i]), i, i);
         h.put("    uint vertex_id : SV_VertexID;\n    uint instance_id : SV_InstanceID;\n};\n");
         h.put("struct Output {\n    float4 position : SV_Position;\n");
+        if (t.vs_clip_mask)
+            h.put("    float4 clip : SV_ClipDistance0;\n");
         for (u32 i = 0; i < 32; i++)
             if (t.out->vs_param_mask & (1u << i))
                 h.put("    float4 p%u : P%u;\n", i, i);
@@ -693,23 +726,54 @@ static void write_declarations(Translator& t, Text& h) {
         }
         h.put("    uint v%u = %s;\n", r, init);
     }
+    for (u32 slot = 0; slot < t.spill_vgpr_count; slot++)
+        for (u32 lane = 0; lane < 64; lane++)
+            if (t.spill_lanes[slot] & (1ull << lane))
+                h.put("    uint spill%u_%u = 0u;\n", slot, lane);
 }
 
-static void detect_wave_size(Translator& t) {
-    // Wave32 code works on EXEC_LO alone with 32-bit mask instructions.
+static bool is_exec64_operand(const RdnaOperand& o) {
+    return o.kind == OPND_SPECIAL && ((o.reg == SRC_EXEC_LO && o.count == 2) || o.reg == SRC_EXEC_HI);
+}
+
+static bool is_exec32_operand(const RdnaOperand& o) {
+    return o.kind == OPND_SPECIAL && o.reg == SRC_EXEC_LO && o.count == 1;
+}
+
+void detect_wave_size(Translator& t) {
+    bool has_exec64 = false;
+    bool has_exec32 = false;
     for (u32 i = 0; i < t.program.count; i++) {
         const RdnaInst& in = t.program.insts[i];
-        if ((in.op >= OP_S_AND_SAVEEXEC_B32 && in.op <= OP_S_ANDN2_WREXEC_B32) ||
-            (in.dst[0].kind == OPND_SPECIAL && in.dst[0].reg == SRC_EXEC_LO && in.dst[0].count == 1 &&
-             in.enc == ENC_SOP1 && in.op == OP_S_MOV_B32)) {
-            t.wave32 = true;
-            return;
+        if ((in.op >= OP_S_AND_SAVEEXEC_B64 && in.op <= OP_S_XNOR_SAVEEXEC_B64) ||
+            (in.op >= OP_S_ANDN1_SAVEEXEC_B64 && in.op <= OP_S_ANDN2_WREXEC_B64) || in.op == OP_S_WQM_B64)
+            has_exec64 = true;
+        if ((in.op >= OP_S_AND_SAVEEXEC_B32 && in.op <= OP_S_ANDN2_WREXEC_B32) || in.op == OP_S_WQM_B32)
+            has_exec32 = true;
+        RdnaEncoding base = rdna_op_encoding(in.op);
+        if (base == ENC_SOP1 || base == ENC_SOP2 || base == ENC_SOPC || base == ENC_SOPK) {
+            for (u32 d = 0; d < 2; d++) {
+                if (is_exec64_operand(in.dst[d]))
+                    has_exec64 = true;
+                else if (is_exec32_operand(in.dst[d]))
+                    has_exec32 = true;
+            }
+            for (u32 s = 0; s < in.num_src; s++) {
+                if (is_exec64_operand(in.src[s]))
+                    has_exec64 = true;
+                else if (is_exec32_operand(in.src[s]))
+                    has_exec32 = true;
+            }
         }
+        // Wave64 requires even-aligned SGPR pairs for VOPC / VOP3 carry-out masks; odd SGPRs prove Wave32.
+        if ((base == ENC_VOPC && in.dst[0].kind == OPND_SGPR && (in.dst[0].reg & 1u)) ||
+            (in.enc == ENC_VOP3 && in.dst[1].kind == OPND_SGPR && (in.dst[1].reg & 1u)))
+            has_exec32 = true;
     }
+    t.wave32 = !has_exec64 && has_exec32;
 }
 
 void emit_program(Translator& t) {
-    detect_wave_size(t);
     if (t.info->stage == SHADER_PIXEL)
         layout_ps_inputs(t);
     t.depth = 1;
