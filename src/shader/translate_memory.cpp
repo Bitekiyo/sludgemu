@@ -66,12 +66,14 @@ static s32 register_pc_pool(Translator& t, u32 rsrc_reg) {
         return -1;
     u32 avail = (t.code_size - base_off) / 4u;
     u32 dwords = avail;
+    // Records are bytes, or elements of the stride when the descriptor has one, so without the stride
+    // (the word holding it usually has the code address in it too) the size is unknown.
     u32 records = 0, word1 = 0;
-    if (sgpr_constant(t.tags, rsrc_reg + 2, &records)) {
-        // Records are bytes, or elements of the stride when the descriptor has one.
+    if (sgpr_constant(t.tags, rsrc_reg + 2, &records) && sgpr_constant(t.tags, rsrc_reg + 1, &word1)) {
         u64 bytes = records;
-        if (sgpr_constant(t.tags, rsrc_reg + 1, &word1) && ((word1 >> 16) & 0x3FFFu))
-            bytes *= (word1 >> 16) & 0x3FFFu;
+        u32 stride = (word1 >> 16) & 0x3FFFu;
+        if (stride)
+            bytes *= stride;
         u64 d = (bytes + 3u) / 4u;
         if (d < avail)
             dwords = (u32)d;
@@ -1508,12 +1510,13 @@ static bool emit_lds(Translator& t, const RdnaInst& in) {
     case OP_DS_APPEND:
     case OP_DS_CONSUME: {
         use_sgpr(t, SRC_M0);
-        const char* delta = in.op == OP_DS_APPEND ? "wave_count(s126)" : "(uint)(-(int)wave_count(s126))";
-        emit(
-            t,
-            "{ uint o_ = 0u; if (EXEC) { uint lane_ = wave_first(s126); if (WaveGetLaneIndex() == lane_) "
-            "InterlockedAdd(g_lds[((s124 & 0xffffu) + %uu) >> 2], %s, o_); o_ = WaveReadLaneAt(o_, lane_); }",
-            offset, delta);
+        // The active lanes are counted before one of them does the add for the wave.
+        const char* delta = in.op == OP_DS_APPEND ? "n_" : "(uint)(-(int)n_)";
+        emit(t,
+             "{ uint o_ = 0u; if (EXEC) { uint n_ = wave_count(s126); uint lane_ = wave_first(s126); "
+             "if (WaveGetLaneIndex() == lane_) InterlockedAdd(g_lds[((s124 & 0xffffu) + %uu) >> 2], %s, o_); "
+             "o_ = WaveReadLaneAt(o_, lane_); }",
+             offset, delta);
         t.depth++;
         write_vgpr(t, in, in.dst[0].reg, "o_");
         t.depth--;

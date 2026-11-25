@@ -728,13 +728,12 @@ static bool emit_compare(Translator& t, const RdnaInst& in) {
     return true;
 }
 
-// Cross-lane access to a lane the desktop wave may not have: lanes 32-63 of a wave64 program are in
-// another desktop wave where waves are 32 wide (the desktop wave size is not known here). Lanes known
-// at translation time are checked; others are assumed to be in range.
+// Access to one particular lane. Where desktop waves are 32 wide (the desktop wave size is not known
+// here), a wave64 program's wave spans two of them and either half may name a lane of the other, so
+// this is only exact for wave32 programs; wave64 ones fail until that is emulated.
 static bool lane_in_desktop_wave(Translator& t, const RdnaInst& in) {
-    u32 lane;
-    if (!t.wave32 && constant_lane(t, in.src[1], &lane) && lane >= 32) {
-        translator_fail(t, "%s of lane %u at 0x%x", rdna_op_name(in.op), lane, in.offset);
+    if (!t.wave32) {
+        translator_fail(t, "%s in a wave64 program at 0x%x", rdna_op_name(in.op), in.offset);
         return false;
     }
     return true;
@@ -774,8 +773,7 @@ static bool emit_vector(Translator& t, const RdnaInst& in) {
         }
         if (!lane_in_desktop_wave(t, in))
             return false;
-        write_sgpr(t, in.dst[0], 0,
-                   fmt(t, "WaveReadLaneAt(%s, %s & %su)", u(t, in, 0), u(t, in, 1), t.wave32 ? "31" : "63"));
+        write_sgpr(t, in.dst[0], 0, fmt(t, "WaveReadLaneAt(%s, %s & 31u)", u(t, in, 0), u(t, in, 1)));
         return true;
     }
     case OP_V_WRITELANE_B32: {
@@ -788,8 +786,8 @@ static bool emit_vector(Translator& t, const RdnaInst& in) {
         }
         if (!lane_in_desktop_wave(t, in))
             return false;
-        emit(t, "if (WaveGetLaneIndex() == (%s & %su)) %s = %s;", u(t, in, 1), t.wave32 ? "31" : "63",
-             vgpr(t, in.dst[0].reg), u(t, in, 0));
+        emit(t, "if (WaveGetLaneIndex() == (%s & 31u)) %s = %s;", u(t, in, 1), vgpr(t, in.dst[0].reg),
+             u(t, in, 0));
         return true;
     }
     case OP_V_MBCNT_LO_U32_B32:
