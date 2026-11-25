@@ -4,7 +4,5 @@
 
 #include "hle/hle.h"
 
-
-// Bundled with titles, but they drive console-only GPU features, so we replace them.
-HLE_EMPTY_MODULE(g_hle_module_xboxbvhbuilder, "xboxbvhbuilder.dll");
+// Bundled with titles, but it drives console-only GPU features, so we replace it.
 HLE_EMPTY_MODULE(g_hle_module_ffx_loader, "amd_fidelityfx_loader_xbox.dll");
