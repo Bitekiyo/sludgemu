@@ -603,28 +603,41 @@ static const char* const k_texture_types[8] = {"Texture1D",   "Texture2D",      
 static const u8 k_dim_coords[8] = {1, 2, 3, 3, 2, 3, 2, 3};
 static const u8 k_dim_grads[8] = {1, 2, 3, 3, 1, 2, 2, 2};
 
-static const char* float_vector(Translator& t, const u32* regs, u32 count) {
-    if (count == 1)
-        return fmt(t, "asfloat(%s)", vgpr(t, regs[0]));
-    char list[160] = {};
-    usize n = 0;
-    for (u32 i = 0; i < count; i++)
-        n += (usize)snprintf(list + n, sizeof(list) - n, "%sasfloat(v%u)", i ? ", " : "", regs[i]);
-    for (u32 i = 0; i < count; i++)
-        use_vgpr(t, regs[i]);
-    return fmt(t, "float%u(%s)", count, list);
+// Image address registers. With 16-bit addresses, components after the first `unpacked` share
+// registers two by two (low half first).
+struct ImageAddress {
+    u32 regs[16];
+    u32 unpacked;
+    bool a16;
+};
+
+// Component `i` as uint bits.
+static const char* address_bits(Translator& t, const ImageAddress& a, s32 i) {
+    if (!a.a16 || (u32)i < a.unpacked)
+        return vgpr(t, a.regs[i]);
+    u32 j = (u32)i - a.unpacked;
+    const char* reg = vgpr(t, a.regs[a.unpacked + j / 2]);
+    return j & 1 ? fmt(t, "(%s >> 16)", reg) : fmt(t, "(%s & 0xffffu)", reg);
 }
 
-static const char* uint_vector(Translator& t, const u32* regs, u32 count) {
-    if (count == 1)
-        return vgpr(t, regs[0]);
-    char list[160] = {};
-    usize n = 0;
-    for (u32 i = 0; i < count; i++)
-        n += (usize)snprintf(list + n, sizeof(list) - n, "%sv%u", i ? ", " : "", regs[i]);
-    for (u32 i = 0; i < count; i++)
-        use_vgpr(t, regs[i]);
-    return fmt(t, "uint%u(%s)", count, list);
+// Component `i` as a float.
+static const char* address_value(Translator& t, const ImageAddress& a, s32 i) {
+    if (!a.a16 || (u32)i < a.unpacked)
+        return fmt(t, "asfloat(%s)", address_bits(t, a, i));
+    return fmt(t, "f16tof32(%s)", address_bits(t, a, i));
+}
+
+// Components [first, first + n) as a float or uint vector.
+static const char* address_vector(Translator& t, const ImageAddress& a, bool floats, u32 first, u32 n) {
+    char list[240] = {};
+    usize len = 0;
+    for (u32 i = 0; i < n; i++)
+        len += (usize)snprintf(list + len, sizeof(list) - len, "%s%s", i ? ", " : "",
+                               floats ? address_value(t, a, (s32)(first + i))
+                                      : address_bits(t, a, (s32)(first + i)));
+    if (n == 1)
+        return fmt(t, "%s", list);
+    return fmt(t, "%s%u(%s)", floats ? "float" : "uint", n, list);
 }
 
 static bool emit_image(Translator& t, const RdnaInst& in) {
@@ -634,8 +647,12 @@ static bool emit_image(Translator& t, const RdnaInst& in) {
         translator_fail(t, "unsupported %s", rdna_op_name(in.op));
         return false;
     }
-    if (m.a16 || m.d16 || m.tfe || m.lwe) {
-        translator_fail(t, "%s with 16-bit data or addresses at 0x%x", rdna_op_name(in.op), in.offset);
+    if (m.tfe || m.lwe) {
+        translator_fail(t, "%s with residency feedback at 0x%x", rdna_op_name(in.op), in.offset);
+        return false;
+    }
+    if (m.a16 && form.grad) {
+        translator_fail(t, "%s with 16-bit gradients at 0x%x", rdna_op_name(in.op), in.offset);
         return false;
     }
     if (m.dim == DIM_CUBE && (form.sample || form.gather)) {
@@ -653,36 +670,50 @@ static bool emit_image(Translator& t, const RdnaInst& in) {
                         in.offset);
         return false;
     }
-    // Address VGPRs in order.
-    u32 regs[16];
-    u32 count = rdna_image_address_count(in.op, m.dim);
-    if (count > 16) {
+    // Address components in order: bias and comparison reference, then gradients, coordinates, LOD
+    // (or mip, or sample index) and clamp. With 16-bit addresses, the components after the bias and
+    // reference are packed two to a register (low half first).
+    u32 components = rdna_image_address_count(in.op, m.dim);
+    u32 unpacked = (form.bias ? 1 : 0) + (form.compare ? 1 : 0);
+    u32 registers = m.a16 ? unpacked + (components - unpacked + 1) / 2 : components;
+    if (components > 16) {
         translator_fail(t, "too many image address registers");
         return false;
     }
-    for (u32 i = 0; i < count; i++)
+    u32 regs[16];
+    for (u32 i = 0; i < registers; i++)
         regs[i] = m.nsa_count && i > 0 ? m.nsa_addr[i - 1] : in.src[0].reg + i;
+    ImageAddress addr = {};
+    memcpy(addr.regs, regs, sizeof(regs));
+    addr.unpacked = unpacked;
+    addr.a16 = m.a16;
     u32 at = 0;
-    u32 bias_reg = 0, compare_reg = 0, lod_reg = 0, clamp_reg = 0, grad_regs[6] = {};
+    s32 bias_at = -1, compare_at = -1, lod_at = -1, clamp_at = -1, grad_at = -1;
     if (form.bias)
-        bias_reg = regs[at++];
+        bias_at = (s32)at++;
     if (form.compare)
-        compare_reg = regs[at++];
+        compare_at = (s32)at++;
     u32 grads = k_dim_grads[m.dim];
     if (form.grad) {
-        for (u32 i = 0; i < grads * 2; i++)
-            grad_regs[i] = regs[at++];
+        grad_at = (s32)at;
+        at += grads * 2;
     }
     u32 coords = k_dim_coords[m.dim];
-    const u32* coord_regs = regs + at;
+    u32 coord_at = at;
     at += coords;
     if (form.lod || form.mip || in.op == OP_IMAGE_MSAA_LOAD)
-        lod_reg = regs[at++];
+        lod_at = (s32)at++;
     if (form.clamp)
-        clamp_reg = regs[at++];
+        clamp_at = (s32)at++;
+    if (at > components) {
+        translator_fail(t, "%s at 0x%x: address layout mismatch", rdna_op_name(in.op), in.offset);
+        return false;
+    }
 
     TableRangeKind kind = heap_kind(t, rsrc, form.store ? RANGE_UAV : RANGE_SRV);
-    bool uav = kind == RANGE_UAV || form.store;
+    // Sampling reads through shader resource views only; stores need unordered access views.
+    bool sampled = form.sample || form.gather || in.op == OP_IMAGE_GET_LOD;
+    bool uav = form.store || (kind == RANGE_UAV && !sampled);
     const char* resource = fmt(t, "%s >> 5", sgpr(t, rsrc));
     emit(t, "{");
     t.depth++;
@@ -725,12 +756,21 @@ static bool emit_image(Translator& t, const RdnaInst& in) {
                             in.offset);
             return false;
         }
-        const char* uv = float_vector(t, coord_regs, coords);
+        const char* uv = address_vector(t, addr, true, coord_at, coords);
+        // Implicit LOD needs derivatives. Compute groups whose shape desktop can't take them in (1D
+        // groups not a multiple of 4 threads, other groups with odd X or Y) have lone lanes in their
+        // quads on console too: zero derivatives, so the LOD is the bias alone.
+        bool implicit_lod_ok = true;
+        if (t.info->stage == SHADER_COMPUTE) {
+            const u16* n = t.info->threads;
+            bool one_d = n[1] == 1 && n[2] == 1;
+            implicit_lod_ok = one_d ? n[0] % 4 == 0 : n[0] % 2 == 0 && n[1] % 2 == 0;
+        }
         if (form.gather) {
             static const char* const k_gather[4] = {"GatherRed", "GatherGreen", "GatherBlue", "GatherAlpha"};
             u32 c = m.dmask & 2 ? 1 : m.dmask & 4 ? 2 : m.dmask & 8 ? 3 : 0;
             if (form.compare)
-                value = fmt(t, "tex_.GatherCmpRed(smp_, %s, asfloat(%s))", uv, vgpr(t, compare_reg));
+                value = fmt(t, "tex_.GatherCmpRed(smp_, %s, %s)", uv, address_value(t, addr, compare_at));
             else
                 value = fmt(t, "tex_.%s(smp_, %s)", k_gather[c], uv);
             if (form.lod || form.bias || form.grad || form.clamp) {
@@ -738,30 +778,29 @@ static bool emit_image(Translator& t, const RdnaInst& in) {
                 return false;
             }
         } else if (form.compare) {
-            const char* ref = fmt(t, "asfloat(%s)", vgpr(t, compare_reg));
-            if (form.lod_zero)
+            const char* ref = address_value(t, addr, compare_at);
+            if (form.lod_zero || (!form.lod && !implicit_lod_ok))
                 value = fmt(t, "tex_.SampleCmpLevelZero(smp_, %s, %s).xxxx", uv, ref);
             else if (form.lod)
-                value =
-                    fmt(t, "tex_.SampleCmpLevel(smp_, %s, %s, asfloat(%s)).xxxx", uv, ref, vgpr(t, lod_reg));
+                value = fmt(t, "tex_.SampleCmpLevel(smp_, %s, %s, %s).xxxx", uv, ref,
+                            address_value(t, addr, lod_at));
             else if (!form.bias && !form.grad && !form.clamp)
                 value = fmt(t, "tex_.SampleCmp(smp_, %s, %s).xxxx", uv, ref);
-        } else if (form.lod_zero) {
-            value = fmt(t, "tex_.SampleLevel(smp_, %s, 0.0f)", uv);
+        } else if (form.lod_zero || (!form.lod && !form.grad && !implicit_lod_ok)) {
+            // Without usable derivatives the LOD is the bias alone (see implicit_lod_ok).
+            value = form.bias && !form.lod_zero
+                        ? fmt(t, "tex_.SampleLevel(smp_, %s, %s)", uv, address_value(t, addr, bias_at))
+                        : fmt(t, "tex_.SampleLevel(smp_, %s, 0.0f)", uv);
         } else if (form.lod) {
-            value = fmt(t, "tex_.SampleLevel(smp_, %s, asfloat(%s))", uv, vgpr(t, lod_reg));
+            value = fmt(t, "tex_.SampleLevel(smp_, %s, %s)", uv, address_value(t, addr, lod_at));
         } else if (form.bias && !form.clamp) {
-            value = fmt(t, "tex_.SampleBias(smp_, %s, asfloat(%s))", uv, vgpr(t, bias_reg));
+            value = fmt(t, "tex_.SampleBias(smp_, %s, %s)", uv, address_value(t, addr, bias_at));
         } else if (form.grad && !form.clamp) {
-            u32 dx[3], dy[3];
-            for (u32 i = 0; i < grads; i++) {
-                dx[i] = grad_regs[i];
-                dy[i] = grad_regs[grads + i];
-            }
-            value = fmt(t, "tex_.SampleGrad(smp_, %s, %s, %s)", uv, float_vector(t, dx, grads),
-                        float_vector(t, dy, grads));
+            value =
+                fmt(t, "tex_.SampleGrad(smp_, %s, %s, %s)", uv, address_vector(t, addr, true, grad_at, grads),
+                    address_vector(t, addr, true, grad_at + grads, grads));
         } else if (!form.bias && !form.grad) {
-            value = form.clamp ? fmt(t, "tex_.Sample(smp_, %s, 0, asfloat(%s))", uv, vgpr(t, clamp_reg))
+            value = form.clamp ? fmt(t, "tex_.Sample(smp_, %s, 0, %s)", uv, address_value(t, addr, clamp_at))
                                : fmt(t, "tex_.Sample(smp_, %s)", uv);
         }
         if (!value) {
@@ -769,20 +808,29 @@ static bool emit_image(Translator& t, const RdnaInst& in) {
             return false;
         }
     } else if (form.load) {
-        const char* xy = uint_vector(t, coord_regs, coords);
+        const char* xy = address_vector(t, addr, false, coord_at, coords);
         if (in.op == OP_IMAGE_MSAA_LOAD)
-            value = fmt(t, "tex_.Load(%s, %s)", xy, vgpr(t, lod_reg));
+            value = fmt(t, "tex_.Load(%s, %s)", xy, address_bits(t, addr, lod_at));
         else if (uav)
             value = fmt(t, "tex_[%s]", xy);
         else
-            value = fmt(t, "tex_.Load(uint%u(%s, %s))", coords + 1, xy, form.mip ? vgpr(t, lod_reg) : "0u");
+            value = fmt(t, "tex_.Load(uint%u(%s, %s))", coords + 1, xy,
+                        form.mip ? address_bits(t, addr, lod_at) : "0u");
     } else if (form.store) {
-        const char* xy = uint_vector(t, coord_regs, coords);
+        const char* xy = address_vector(t, addr, false, coord_at, coords);
         const char* c[4] = {"0.0f", "0.0f", "0.0f", "0.0f"};
         u32 source = 0;
-        for (u32 i = 0; i < 4; i++)
-            if (m.dmask & (1u << i))
-                c[i] = fmt(t, "asfloat(%s)", vgpr(t, in.dst[0].reg + source++));
+        for (u32 i = 0; i < 4; i++) {
+            if (!(m.dmask & (1u << i)))
+                continue;
+            // 16-bit data: two components to a register, low half first.
+            const char* reg = vgpr(t, in.dst[0].reg + (m.d16 ? source / 2 : source));
+            if (!m.d16)
+                c[i] = fmt(t, "asfloat(%s)", reg);
+            else
+                c[i] = fmt(t, source & 1 ? "f16tof32(%s >> 16)" : "f16tof32(%s & 0xffffu)", reg);
+            source++;
+        }
         emit(t, "if (EXEC) tex_[%s] = float4(%s, %s, %s, %s);", xy, c[0], c[1], c[2], c[3]);
         t.depth--;
         emit(t, "}");
@@ -820,7 +868,7 @@ static bool emit_image(Translator& t, const RdnaInst& in) {
     } else if (in.op == OP_IMAGE_GET_LOD) {
         u32 samp = in.src[2].reg;
         emit(t, "SamplerState smp_ = SamplerDescriptorHeap[%s >> 4];", sgpr(t, samp));
-        const char* uv = float_vector(t, coord_regs, coords);
+        const char* uv = address_vector(t, addr, true, coord_at, coords);
         value = fmt(
             t,
             "float4(tex_.CalculateLevelOfDetail(smp_, %s), tex_.CalculateLevelOfDetailUnclamped(smp_, %s), "
@@ -833,9 +881,21 @@ static bool emit_image(Translator& t, const RdnaInst& in) {
     emit(t, "float4 r_ = %s;", value);
     u32 dst = in.dst[0].reg;
     u32 mask = form.gather ? 0xF : m.dmask;
+    const char* results[4];
+    u32 n = 0;
     for (u32 i = 0; i < 4; i++)
         if (mask & (1u << i))
-            write_vgpr(t, in, dst++, fmt(t, "asuint(r_.%c)", "xyzw"[i]));
+            results[n++] = fmt(t, "r_.%c", "xyzw"[i]);
+    if (!m.d16) {
+        for (u32 i = 0; i < n; i++)
+            write_vgpr(t, in, dst + i, fmt(t, "asuint(%s)", results[i]));
+    } else {
+        // 16-bit data: two components to a register, low half first.
+        for (u32 i = 0; i < n; i += 2)
+            write_vgpr(t, in, dst + i / 2,
+                       i + 1 < n ? fmt(t, "(f32tof16(%s) | (f32tof16(%s) << 16))", results[i], results[i + 1])
+                                 : fmt(t, "f32tof16(%s)", results[i]));
+    }
     t.depth--;
     emit(t, "}");
     return true;

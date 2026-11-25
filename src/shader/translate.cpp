@@ -212,7 +212,137 @@ static Tag carried(Tag a, Tag b) {
     return a == b ? a : TAG_NONE;
 }
 
+// Scalar integer results of constant operands, evaluated at translation time (programs build sampler
+// descriptors and the like from constants with arithmetic, not only with moves).
+static bool fold_scalar(const TagState& s, const RdnaInst& in, u32* out) {
+    if (in.dst[0].kind != OPND_SGPR || in.dst[0].count != 1)
+        return false;
+    u32 a = 0, b = 0;
+    if (in.num_src < 1 || !constant_of(s, in.src[0], 0, &a))
+        return false;
+    bool two = in.num_src > 1;
+    if (two && !constant_of(s, in.src[1], 0, &b))
+        return false;
+    switch (in.op) {
+    case OP_S_NOT_B32:
+        *out = ~a;
+        return true;
+    case OP_S_BREV_B32: {
+        u32 r = 0;
+        for (u32 i = 0; i < 32; i++)
+            r |= ((a >> i) & 1u) << (31 - i);
+        *out = r;
+        return true;
+    }
+    default:
+        break;
+    }
+    if (!two)
+        return false;
+    switch (in.op) {
+    case OP_S_ADD_U32:
+    case OP_S_ADD_I32:
+        *out = a + b;
+        return true;
+    case OP_S_SUB_U32:
+    case OP_S_SUB_I32:
+        *out = a - b;
+        return true;
+    case OP_S_MIN_U32:
+        *out = a < b ? a : b;
+        return true;
+    case OP_S_MAX_U32:
+        *out = a > b ? a : b;
+        return true;
+    case OP_S_MIN_I32:
+        *out = (s32)a < (s32)b ? a : b;
+        return true;
+    case OP_S_MAX_I32:
+        *out = (s32)a > (s32)b ? a : b;
+        return true;
+    case OP_S_AND_B32:
+        *out = a & b;
+        return true;
+    case OP_S_OR_B32:
+        *out = a | b;
+        return true;
+    case OP_S_XOR_B32:
+        *out = a ^ b;
+        return true;
+    case OP_S_ANDN2_B32:
+        *out = a & ~b;
+        return true;
+    case OP_S_ORN2_B32:
+        *out = a | ~b;
+        return true;
+    case OP_S_NAND_B32:
+        *out = ~(a & b);
+        return true;
+    case OP_S_NOR_B32:
+        *out = ~(a | b);
+        return true;
+    case OP_S_XNOR_B32:
+        *out = ~(a ^ b);
+        return true;
+    case OP_S_LSHL_B32:
+        *out = a << (b & 31);
+        return true;
+    case OP_S_LSHR_B32:
+        *out = a >> (b & 31);
+        return true;
+    case OP_S_ASHR_I32:
+        *out = (u32)((s32)a >> (b & 31));
+        return true;
+    case OP_S_BFM_B32:
+        *out = ((1u << (a & 31)) - 1u) << (b & 31);
+        return true;
+    case OP_S_MUL_I32:
+        *out = a * b;
+        return true;
+    case OP_S_MUL_HI_U32:
+        *out = (u32)(((u64)a * b) >> 32);
+        return true;
+    case OP_S_BFE_U32:
+    case OP_S_BFE_I32: {
+        u32 offset = b & 31, width = (b >> 16) & 127;
+        if (width == 0) {
+            *out = 0;
+            return true;
+        }
+        u32 v = a >> offset;
+        if (width < 32) {
+            v &= (1u << width) - 1u;
+            if (in.op == OP_S_BFE_I32 && (v >> (width - 1)) & 1u)
+                v |= ~((1u << width) - 1u);
+        }
+        *out = v;
+        return true;
+    }
+    case OP_S_LSHL1_ADD_U32:
+    case OP_S_LSHL2_ADD_U32:
+    case OP_S_LSHL3_ADD_U32:
+    case OP_S_LSHL4_ADD_U32:
+        *out = (a << (in.op - OP_S_LSHL1_ADD_U32 + 1)) + b;
+        return true;
+    case OP_S_PACK_LL_B32_B16:
+        *out = (a & 0xFFFFu) | (b << 16);
+        return true;
+    default:
+        return false;
+    }
+}
+
+static void transfer(const Translator& t, TagState& s, const RdnaInst& in);
+
 void tags_transfer(const Translator& t, TagState& s, const RdnaInst& in) {
+    u32 folded;
+    bool fold = fold_scalar(s, in, &folded);
+    transfer(t, s, in);
+    if (fold)
+        set_constant(s, in.dst[0], 0, folded);
+}
+
+static void transfer(const Translator& t, TagState& s, const RdnaInst& in) {
     u32 value;
     switch (in.op) {
     case OP_S_MOV_B32:
