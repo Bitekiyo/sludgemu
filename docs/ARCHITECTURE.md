@@ -62,7 +62,7 @@ scheduler places threads better on hybrid CPUs than a fixed mapping would.
 ## Memory
 
 "Physical" memory is split into 64 KiB page frames, backed by committed pagefile sections of
-256 MiB ("chunks") that are created as frames get allocated, so the commit charge follows what the
+256 MiB ("chunks") that are created as frames get used, so the commit charge follows what the
 title actually uses. Freed frames give their RAM back to the OS and are zeroed on reuse. Ranges
 reserved for physical mapping are Win32 placeholders, and frames are mapped into them with
 `MapViewOfFile3`, which gives real aliasing: the same frame at several addresses, as on console.
@@ -70,14 +70,33 @@ Mapping is 64 KiB granular (the console page size, which matches Windows' view g
 run of consecutive frames is mapped as one view. Each range keeps a list of regions that mirrors
 the address space exactly (one placeholder or one view per entry), and every change updates both
 together.
-Graphics allocations are placed inside the graphics address window reported by
-`D3D12ConfigureVirtualMemoryX` and recorded in a GPU range registry for the graphics layer.
 
-Unified memory without copies (in progress): committed sections can be opened as D3D12 heaps, so
-every console page can be made GPU-visible in place, which suits memory the CPU writes and the GPU
-reads. GPU-heavy resources (render targets, depth, UAVs, textures) go to VRAM instead, and data
-loaded into them is written there directly. The aim is that no title memory exists twice and
-nothing is copied every frame.
+The frame numbers a title gets are IDs, bound to real memory only when first mapped. Titles
+allocate frames in bulk and map slices of them wherever they need them, in no particular order;
+binding late lets each 256 MiB slice of a range claim a free chunk and lay its pages out in address
+order, so memory that is contiguous for the title is contiguous in RAM too. The graphics layer
+relies on that (see below). Allocating IDs reserves the budget, so binding never fails.
+
+Graphics allocations are placed inside the graphics address window reported by
+`D3D12ConfigureVirtualMemoryX`, and the console D3D12 runtime's own allocations (descriptor heaps,
+committed resources) go through `XMemAlloc` as on console, so the title's allocation hooks can
+hand out memory it set aside for them.
+
+## Graphics (`src/hle/d3d12`, `src/gpu`)
+
+Console D3D12 objects are plain structs with a function table (see `console_object.h`); every
+entry is ours and talks to a desktop D3D12 device from the Agility SDK.
+
+Unified memory without copies: the GPU reads and writes title memory in place, through "windows":
+desktop buffers placed on heaps opened over the host pages (`OpenExistingHeapFromAddress1`). A
+window covers one contiguous block of title memory and is opened when the GPU first needs it, only
+over the 64 MiB granules in use, since opening a heap pins its pages. Any title GPU address
+translates to a desktop one through the window holding it; windows close when the title remaps or
+frees the memory under them. Buffers are title memory seen through windows. Textures need desktop
+layouts, so they get desktop textures in video memory; their title pages are never pinned.
+
+Descriptor heaps live in title memory (handles are plain addresses there) and are mirrored by
+desktop heaps slot for slot; every descriptor write and copy updates both.
 
 ## File system
 

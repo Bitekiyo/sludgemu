@@ -247,6 +247,22 @@ static void WINAPI XMemFree(PVOID p, ULONGLONG attributes) {
     XMemFreeDefault(p, attributes);
 }
 
+void* xmem_alloc(usize size, u64 attributes) {
+    return XMemAlloc(size, attributes);
+}
+
+void xmem_free(void* p, u64 attributes) {
+    XMemFree(p, attributes);
+}
+
+u64 xmem_d3d_attributes(u32 object_type, u32 memory_type, u64 size, u64 alignment, bool gpu_32bit) {
+    u32 alignment_log2 = MEM_PAGE_SHIFT;
+    while ((1ull << alignment_log2) < alignment)
+        alignment_log2++;
+    u32 page_size = size >= MiB(2) ? XALLOC_PAGE_2M : XALLOC_PAGE_64K;
+    return xalloc_make(object_type, page_size, XALLOC_ALLOCATOR_D3D, alignment_log2, memory_type, gpu_32bit);
+}
+
 void xmem_init() {
     if (!mem_init(console_profile().physical_memory))
         FATAL("memory subsystem initialization failed");

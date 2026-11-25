@@ -51,6 +51,10 @@ add_executable(sludgemu WIN32
     hle/d3d12/d3d12_objects.h
     hle/d3d12/command_queue.cpp
     hle/d3d12/fence.cpp
+    hle/d3d12/resource.cpp
+    hle/d3d12/descriptor_heap.cpp
+    hle/d3d12/views.h
+    hle/d3d12/views.cpp
     hle/d3d12/command_allocator.cpp
     hle/d3d12/command_list.cpp
     hle/d3d12/frame_pacing.h
@@ -60,6 +64,8 @@ add_executable(sludgemu WIN32
     gpu/agility.cpp
     gpu/gpu.h
     gpu/gpu.cpp
+    gpu/gpu_window.h
+    gpu/gpu_window.cpp
     hle/xgameruntime/runtime_api.h
     hle/xgameruntime/xgameruntime.h
     hle/xgameruntime/xgameruntime.cpp

@@ -16,5 +16,8 @@ void gpu_set_options(const GpuOptions& options);
 
 // Creates the desktop device on first use. Returns nullptr (and logs why) if no suitable
 // adapter exists.
-ID3D12Device10* gpu_device();
+ID3D12Device13* gpu_device();
 IDXGIFactory6* gpu_factory();
+
+// Releases a desktop object once the GPU can no longer be using it.
+void gpu_retire(IUnknown* object);

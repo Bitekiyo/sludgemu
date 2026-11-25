@@ -11,6 +11,7 @@
 #include "hle/d3d12/d3d12_objects.h"
 #include "hle/d3d12/d3d12_tables.h"
 #include "hle/d3d12/frame_pacing.h"
+#include "hle/d3d12/views.h"
 
 static_assert(offsetof(ConsoleDevice, null_constant_buffer_address) == 0x10, "device layout");
 static_assert(offsetof(ConsoleDevice, out_of_line_flags) == 0x18, "device layout");
@@ -72,18 +73,13 @@ static HRESULT WINAPI device_create_fence(ConsoleDevice* self, UINT64 initial_va
 // plain pointers into heap memory that title code steps through with these strides.
 static UINT WINAPI device_get_descriptor_handle_increment_size(ConsoleDevice*,
                                                                D3D12_DESCRIPTOR_HEAP_TYPE type) {
-    switch (type) {
-    case D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV:
-        return CONSOLE_DESCRIPTOR_SIZE_RESOURCE;
-    case D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER:
-        return CONSOLE_DESCRIPTOR_SIZE_SAMPLER;
-    case D3D12_DESCRIPTOR_HEAP_TYPE_RTV:
-        return CONSOLE_DESCRIPTOR_SIZE_RTV;
-    case D3D12_DESCRIPTOR_HEAP_TYPE_DSV:
-        return CONSOLE_DESCRIPTOR_SIZE_DSV;
-    default:
-        return 0;
-    }
+    return console_descriptor_size(type);
+}
+
+static HRESULT WINAPI device_create_descriptor_heap(ConsoleDevice* self,
+                                                    const D3D12_DESCRIPTOR_HEAP_DESC* desc, REFIID iid,
+                                                    void** out) {
+    return console_create_descriptor_heap(self, desc, iid, out);
 }
 
 // --- frame pacing (see frame_pacing.h) --------------------------------------------------------------
@@ -119,19 +115,97 @@ static D3D12_HEAP_PROPERTIES* WINAPI device_get_custom_heap_properties(D3D12_HEA
     return ret;
 }
 
+static HRESULT WINAPI device_create_placed_resource_x(ConsoleDevice* self, D3D12_GPU_VIRTUAL_ADDRESS address,
+                                                      const D3D12_RESOURCE_DESC* desc,
+                                                      D3D12_RESOURCE_STATES state,
+                                                      const D3D12_CLEAR_VALUE* clear, REFIID iid,
+                                                      void** out) {
+    if (!desc)
+        return E_INVALIDARG;
+    // Resource states predate the barrier layouts the resource keeps; the first barrier sets one.
+    D3D12_RESOURCE_DESC1 d1 = console_desc1_from_desc(*desc);
+    return console_create_placed_resource(self, address, &d1, D3D12_BARRIER_LAYOUT_UNDEFINED, clear, iid,
+                                          out);
+}
+
+static HRESULT WINAPI device_create_placed_resource_x1(ConsoleDevice* self, D3D12_GPU_VIRTUAL_ADDRESS address,
+                                                       const D3D12_RESOURCE_DESC1* desc,
+                                                       D3D12_BARRIER_LAYOUT layout,
+                                                       const D3D12_CLEAR_VALUE* clear, REFIID iid,
+                                                       void** out) {
+    return console_create_placed_resource(self, address, desc, layout, clear, iid, out);
+}
+
+// Struct return through a hidden pointer. Several resources are laid out one after another, each
+// at its own alignment.
+static D3D12_RESOURCE_ALLOCATION_INFO* WINAPI device_get_resource_allocation_info(
+    D3D12_RESOURCE_ALLOCATION_INFO* ret, ConsoleDevice*, UINT, UINT count, const D3D12_RESOURCE_DESC* descs) {
+    u64 size = 0, alignment = 0;
+    for (UINT i = 0; i < count; i++) {
+        D3D12_RESOURCE_ALLOCATION_INFO info =
+            console_resource_allocation_info(console_desc1_from_desc(descs[i]));
+        if (info.SizeInBytes == UINT64_MAX) {
+            *ret = info;
+            return ret;
+        }
+        size = ALIGN_UP(size, info.Alignment) + info.SizeInBytes;
+        if (info.Alignment > alignment)
+            alignment = info.Alignment;
+    }
+    *ret = {size, alignment};
+    return ret;
+}
+
+static HRESULT WINAPI device_create_committed_resource(ConsoleDevice* self, const D3D12_HEAP_PROPERTIES* heap,
+                                                       D3D12_HEAP_FLAGS heap_flags,
+                                                       const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES,
+                                                       const D3D12_CLEAR_VALUE* clear, REFIID iid,
+                                                       void** out) {
+    if (!desc)
+        return E_INVALIDARG;
+    D3D12_RESOURCE_DESC1 d1 = console_desc1_from_desc(*desc);
+    return console_create_committed_resource(self, heap, heap_flags, &d1, D3D12_BARRIER_LAYOUT_UNDEFINED,
+                                             clear, iid, out);
+}
+
+// Console titles have no protected content, and desktop textures that need views in other formats
+// are created typeless, so the session and castable formats don't carry over.
+static HRESULT WINAPI device_create_committed_resource3(
+    ConsoleDevice* self, const D3D12_HEAP_PROPERTIES* heap, D3D12_HEAP_FLAGS heap_flags,
+    const D3D12_RESOURCE_DESC1* desc, D3D12_BARRIER_LAYOUT layout, const D3D12_CLEAR_VALUE* clear,
+    void* protected_session, UINT32 castable_count, DXGI_FORMAT* castable_formats, REFIID iid, void** out) {
+    return console_create_committed_resource(self, heap, heap_flags, desc, layout, clear, iid, out);
+}
+
 static const ConsoleEntry k_device_impl[] = {
     CONSOLE_ENTRY(7, device_get_node_count),
     CONSOLE_ENTRY(8, device_create_command_queue),
     CONSOLE_ENTRY(9, device_create_command_allocator),
+    CONSOLE_ENTRY(14, device_create_descriptor_heap),
     CONSOLE_ENTRY(15, device_get_descriptor_handle_increment_size),
+    CONSOLE_ENTRY(17, device_create_constant_buffer_view),
+    CONSOLE_ENTRY(18, device_create_shader_resource_view),
+    CONSOLE_ENTRY(19, device_create_unordered_access_view),
+    CONSOLE_ENTRY(20, device_create_render_target_view),
+    CONSOLE_ENTRY(21, device_create_depth_stencil_view),
+    CONSOLE_ENTRY(22, device_create_sampler),
+    CONSOLE_ENTRY(23, device_copy_descriptors),
+    CONSOLE_ENTRY(24, device_copy_descriptors_simple),
+    CONSOLE_ENTRY(25, device_get_resource_allocation_info),
     CONSOLE_ENTRY(26, device_get_custom_heap_properties),
+    CONSOLE_ENTRY(27, device_create_committed_resource),
     CONSOLE_ENTRY(36, device_create_fence),
+    CONSOLE_ENTRY(44, device_create_placed_resource_x),
     CONSOLE_ENTRY(48, device_create_command_queue_x),
+    CONSOLE_ENTRY(70, device_create_placed_raw_srv_x),
+    CONSOLE_ENTRY(71, device_create_placed_raw_uav_x),
     CONSOLE_ENTRY(73, device_create_command_list_x),
     CONSOLE_ENTRY(78, device_set_frame_interval_x),
     CONSOLE_ENTRY(79, device_schedule_frame_event_x),
     CONSOLE_ENTRY(80, device_wait_frame_event_x),
     CONSOLE_ENTRY(81, device_get_frame_statistics_x),
+    CONSOLE_ENTRY(127, device_create_committed_resource3),
+    CONSOLE_ENTRY(133, device_create_placed_resource_x1),
 };
 
 HRESULT console_create_device(void* adapter, const ConsoleDeviceParams* params, REFIID iid, void** out) {
@@ -142,7 +216,7 @@ HRESULT console_create_device(void* adapter, const ConsoleDeviceParams* params, 
           params->graphics_queue_ring_bytes);
 
     if (!g_device) {
-        ID3D12Device10* desktop = gpu_device();
+        ID3D12Device13* desktop = gpu_device();
         if (!desktop)
             return DXGI_ERROR_UNSUPPORTED;
         void* const* table =
@@ -157,6 +231,9 @@ HRESULT console_create_device(void* adapter, const ConsoleDeviceParams* params, 
         console_fence_init();
         console_command_allocator_init();
         console_command_list_init();
+        gpu_window_init();
+        console_resource_init();
+        console_descriptor_heap_init();
     }
     if (!out)
         return S_FALSE; // capability check only

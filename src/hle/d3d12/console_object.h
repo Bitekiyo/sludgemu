@@ -66,6 +66,11 @@ void* console_alloc(usize size, const ConsoleClass* klass, void* const* table, I
 // creation reference is dropped.
 HRESULT console_return(void* object, REFIID iid, void** out);
 
+// Takes a reference unless the object is already being destroyed (its count reached zero), for
+// lookups that can race with the title's last Release.
+bool console_try_add_ref(void* object);
+void console_release(void* object);
+
 // QueryInterface on an existing object.
 HRESULT console_query(void* object, REFIID iid, void** out);
 

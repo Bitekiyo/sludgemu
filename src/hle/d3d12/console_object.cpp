@@ -128,6 +128,22 @@ void* console_alloc(usize size, const ConsoleClass* klass, void* const* table, I
     return object;
 }
 
+bool console_try_add_ref(void* object) {
+    volatile long* refs = (volatile long*)&((ConsoleObjectHeader*)object)->ref_count;
+    long seen = *refs;
+    while (seen > 0) {
+        long previous = InterlockedCompareExchange(refs, seen + 1, seen);
+        if (previous == seen)
+            return true;
+        seen = previous;
+    }
+    return false;
+}
+
+void console_release(void* object) {
+    object_release(object);
+}
+
 HRESULT console_query(void* object, REFIID iid, void** out) {
     return object_query_interface(object, iid, out);
 }

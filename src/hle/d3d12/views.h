@@ -1,0 +1,36 @@
+#pragma once
+
+#include "hle/d3d12/d3d12_objects.h"
+
+// Device entries that write descriptors (views.cpp). Resources arrive as console objects.
+
+void WINAPI device_create_constant_buffer_view(ConsoleDevice* self,
+                                               const D3D12_CONSTANT_BUFFER_VIEW_DESC* desc,
+                                               D3D12_CPU_DESCRIPTOR_HANDLE dest);
+void WINAPI device_create_shader_resource_view(ConsoleDevice* self, void* resource,
+                                               const D3D12_SHADER_RESOURCE_VIEW_DESC* desc,
+                                               D3D12_CPU_DESCRIPTOR_HANDLE dest);
+// `desc` is a console UAV description, which is shorter than the desktop one.
+void WINAPI device_create_unordered_access_view(ConsoleDevice* self, void* resource, void* counter,
+                                                const void* desc, D3D12_CPU_DESCRIPTOR_HANDLE dest);
+void WINAPI device_create_render_target_view(ConsoleDevice* self, void* resource,
+                                             const D3D12_RENDER_TARGET_VIEW_DESC* desc,
+                                             D3D12_CPU_DESCRIPTOR_HANDLE dest);
+void WINAPI device_create_depth_stencil_view(ConsoleDevice* self, void* resource,
+                                             const D3D12_DEPTH_STENCIL_VIEW_DESC* desc,
+                                             D3D12_CPU_DESCRIPTOR_HANDLE dest);
+void WINAPI device_create_sampler(ConsoleDevice* self, const D3D12_SAMPLER_DESC* desc,
+                                  D3D12_CPU_DESCRIPTOR_HANDLE dest);
+void WINAPI device_copy_descriptors(ConsoleDevice* self, UINT dest_range_count,
+                                    const D3D12_CPU_DESCRIPTOR_HANDLE* dest_starts, const UINT* dest_sizes,
+                                    UINT src_range_count, const D3D12_CPU_DESCRIPTOR_HANDLE* src_starts,
+                                    const UINT* src_sizes, D3D12_DESCRIPTOR_HEAP_TYPE type);
+void WINAPI device_copy_descriptors_simple(ConsoleDevice* self, UINT count, D3D12_CPU_DESCRIPTOR_HANDLE dest,
+                                           D3D12_CPU_DESCRIPTOR_HANDLE src, D3D12_DESCRIPTOR_HEAP_TYPE type);
+
+struct ConsoleSrvDescX;
+struct ConsoleUavDescX;
+void WINAPI device_create_placed_raw_srv_x(ConsoleDevice* self, const D3D12_RESOURCE_DESC* resource_desc,
+                                           const ConsoleSrvDescX* desc, D3D12_CPU_DESCRIPTOR_HANDLE dest);
+void WINAPI device_create_placed_raw_uav_x(ConsoleDevice* self, const D3D12_RESOURCE_DESC* resource_desc,
+                                           const ConsoleUavDescX* desc, D3D12_CPU_DESCRIPTOR_HANDLE dest);
