@@ -63,6 +63,7 @@ static bool fill(const Window* w, u64 address, u64 size, GpuAddress* out) {
     out->buffer = w->buffer;
     out->offset = address - w->base;
     out->desktop_address = w->desktop_address + out->offset;
+    out->available = w->end - address;
     return true;
 }
 

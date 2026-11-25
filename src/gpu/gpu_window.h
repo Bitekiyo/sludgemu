@@ -14,6 +14,7 @@ struct GpuAddress {
     ID3D12Resource* buffer; // the window; valid until the GPU is done with work recorded now
     u64 offset;             // of the translated address within `buffer`
     u64 desktop_address;    // desktop GPU address of the same memory
+    u64 available;          // bytes from there to the end of the window
 };
 
 void gpu_window_init();

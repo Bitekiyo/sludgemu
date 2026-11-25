@@ -5,6 +5,7 @@
 #include "common/log.h"
 #include "core/memory.h"
 #include "hle/d3d12/device.h"
+#include "hle/d3d12/root_signature.h"
 #include "hle/hle.h"
 
 // Console graphics virtual-memory configuration (in/out). Layout matches the title's ABI.
@@ -41,6 +42,8 @@ static HRESULT WINAPI D3D12XboxCreateDevice(void* adapter, const ConsoleDevicePa
 static const HleExport k_exports[] = {
     HLE_EXPORT(D3D12ConfigureVirtualMemoryX),
     HLE_EXPORT(D3D12XboxCreateDevice),
+    HLE_EXPORT_AS(console_serialize_versioned_root_signature, "D3D12SerializeVersionedRootSignature"),
+    HLE_EXPORT_AS(console_serialize_root_signature, "D3D12SerializeRootSignature"),
 };
 
 extern const HleModule g_hle_module_d3d12_xs = {"d3d12_xs.dll", k_exports, ARRAY_COUNT(k_exports)};

@@ -53,6 +53,11 @@ add_executable(sludgemu WIN32
     hle/d3d12/fence.cpp
     hle/d3d12/resource.cpp
     hle/d3d12/descriptor_heap.cpp
+    hle/d3d12/query_heap.cpp
+    hle/d3d12/command_signature.cpp
+    hle/d3d12/root_signature.h
+    hle/d3d12/root_signature.cpp
+    hle/d3d12/page_pool.cpp
     hle/d3d12/views.h
     hle/d3d12/views.cpp
     hle/d3d12/command_allocator.cpp

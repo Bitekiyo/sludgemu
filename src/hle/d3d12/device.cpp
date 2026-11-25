@@ -177,12 +177,44 @@ static HRESULT WINAPI device_create_committed_resource3(
     return console_create_committed_resource(self, heap, heap_flags, desc, layout, clear, iid, out);
 }
 
+static HRESULT WINAPI device_create_query_heap(ConsoleDevice* self, const D3D12_QUERY_HEAP_DESC* desc,
+                                               REFIID iid, void** out) {
+    return console_create_query_heap(self, desc, iid, out);
+}
+
+static HRESULT WINAPI device_create_command_signature(ConsoleDevice* self,
+                                                      const D3D12_COMMAND_SIGNATURE_DESC* desc,
+                                                      void* root_signature, REFIID iid, void** out) {
+    return console_create_command_signature(self, desc, root_signature, iid, out);
+}
+
+// Root signatures are per device on desktop too; the node mask has no meaning with one GPU.
+static HRESULT WINAPI device_create_root_signature(ConsoleDevice* self, UINT, const void* blob, SIZE_T size,
+                                                   REFIID iid, void** out) {
+    return console_create_root_signature(self, blob, size, iid, out);
+}
+
+static HRESULT WINAPI device_register_page_pool_x(ConsoleDevice*, D3D12_GPU_VIRTUAL_ADDRESS address,
+                                                  UINT page_count, HANDLE* handle) {
+    return console_register_page_pool(address, page_count, 0, handle);
+}
+
+static HRESULT WINAPI device_register_page_pool2_x(ConsoleDevice*, D3D12_GPU_VIRTUAL_ADDRESS address,
+                                                   UINT page_count, UINT flags, HANDLE* handle) {
+    return console_register_page_pool(address, page_count, flags, handle);
+}
+
+static HRESULT WINAPI device_unregister_page_pool_x(ConsoleDevice*, HANDLE handle) {
+    return console_unregister_page_pool(handle);
+}
+
 static const ConsoleEntry k_device_impl[] = {
     CONSOLE_ENTRY(7, device_get_node_count),
     CONSOLE_ENTRY(8, device_create_command_queue),
     CONSOLE_ENTRY(9, device_create_command_allocator),
     CONSOLE_ENTRY(14, device_create_descriptor_heap),
     CONSOLE_ENTRY(15, device_get_descriptor_handle_increment_size),
+    CONSOLE_ENTRY(16, device_create_root_signature),
     CONSOLE_ENTRY(17, device_create_constant_buffer_view),
     CONSOLE_ENTRY(18, device_create_shader_resource_view),
     CONSOLE_ENTRY(19, device_create_unordered_access_view),
@@ -195,15 +227,21 @@ static const ConsoleEntry k_device_impl[] = {
     CONSOLE_ENTRY(26, device_get_custom_heap_properties),
     CONSOLE_ENTRY(27, device_create_committed_resource),
     CONSOLE_ENTRY(36, device_create_fence),
+    CONSOLE_ENTRY(39, device_create_query_heap),
+    CONSOLE_ENTRY(41, device_create_command_signature),
     CONSOLE_ENTRY(44, device_create_placed_resource_x),
     CONSOLE_ENTRY(48, device_create_command_queue_x),
     CONSOLE_ENTRY(70, device_create_placed_raw_srv_x),
     CONSOLE_ENTRY(71, device_create_placed_raw_uav_x),
+    CONSOLE_ENTRY(61, device_create_sampler_x),
     CONSOLE_ENTRY(73, device_create_command_list_x),
+    CONSOLE_ENTRY(74, device_register_page_pool_x),
+    CONSOLE_ENTRY(75, device_unregister_page_pool_x),
     CONSOLE_ENTRY(78, device_set_frame_interval_x),
     CONSOLE_ENTRY(79, device_schedule_frame_event_x),
     CONSOLE_ENTRY(80, device_wait_frame_event_x),
     CONSOLE_ENTRY(81, device_get_frame_statistics_x),
+    CONSOLE_ENTRY(120, device_register_page_pool2_x),
     CONSOLE_ENTRY(127, device_create_committed_resource3),
     CONSOLE_ENTRY(133, device_create_placed_resource_x1),
 };
@@ -234,6 +272,9 @@ HRESULT console_create_device(void* adapter, const ConsoleDeviceParams* params, 
         gpu_window_init();
         console_resource_init();
         console_descriptor_heap_init();
+        console_query_heap_init();
+        console_command_signature_init();
+        console_root_signature_init();
     }
     if (!out)
         return S_FALSE; // capability check only

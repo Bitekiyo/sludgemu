@@ -34,3 +34,7 @@ void WINAPI device_create_placed_raw_srv_x(ConsoleDevice* self, const D3D12_RESO
                                            const ConsoleSrvDescX* desc, D3D12_CPU_DESCRIPTOR_HANDLE dest);
 void WINAPI device_create_placed_raw_uav_x(ConsoleDevice* self, const D3D12_RESOURCE_DESC* resource_desc,
                                            const ConsoleUavDescX* desc, D3D12_CPU_DESCRIPTOR_HANDLE dest);
+
+struct ConsoleSamplerDescX;
+void WINAPI device_create_sampler_x(ConsoleDevice* self, const ConsoleSamplerDescX* desc,
+                                    D3D12_CPU_DESCRIPTOR_HANDLE dest);

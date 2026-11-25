@@ -197,3 +197,48 @@ bool console_descriptor_slots(u64 handle, u32 count, DescriptorSlot* out);
 
 // After writing `count` descriptors at slot.cpu, updates the shader-visible copy.
 void console_descriptor_publish(const DescriptorSlot& slot, u32 count);
+
+struct ConsoleQueryHeap {
+    ConsoleObjectHeader header;
+
+    D3D12_QUERY_HEAP_DESC desc; // as the title asked for it
+    ID3D12QueryHeap* desktop;
+};
+
+// A command signature: the layout of indirect arguments. Console layouts can include arguments
+// desktop D3D12 has no equivalent for (descriptor tables, pipeline states, padding), so the
+// description is kept and turned into desktop commands when indirect work is translated.
+struct ConsoleCommandSignature {
+    ConsoleObjectHeader header;
+
+    u32 byte_stride;
+    u32 argument_count;
+    D3D12_INDIRECT_ARGUMENT_DESC* arguments;
+    void* root_signature; // console root signature (referenced), or nullptr
+};
+
+void console_query_heap_init();
+void console_command_signature_init();
+
+HRESULT console_create_query_heap(ConsoleDevice* device, const D3D12_QUERY_HEAP_DESC* desc, REFIID iid,
+                                  void** out);
+HRESULT console_create_command_signature(ConsoleDevice* device, const D3D12_COMMAND_SIGNATURE_DESC* desc,
+                                         void* root_signature, REFIID iid, void** out);
+
+// A root signature, kept in its desktop form plus the description for translating root arguments.
+struct ConsoleRootSignature {
+    ConsoleObjectHeader header;
+
+    const D3D12_ROOT_SIGNATURE_DESC1* desc; // owned by `deserializer`
+    ID3D12VersionedRootSignatureDeserializer* deserializer;
+    ID3D12RootSignature* desktop;
+};
+
+void console_root_signature_init();
+
+HRESULT console_create_root_signature(ConsoleDevice* device, const void* blob, usize size, REFIID iid,
+                                      void** out);
+
+// Page pools (page_pool.cpp): title memory registered as a source of GPU page mapping copies.
+HRESULT console_register_page_pool(u64 address, u32 page_count, u32 flags, HANDLE* handle);
+HRESULT console_unregister_page_pool(HANDLE handle);

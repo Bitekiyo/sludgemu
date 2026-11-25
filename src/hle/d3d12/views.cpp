@@ -144,10 +144,22 @@ void WINAPI device_create_constant_buffer_view(ConsoleDevice* self,
     if (!console_descriptor_slots(dest.ptr, 1, &slot))
         return;
     D3D12_CONSTANT_BUFFER_VIEW_DESC d = {};
-    bool valid = desc && desc->BufferLocation &&
-                 console_translate_gpu_address(desc->BufferLocation, desc->SizeInBytes, &d.BufferLocation);
-    if (valid)
-        d.SizeInBytes = desc->SizeInBytes;
+    GpuAddress a = {};
+    bool valid = desc && desc->BufferLocation && gpu_translate(desc->BufferLocation, desc->SizeInBytes, &a);
+    if (valid && (a.desktop_address & (D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT - 1))) {
+        LOG_E("d3d12", "constant buffer view at 0x%llx is not 256-byte aligned", desc->BufferLocation);
+        valid = false;
+    }
+    if (valid) {
+        // Console views can end anywhere; desktop sizes are whole 256-byte units. Round up, but
+        // never past the window, where the GPU would read unmapped memory.
+        u64 size = ALIGN_UP((u64)desc->SizeInBytes, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+        if (size > a.available)
+            size = ALIGN_DOWN(a.available, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+        d.BufferLocation = a.desktop_address;
+        d.SizeInBytes = (u32)size;
+        valid = size != 0;
+    }
     self->desktop->CreateConstantBufferView(valid ? &d : nullptr, slot.cpu);
     finish_write(slot);
 }
@@ -413,5 +425,95 @@ void WINAPI device_create_placed_raw_uav_x(ConsoleDevice* self, const D3D12_RESO
     if (!desktop_counter)
         d.Buffer.CounterOffsetInBytes = 0;
     self->desktop->CreateUnorderedAccessView(desktop, desktop_counter, &d, slot.cpu);
+    finish_write(slot);
+}
+
+// --- console sampler descriptions --------------------------------------------------------------------
+
+// The console sampler description sets each filter stage separately, as the hardware does.
+struct ConsoleSamplerDescX {
+    u32 flags;
+    u32 filter_mag; // CONSOLE_XY_FILTER_*
+    u32 filter_min;
+    u32 filter_mip; // CONSOLE_MIP_FILTER_*
+    u32 filter_z;
+    u32 filter_mode; // CONSOLE_FILTER_MODE_*
+    D3D12_TEXTURE_ADDRESS_MODE address_u;
+    D3D12_TEXTURE_ADDRESS_MODE address_v;
+    D3D12_TEXTURE_ADDRESS_MODE address_w;
+    f32 min_lod;
+    f32 max_lod;
+    f32 mip_lod_bias;
+    f32 mip_lod_bias_secondary;
+    u32 max_anisotropy;
+    f32 anisotropy_bias;
+    u32 anisotropy_threshold;
+    D3D12_COMPARISON_FUNC comparison_func;
+    f32 border_color[4];
+    u32 performance_mip;
+    u32 performance_z;
+    u32 min_mip_slope_u;
+    u32 min_mip_offset_u;
+    u32 min_mip_slope_v_or_w;
+    u32 min_mip_offset_v_or_w;
+};
+static_assert(sizeof(ConsoleSamplerDescX) == 108, "console sampler description layout");
+
+#define CONSOLE_SAMPLER_FLAG_UNNORMALIZED_COORDINATES 0x1
+#define CONSOLE_XY_FILTER_BILINEAR                    1
+#define CONSOLE_XY_FILTER_ANISO_POINT                 2
+#define CONSOLE_XY_FILTER_ANISO_BILINEAR              3
+#define CONSOLE_MIP_FILTER_NONE                       0
+#define CONSOLE_MIP_FILTER_LINEAR                     2
+#define CONSOLE_FILTER_MODE_MIN                       1
+#define CONSOLE_FILTER_MODE_MAX                       2
+
+static D3D12_SAMPLER_DESC2 desktop_sampler_desc(const ConsoleSamplerDescX& c) {
+    D3D12_SAMPLER_DESC2 d = {};
+    bool aniso =
+        c.filter_min >= CONSOLE_XY_FILTER_ANISO_POINT || c.filter_mag >= CONSOLE_XY_FILTER_ANISO_POINT;
+    bool min_linear =
+        c.filter_min == CONSOLE_XY_FILTER_BILINEAR || c.filter_min == CONSOLE_XY_FILTER_ANISO_BILINEAR;
+    bool mag_linear =
+        c.filter_mag == CONSOLE_XY_FILTER_BILINEAR || c.filter_mag == CONSOLE_XY_FILTER_ANISO_BILINEAR;
+    bool mip_linear = c.filter_mip == CONSOLE_MIP_FILTER_LINEAR;
+    D3D12_FILTER_REDUCTION_TYPE reduction = D3D12_FILTER_REDUCTION_TYPE_STANDARD;
+    if (c.filter_mode == CONSOLE_FILTER_MODE_MIN)
+        reduction = D3D12_FILTER_REDUCTION_TYPE_MINIMUM;
+    else if (c.filter_mode == CONSOLE_FILTER_MODE_MAX)
+        reduction = D3D12_FILTER_REDUCTION_TYPE_MAXIMUM;
+    else if (c.comparison_func > D3D12_COMPARISON_FUNC_NEVER)
+        reduction = D3D12_FILTER_REDUCTION_TYPE_COMPARISON;
+    if (aniso)
+        d.Filter = mip_linear ? D3D12_ENCODE_ANISOTROPIC_FILTER(reduction)
+                              : D3D12_ENCODE_MIN_MAG_ANISOTROPIC_MIP_POINT_FILTER(reduction);
+    else
+        d.Filter = D3D12_ENCODE_BASIC_FILTER(min_linear ? D3D12_FILTER_TYPE_LINEAR : D3D12_FILTER_TYPE_POINT,
+                                             mag_linear ? D3D12_FILTER_TYPE_LINEAR : D3D12_FILTER_TYPE_POINT,
+                                             mip_linear ? D3D12_FILTER_TYPE_LINEAR : D3D12_FILTER_TYPE_POINT,
+                                             reduction);
+    d.AddressU = c.address_u;
+    d.AddressV = c.address_v;
+    d.AddressW = c.address_w;
+    d.MipLODBias = c.mip_lod_bias;
+    d.MaxAnisotropy = c.max_anisotropy ? (c.max_anisotropy > 16 ? 16 : c.max_anisotropy) : 1;
+    d.ComparisonFunc = c.comparison_func ? c.comparison_func : D3D12_COMPARISON_FUNC_NEVER;
+    for (u32 i = 0; i < 4; i++)
+        d.FloatBorderColor[i] = c.border_color[i];
+    d.MinLOD = c.min_lod;
+    d.MaxLOD =
+        c.filter_mip == CONSOLE_MIP_FILTER_NONE ? c.min_lod : c.max_lod; // no mipmapping: stay at MinLOD
+    if (c.flags & CONSOLE_SAMPLER_FLAG_UNNORMALIZED_COORDINATES)
+        d.Flags = D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES;
+    return d;
+}
+
+void WINAPI device_create_sampler_x(ConsoleDevice* self, const ConsoleSamplerDescX* desc,
+                                    D3D12_CPU_DESCRIPTOR_HANDLE dest) {
+    DescriptorSlot slot;
+    if (!desc || !console_descriptor_slots(dest.ptr, 1, &slot))
+        return;
+    D3D12_SAMPLER_DESC2 d = desktop_sampler_desc(*desc);
+    self->desktop->CreateSampler2(&d, slot.cpu);
     finish_write(slot);
 }
