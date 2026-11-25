@@ -11,6 +11,10 @@
 // The texture layout equivalent to a console resource state.
 D3D12_BARRIER_LAYOUT console_layout_from_state(u32 state);
 
+// The desktop value of a console texture layout. The console enumeration has a present layout of its
+// own before the last one; desktop's present layout is its common layout.
+D3D12_BARRIER_LAYOUT console_desktop_layout(u32 layout);
+
 // ResourceBarrier: legacy transition, aliasing and UAV barriers.
 void console_record_resource_barriers(ID3D12GraphicsCommandList7* list, u32 count,
                                       const D3D12_RESOURCE_BARRIER* barriers);

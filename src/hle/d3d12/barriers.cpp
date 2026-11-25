@@ -34,6 +34,17 @@ static u32 desktop_state(u32 state) {
     return state;
 }
 
+#define CONSOLE_LAYOUT_PRESENT                                            31
+#define CONSOLE_LAYOUT_DIRECT_QUEUE_GENERIC_READ_COMPUTE_QUEUE_ACCESSIBLE 32
+
+D3D12_BARRIER_LAYOUT console_desktop_layout(u32 layout) {
+    if (layout == CONSOLE_LAYOUT_PRESENT)
+        return D3D12_BARRIER_LAYOUT_PRESENT;
+    if (layout == CONSOLE_LAYOUT_DIRECT_QUEUE_GENERIC_READ_COMPUTE_QUEUE_ACCESSIBLE)
+        return D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_GENERIC_READ_COMPUTE_QUEUE_ACCESSIBLE;
+    return (D3D12_BARRIER_LAYOUT)layout;
+}
+
 D3D12_BARRIER_LAYOUT console_layout_from_state(u32 state) {
     const u32 shader_read =
         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
@@ -248,6 +259,8 @@ static void record_texture_group(ID3D12GraphicsCommandList7* list, const D3D12_B
             LOG_W_ONCE("d3d12", "Barrier: texture without desktop backing skipped");
             continue;
         }
+        b.LayoutBefore = console_desktop_layout(b.LayoutBefore);
+        b.LayoutAfter = console_desktop_layout(b.LayoutAfter);
         out[n++] = b;
         if (n == BARRIER_BATCH) {
             D3D12_BARRIER_GROUP group = {D3D12_BARRIER_TYPE_TEXTURE, n};

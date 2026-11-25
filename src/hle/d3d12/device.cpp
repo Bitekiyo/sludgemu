@@ -133,7 +133,8 @@ static HRESULT WINAPI device_create_placed_resource_x1(ConsoleDevice* self, D3D1
                                                        D3D12_BARRIER_LAYOUT layout,
                                                        const D3D12_CLEAR_VALUE* clear, REFIID iid,
                                                        void** out) {
-    return console_create_placed_resource(self, address, desc, layout, clear, iid, out);
+    return console_create_placed_resource(self, address, desc, console_desktop_layout(layout), clear, iid,
+                                          out);
 }
 
 // Struct returns through a hidden pointer. Several resources are laid out one after another, each
@@ -196,7 +197,8 @@ static HRESULT WINAPI device_create_committed_resource3(
     ConsoleDevice* self, const D3D12_HEAP_PROPERTIES* heap, D3D12_HEAP_FLAGS heap_flags,
     const D3D12_RESOURCE_DESC1* desc, D3D12_BARRIER_LAYOUT layout, const D3D12_CLEAR_VALUE* clear,
     void* protected_session, UINT32 castable_count, DXGI_FORMAT* castable_formats, REFIID iid, void** out) {
-    return console_create_committed_resource(self, heap, heap_flags, desc, layout, clear, iid, out);
+    return console_create_committed_resource(self, heap, heap_flags, desc, console_desktop_layout(layout),
+                                             clear, iid, out);
 }
 
 // --- pipeline states ---------------------------------------------------------------------------------
