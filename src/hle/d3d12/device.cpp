@@ -136,23 +136,44 @@ static HRESULT WINAPI device_create_placed_resource_x1(ConsoleDevice* self, D3D1
     return console_create_placed_resource(self, address, desc, layout, clear, iid, out);
 }
 
-// Struct return through a hidden pointer. Several resources are laid out one after another, each
-// at its own alignment.
-static D3D12_RESOURCE_ALLOCATION_INFO* WINAPI device_get_resource_allocation_info(
-    D3D12_RESOURCE_ALLOCATION_INFO* ret, ConsoleDevice*, UINT, UINT count, const D3D12_RESOURCE_DESC* descs) {
+// Struct returns through a hidden pointer. Several resources are laid out one after another, each
+// at its own alignment; the 1/2 versions also report where each one goes.
+static D3D12_RESOURCE_ALLOCATION_INFO layout_resources(UINT count, const D3D12_RESOURCE_DESC1* descs1,
+                                                      const D3D12_RESOURCE_DESC* descs,
+                                                      D3D12_RESOURCE_ALLOCATION_INFO1* each) {
     u64 size = 0, alignment = 0;
     for (UINT i = 0; i < count; i++) {
-        D3D12_RESOURCE_ALLOCATION_INFO info =
-            console_resource_allocation_info(console_desc1_from_desc(descs[i]));
-        if (info.SizeInBytes == UINT64_MAX) {
-            *ret = info;
-            return ret;
-        }
-        size = ALIGN_UP(size, info.Alignment) + info.SizeInBytes;
+        D3D12_RESOURCE_DESC1 d = descs1 ? descs1[i] : console_desc1_from_desc(descs[i]);
+        D3D12_RESOURCE_ALLOCATION_INFO info = console_resource_allocation_info(d);
+        if (info.SizeInBytes == UINT64_MAX)
+            return info;
+        size = ALIGN_UP(size, info.Alignment);
+        if (each)
+            each[i] = {size, info.Alignment, info.SizeInBytes};
+        size += info.SizeInBytes;
         if (info.Alignment > alignment)
             alignment = info.Alignment;
     }
-    *ret = {size, alignment};
+    return {size, alignment};
+}
+
+static D3D12_RESOURCE_ALLOCATION_INFO* WINAPI device_get_resource_allocation_info(
+    D3D12_RESOURCE_ALLOCATION_INFO* ret, ConsoleDevice*, UINT, UINT count, const D3D12_RESOURCE_DESC* descs) {
+    *ret = layout_resources(count, nullptr, descs, nullptr);
+    return ret;
+}
+
+static D3D12_RESOURCE_ALLOCATION_INFO* WINAPI device_get_resource_allocation_info1(
+    D3D12_RESOURCE_ALLOCATION_INFO* ret, ConsoleDevice*, UINT, UINT count, const D3D12_RESOURCE_DESC* descs,
+    D3D12_RESOURCE_ALLOCATION_INFO1* each) {
+    *ret = layout_resources(count, nullptr, descs, each);
+    return ret;
+}
+
+static D3D12_RESOURCE_ALLOCATION_INFO* WINAPI device_get_resource_allocation_info2(
+    D3D12_RESOURCE_ALLOCATION_INFO* ret, ConsoleDevice*, UINT, UINT count, const D3D12_RESOURCE_DESC1* descs,
+    D3D12_RESOURCE_ALLOCATION_INFO1* each) {
+    *ret = layout_resources(count, descs, nullptr, each);
     return ret;
 }
 
@@ -241,6 +262,8 @@ static const ConsoleEntry k_device_impl[] = {
     CONSOLE_ENTRY(79, device_schedule_frame_event_x),
     CONSOLE_ENTRY(80, device_wait_frame_event_x),
     CONSOLE_ENTRY(81, device_get_frame_statistics_x),
+    CONSOLE_ENTRY(95, device_get_resource_allocation_info1),
+    CONSOLE_ENTRY(108, device_get_resource_allocation_info2),
     CONSOLE_ENTRY(120, device_register_page_pool2_x),
     CONSOLE_ENTRY(127, device_create_committed_resource3),
     CONSOLE_ENTRY(133, device_create_placed_resource_x1),
