@@ -84,6 +84,18 @@ set(SLUDGE_AGILITY_DLLS
     ${agility_pkg_SOURCE_DIR}/build/native/bin/x64/D3D12Core.dll
     ${agility_pkg_SOURCE_DIR}/build/native/bin/x64/d3d12SDKLayers.dll)
 
+# DirectX Shader Compiler: compiles our own shaders at build time (dxc.exe) and translated title
+# shaders at run time (dxcompiler.dll, with dxil.dll for validation and signing, copied next to
+# sludgemu.exe).
+sludge_fetch_nuget(dxc_pkg Microsoft.Direct3D.DXC 1.9.2609.5
+    73cfa082245918c2cc1ec6740250eb7377e83a757b3b3a3e16e0d71535bfbfc3)
+set(SLUDGE_DXC_EXE ${dxc_pkg_SOURCE_DIR}/build/native/bin/x64/dxc.exe)
+add_library(dxc INTERFACE)
+target_include_directories(dxc INTERFACE ${dxc_pkg_SOURCE_DIR}/build/native/include)
+set(SLUDGE_DXC_DLLS
+    ${dxc_pkg_SOURCE_DIR}/build/native/bin/x64/dxcompiler.dll
+    ${dxc_pkg_SOURCE_DIR}/build/native/bin/x64/dxil.dll)
+
 add_subdirectory(src)
 
 enable_testing()

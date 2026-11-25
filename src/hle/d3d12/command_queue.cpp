@@ -4,6 +4,8 @@
 
 #include "common/log.h"
 #include "gpu/gpu.h"
+#include "gpu/presenter.h"
+#include "hle/d3d12/frame_pacing.h"
 #include "hle/d3d12/d3d12_objects.h"
 #include "hle/d3d12/d3d12_tables.h"
 
@@ -146,6 +148,51 @@ static void WINAPI queue_end_event(ConsoleCommandQueue* self) {
     self->desktop->EndEvent();
 }
 
+// --- presentation ------------------------------------------------------------------------------------
+
+// One plane of a console present: the views' resources (one per view; stereo has two), the part of
+// each to show and where it goes on the display (normalized).
+struct ConsolePresentPlane {
+    FrameToken token;
+    u32 resource_count;
+    ConsoleResource** resources;
+    const D3D12_RECT* source_rects; // optional
+    const f32 (*dest_rects)[4];     // optional: left, top, right, bottom
+    DXGI_COLOR_SPACE_TYPE color_space;
+    u32 scale_filter;
+    u32 extended_count;
+    const void* extended;
+    u32 flags;
+};
+static_assert(sizeof(ConsolePresentPlane) == 72, "console present plane layout");
+
+static HRESULT WINAPI queue_present_x(ConsoleCommandQueue* self, UINT plane_count,
+                                      const ConsolePresentPlane* planes, const void* parameters) {
+    (void)parameters; // immediate flips, tearing and VRR preferences
+    if (plane_count > PRESENT_MAX_PLANES || (plane_count && !planes))
+        return E_INVALIDARG;
+    PresentPlane out[PRESENT_MAX_PLANES] = {};
+    for (UINT i = 0; i < plane_count; i++) {
+        const ConsolePresentPlane& in = planes[i];
+        if (!in.resource_count || !in.resources || !in.resources[0])
+            continue;
+        if (in.color_space != DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709)
+            LOG_W_ONCE("present", "plane color space %d is shown as SDR", in.color_space);
+        u64 offset;
+        out[i].texture = console_resource_desktop(in.resources[0], &offset);
+        if (in.source_rects)
+            out[i].source = in.source_rects[0];
+        static const f32 k_full[4] = {0.0f, 0.0f, 1.0f, 1.0f};
+        const f32* dest = in.dest_rects ? in.dest_rects[0] : k_full;
+        for (u32 c = 0; c < 4; c++)
+            out[i].dest[c] = dest[c];
+    }
+    presenter_present(self->desktop, out, plane_count);
+    if (plane_count)
+        frame_on_flip(planes[0].token);
+    return S_OK;
+}
+
 // Work is submitted as it arrives, so there is nothing to kick off.
 static void WINAPI queue_kickoff_x(ConsoleCommandQueue*) {}
 
@@ -173,6 +220,7 @@ static const ConsoleEntry k_queue_impl[] = {
     CONSOLE_ENTRY(18, queue_get_timestamp_frequency),
     CONSOLE_ENTRY(19, queue_get_clock_calibration),
     CONSOLE_ENTRY(28, queue_get_desc),
+    CONSOLE_ENTRY(32, queue_present_x),
     CONSOLE_ENTRY(35, queue_execute_command_lists_2x),
 };
 

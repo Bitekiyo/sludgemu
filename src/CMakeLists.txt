@@ -74,6 +74,8 @@ add_executable(sludgemu WIN32
     hle/dstorage/dstorage.cpp
 
     gpu/agility.cpp
+    gpu/presenter.h
+    gpu/presenter.cpp
     gpu/gpu.h
     gpu/gpu.cpp
     gpu/gpu_window.h
@@ -101,13 +103,28 @@ add_executable(sludgemu WIN32
     platform/window.cpp
 )
 target_include_directories(sludgemu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
+# Our own shaders, compiled at build time into headers holding the bytecode as `k_<name>`.
+function(sludge_shader target hlsl entry profile name)
+    set(out ${CMAKE_CURRENT_BINARY_DIR}/shaders/${name}.h)
+    add_custom_command(OUTPUT ${out}
+        COMMAND ${SLUDGE_DXC_EXE} -nologo -O3 -T ${profile} -E ${entry} -Vn k_${name} -Fh ${out}
+            ${CMAKE_CURRENT_SOURCE_DIR}/${hlsl}
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${hlsl}
+        COMMENT "Compiling ${hlsl} (${entry})")
+    target_sources(${target} PRIVATE ${out})
+endfunction()
+sludge_shader(sludgemu gpu/shaders/present.hlsl vs_main vs_6_0 present_vs)
+sludge_shader(sludgemu gpu/shaders/present.hlsl ps_main ps_6_0 present_ps)
+target_include_directories(sludgemu PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 target_link_libraries(sludgemu PRIVATE agility sludge_options shell32 user32 synchronization delayimp
-    dstorage libdeflate::libdeflate_static addrlib d3d12 dxgi)
+    dstorage libdeflate::libdeflate_static addrlib d3d12 dxgi dxc)
 
 # Loaded only when a title uses DirectStorage.
 target_link_options(sludgemu PRIVATE /DELAYLOAD:dstorage.dll)
 add_custom_command(TARGET sludgemu POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different ${SLUDGE_DSTORAGE_DLLS} $<TARGET_FILE_DIR:sludgemu>
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${SLUDGE_DXC_DLLS} $<TARGET_FILE_DIR:sludgemu>
     COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:sludgemu>/D3D12
     COMMAND ${CMAKE_COMMAND} -E copy_if_different ${SLUDGE_AGILITY_DLLS} $<TARGET_FILE_DIR:sludgemu>/D3D12)
 

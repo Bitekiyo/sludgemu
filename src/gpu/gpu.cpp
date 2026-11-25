@@ -55,6 +55,13 @@ static void route_debug_messages(ID3D12Device* device) {
         LOG_W("gpu", "debug layer messages unavailable (no ID3D12InfoQueue1)");
         return;
     }
+    // A deprecation advisory the runtime raises from inside its own calls (DXGI checks features on
+    // every present), which would bury everything else.
+    D3D12_MESSAGE_ID deny[] = {D3D12_MESSAGE_ID_DEPRECATED_API};
+    D3D12_INFO_QUEUE_FILTER filter = {};
+    filter.DenyList.NumIDs = ARRAY_COUNT(deny);
+    filter.DenyList.pIDList = deny;
+    queue->PushStorageFilter(&filter);
     DWORD cookie = 0;
     if (FAILED(queue->RegisterMessageCallback(on_debug_message, D3D12_MESSAGE_CALLBACK_FLAG_NONE, nullptr,
                                               &cookie)))
