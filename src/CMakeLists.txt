@@ -36,6 +36,7 @@ add_executable(sludgemu WIN32
     core/title.cpp
     core/memory.h
     core/memory.cpp
+    core/memory_tracking.cpp
     core/vfs.h
     core/vfs.cpp
     core/console_profile.h

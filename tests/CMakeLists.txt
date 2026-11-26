@@ -7,6 +7,7 @@ add_executable(sludgemu_tests
     xma_test.cpp
     ${PROJECT_SOURCE_DIR}/src/common/log.cpp
     ${PROJECT_SOURCE_DIR}/src/core/memory.cpp
+    ${PROJECT_SOURCE_DIR}/src/core/memory_tracking.cpp
     ${PROJECT_SOURCE_DIR}/src/hle/audio/xapu.cpp
     ${PROJECT_SOURCE_DIR}/src/hle/audio/xdsp.cpp
     ${PROJECT_SOURCE_DIR}/src/hle/audio/xma.cpp

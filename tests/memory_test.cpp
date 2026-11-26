@@ -4,6 +4,7 @@
 #include <windows.h>
 #include <intrin.h>
 #include <stdio.h>
+#include <string.h>
 
 #include "common/log.h"
 #include "core/memory.h"
@@ -377,8 +378,9 @@ static bool page_writable(const void* p) {
 }
 
 // Write watches: reads pass and the first write reports the watched range, also through another
-// address showing the same frames; watches survive views being remapped and pages being backed or
-// committed, and end when other frames are mapped there.
+// address showing the same frames, and releases the pages at every address; watches survive views
+// being remapped and pages being backed or committed, and end unreported when other frames are mapped
+// at their range.
 static void test_write_watches() {
     mem_set_write_listener(on_write);
     MemAddressLimits limits = {};
@@ -408,9 +410,9 @@ static void test_write_watches() {
     CHECK(!page_writable(b + PAGE));
     pb[2 * PAGE + 9] = 2; // frame 1 through b
     CHECK(g_write_reports == 2 && g_write_base == (u64)a && g_write_size == 2 * PAGE);
-    CHECK(pa[PAGE + 9] == 2);
-    mem_end_write_watches(a, 2 * PAGE); // the watch through a itself is still there
-    CHECK(g_write_reports == 3 && page_writable(a));
+    CHECK(pa[PAGE + 9] == 2 && page_writable(a + PAGE) && page_writable(b + 2 * PAGE));
+    mem_end_write_watches(a, 2 * PAGE); // nothing left to end
+    CHECK(g_write_reports == 2);
 
     // A view remapped over the same frames keeps the watch; other frames end it.
     g_write_reports = 0;
@@ -419,7 +421,7 @@ static void test_write_watches() {
     CHECK(g_write_reports == 0);
     CHECK(!page_writable(a));
     CHECK(mem_map_physical(a, 1, &frames[2]));
-    CHECK(g_write_reports == 1 && g_write_base == (u64)a);
+    CHECK(g_write_reports == 0 && page_writable(b + PAGE)); // ended unreported; frame 0 released at b
     CHECK(mem_release(a));
     CHECK(mem_release(b));
     mem_physical_free(3, frames);
@@ -466,6 +468,54 @@ static void test_write_watches() {
         gpu[MiB(5) + 0xB00] = 4;
         CHECK(g_write_reports == 2 && g_write_base == (u64)gpu + MiB(5) && g_write_size == 0x400);
         CHECK(mem_release(gpu));
+    }
+    mem_set_write_listener(nullptr);
+}
+
+// Protection is counted per page: watches sharing pages end only when their own pages are written,
+// a page stays protected while any watch needs it, unwatching releases only what nobody else needs,
+// and GPU-only memory isn't protected.
+static void test_watch_counts() {
+    mem_set_write_listener(on_write);
+    g_write_reports = 0;
+    MemAddressLimits limits = {};
+    u8* gpu = (u8*)mem_alloc_virtual(nullptr, MiB(16), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE, limits,
+                                     MEM_RANGE_GPU, 0);
+    CHECK(gpu != nullptr);
+    if (!gpu)
+        return;
+    memset(gpu, 0, 5 * 4096);
+    mem_watch_writes(gpu, 3 * 4096);        // watch A: pages 0-2
+    mem_watch_writes(gpu + 2 * 4096, 8192); // watch B: pages 2-3 (shares page 2)
+    mem_watch_writes(gpu, 3 * 4096);        // armed already: nothing changes
+    CHECK(!page_writable(gpu) && !page_writable(gpu + 3 * 4096));
+    gpu[3 * 4096] = 1; // B's own page: B ends, A's pages stay protected
+    CHECK(g_write_reports == 1 && g_write_base == (u64)gpu + 2 * 4096);
+    CHECK(!page_writable(gpu + 2 * 4096) && page_writable(gpu + 3 * 4096));
+    gpu[2 * 4096] = 1; // now only A covers page 2
+    CHECK(g_write_reports == 2 && g_write_base == (u64)gpu && page_writable(gpu));
+
+    // Two watches over one page; unwatching one keeps the page protected for the other.
+    mem_watch_writes(gpu + 4 * 4096, 0x100);
+    mem_watch_writes(gpu + 4 * 4096 + 0x800, 0x100);
+    mem_unwatch_writes(gpu + 4 * 4096, 0x100);
+    CHECK(!page_writable(gpu + 4 * 4096));
+    gpu[4 * 4096 + 0x10] = 1; // the page is written: the remaining watch ends
+    CHECK(g_write_reports == 3 && g_write_base == (u64)gpu + 4 * 4096 + 0x800 &&
+          page_writable(gpu + 4 * 4096));
+    CHECK(mem_release(gpu));
+
+    // GPU-only memory: the CPU can't write it, so it needs no protection.
+    u8* gpu_only = (u8*)mem_alloc_virtual(nullptr, MiB(16), MEM_RESERVE | MEM_COMMIT, PAGE_NOACCESS, limits,
+                                          MEM_RANGE_GPU, 0);
+    if (gpu_only) {
+        MEMORY_BASIC_INFORMATION before = {}, after = {};
+        VirtualQuery(gpu_only, &before, sizeof(before));
+        mem_watch_writes(gpu_only, 4096);
+        VirtualQuery(gpu_only, &after, sizeof(after));
+        CHECK(after.Protect == before.Protect); // left alone
+        mem_unwatch_writes(gpu_only, 4096);
+        CHECK(mem_release(gpu_only));
     }
     mem_set_write_listener(nullptr);
 }
@@ -612,6 +662,7 @@ int main() {
     test_lazy_commit();
     test_gpu_section_ranges();
     test_write_watches();
+    test_watch_counts();
     test_store_traps();
     test_device_writes();
     test_xapu_decode();

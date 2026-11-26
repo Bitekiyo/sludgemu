@@ -149,19 +149,26 @@ bool mem_is_mapped(const void* addr, u64 size);
 typedef void (*MemMappingListener)(const u8* base, u64 size);
 void mem_add_mapping_listener(MemMappingListener listener);
 
-// Write watches: [base, base + size) of tracked title memory becomes read-only until the first write,
-// which makes it writable again and reports the range to the write listener. Mapped frames can show
-// at several addresses (the console's physical pages), so every address showing the range's frames
-// is watched, and a write through any of them reports the range. For memory the title keeps
-// read-write. Watches survive views being remapped over the same frames; they end, reported like
-// writes, when other frames are mapped there. Writes through our own views of the memory (for the
-// GPU) and by the kernel aren't seen: kernel I/O into title memory ends the watches first (see
-// mem_end_write_watches), since its writes would fail rather than fault.
+// Write watches: the memory under [base, base + size) of tracked title memory becomes read-only until
+// the first write into one of its pages, which ends the watch and reports the range to the write
+// listener. Watches are on memory, not addresses: mapped frames can show at several addresses (the
+// console's physical pages), and a write through any address showing a watched page ends the watch,
+// whose pages then become writable at every address (those no other watch or trap needs). Protection
+// is per host page, so a write next to a watched range on one of its pages ends it too. GPU-only and
+// read-only memory needs no protection: the CPU can't write it. Watches survive views being remapped
+// over the same frames; they end unreported when other frames are mapped at their range (mapping
+// listeners get that change). Writes through our own views of the memory (for the GPU) and by the
+// kernel aren't seen: kernel I/O into title memory ends the watches first (mem_end_write_watches),
+// since its writes would fail rather than fault. Arming a range that is watched already does nothing.
 typedef void (*MemWriteListener)(u64 base, u64 size); // called without memory locks held
 void mem_set_write_listener(MemWriteListener listener);
 void mem_watch_writes(const void* base, u64 size);
 
-// Ends the watches overlapping [base, base + size), reporting them.
+// Ends the watch armed for exactly [base, base + size), unreported (its user is gone).
+void mem_unwatch_writes(const void* base, u64 size);
+
+// The memory under [base, base + size) is about to be written without faults (kernel I/O): the
+// watches on its pages end and are reported.
 void mem_end_write_watches(const void* base, u64 size);
 
 // Device writes: title memory that something other than the CPU writes (DirectStorage requests),
@@ -187,10 +194,10 @@ u32 mem_frame_addresses(u64 pfn, u64* vas, u32 max);
 // Store traps: every CPU store into [base, base + size) of tracked title memory is reported to the
 // store listener right after it completes, for values something else waits on (GPU work waiting for a
 // counter the CPU writes). The pages stay read-only: a store faults, runs alone with its page writable
-// (single-stepped), and the page is protected again before the report. Stores to the same pages
-// outside the range are reported too (the listener checks the values); stores through other
-// addresses showing the frames, through our views and by the kernel aren't seen. Traps last until the
-// range is released.
+// (single-stepped), and the page is protected again before the report. Like watches, traps are on
+// memory: stores through any address showing it are reported. Stores to the same pages outside the
+// range are reported too (the listener checks the values); stores through our views and by the
+// kernel aren't seen. Traps last until the range is released.
 typedef void (*MemStoreListener)(u64 base, u64 size); // called on the storing thread, no locks held
 void mem_set_store_listener(MemStoreListener listener);
 void mem_trap_stores(const void* base, u64 size);

@@ -94,8 +94,7 @@ void texture_sync_remove(ConsoleResource* r) {
         break;
     }
     ReleaseSRWLockExclusive(&g_sync.lock);
-    // Its memory needn't stay protected; the report finds no texture there (or an alias to mark).
-    mem_end_write_watches((const void*)start, size);
+    mem_unwatch_writes((const void*)start, size); // its memory needn't stay protected
 }
 
 void texture_sync_mark(u64 address, u64 size) {
