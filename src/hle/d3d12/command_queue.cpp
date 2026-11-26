@@ -247,9 +247,36 @@ struct ConsolePresentPlane {
 };
 static_assert(sizeof(ConsolePresentPlane) == 72, "console present plane layout");
 
+// Presents per second and the longest interval between two, logged once a second (--frame-stats).
+// Called from the presenting thread only.
+static void count_frame() {
+    static LARGE_INTEGER frequency, last, second;
+    static u32 frames;
+    static u64 longest;
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    if (!frequency.QuadPart) {
+        QueryPerformanceFrequency(&frequency);
+        second = now;
+    } else if ((u64)(now.QuadPart - last.QuadPart) > longest) {
+        longest = (u64)(now.QuadPart - last.QuadPart);
+    }
+    last = now;
+    frames++;
+    if (now.QuadPart - second.QuadPart >= frequency.QuadPart) {
+        LOG_I("present", "%u presents/s, longest interval %.1f ms", frames,
+              (double)longest * 1000.0 / (double)frequency.QuadPart);
+        frames = 0;
+        longest = 0;
+        second = now;
+    }
+}
+
 static HRESULT WINAPI queue_present_x(ConsoleCommandQueue* self, UINT plane_count,
                                       const ConsolePresentPlane* planes, const void* parameters) {
     (void)parameters; // immediate flips, tearing and VRR preferences
+    if (gpu_options().frame_stats)
+        count_frame();
     if (plane_count > PRESENT_MAX_PLANES || (plane_count && !planes))
         return E_INVALIDARG;
     PresentPlane out[PRESENT_MAX_PLANES] = {};

@@ -8,6 +8,7 @@
 //   --gpu-debug        enable the D3D12 debug layer
 //   --gpu-serialize    wait for the GPU after every title submission (timing diagnostics)
 //   --gpu-warp         render with the software rasterizer (WARP) instead of the GPU
+//   --frame-stats      log presents per second and the longest frame interval, every second
 //   --model=MODEL      console to present as: series-x or series-s (default: what the host fits)
 //   --dump-threads-after=N   log every thread's backtrace every N seconds (hang diagnosis)
 //   --watch-write=SPEC       log every write to an 8-byte location ("module.dll+0xRVA" or "0xADDR")
@@ -40,6 +41,7 @@ struct Options {
     bool gpu_debug;
     bool gpu_serialize;
     bool gpu_warp;
+    bool frame_stats;
     ConsoleModel model;
     bool model_given;
     u32 dump_threads_after;
@@ -84,6 +86,8 @@ static bool parse_options(int argc, wchar_t** argv, Options* opt) {
             opt->gpu_serialize = true;
         } else if (wcscmp(a, L"--gpu-warp") == 0) {
             opt->gpu_warp = true;
+        } else if (wcscmp(a, L"--frame-stats") == 0) {
+            opt->frame_stats = true;
         } else if (wcscmp(a, L"--break-on-stub") == 0) {
             opt->break_on_stub = true;
         } else if (wcsncmp(a, L"--dump-threads-after=", 21) == 0) {
@@ -183,6 +187,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
     gpu_options.debug_layer = opt.gpu_debug;
     gpu_options.warp = opt.gpu_warp;
     gpu_options.serialize = opt.gpu_serialize;
+    gpu_options.frame_stats = opt.frame_stats;
     gpu_set_options(gpu_options);
     window_init(title.display_name);
 
