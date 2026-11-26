@@ -330,7 +330,7 @@ void texture_sync_init() {
             g_trace.dump_dir[0] = 0;
     }
     mem_add_mapping_listener(on_mapping_changed);
-    mem_set_write_listener(on_written);
+    mem_add_write_listener(on_written);
 }
 
 bool texture_sync_pending() {

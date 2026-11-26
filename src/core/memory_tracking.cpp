@@ -65,7 +65,7 @@ static struct {
     SRWLOCK lock;
     volatile long live;  // watches and traps there are: none means no fault can be ours
     volatile long taken; // host pages taken
-    MemWriteListener write_listener;
+    MemWriteListener write_listeners[4];
     MemStoreListener store_listener;
     MemTakenListener taken_listener;
     u16* frame_counts; // per host page of every frame ID: what protects it
@@ -105,8 +105,26 @@ void tracking_init() {
     g_step_ip.init();
 }
 
-void mem_set_write_listener(MemWriteListener listener) {
-    g_track.write_listener = listener;
+void mem_add_write_listener(MemWriteListener listener) {
+    for (u32 i = 0; i < ARRAY_COUNT(g_track.write_listeners); i++) {
+        if (!g_track.write_listeners[i]) {
+            g_track.write_listeners[i] = listener;
+            return;
+        }
+    }
+    FATAL("too many write listeners");
+}
+
+void mem_remove_write_listener(MemWriteListener listener) {
+    for (u32 i = 0; i < ARRAY_COUNT(g_track.write_listeners); i++)
+        if (g_track.write_listeners[i] == listener)
+            g_track.write_listeners[i] = nullptr;
+}
+
+static void notify_write(u64 base, u64 size, MemWriteKind kind) {
+    for (u32 i = 0; i < ARRAY_COUNT(g_track.write_listeners); i++)
+        if (MemWriteListener listener = g_track.write_listeners[i])
+            listener(base, size, kind);
 }
 
 void mem_set_store_listener(MemStoreListener listener) {
@@ -603,8 +621,8 @@ static void end_watches_reporting_in(u64 start, u64 end, bool traps) {
 }
 
 static void report_writes(const Report* reports, u32 count) {
-    for (u32 i = 0; i < count && g_track.write_listener; i++)
-        g_track.write_listener(reports[i].base, reports[i].size, MEM_WATCH_ENDED);
+    for (u32 i = 0; i < count; i++)
+        notify_write(reports[i].base, reports[i].size, MEM_WATCH_ENDED);
 }
 
 static void watch_or_trap(const void* base, u64 size, bool trap) {
@@ -1121,8 +1139,8 @@ void mem_poll_device_writes() {
         if (!finished.done)
             return;
         CloseHandle(finished.done);
-        for (u32 k = 0; k < finished.count && g_track.write_listener; k++)
-            g_track.write_listener(finished.spans[k].base, finished.spans[k].size, MEM_DEVICE_WROTE);
+        for (u32 k = 0; k < finished.count; k++)
+            notify_write(finished.spans[k].base, finished.spans[k].size, MEM_DEVICE_WROTE);
         free(finished.spans);
     }
 }

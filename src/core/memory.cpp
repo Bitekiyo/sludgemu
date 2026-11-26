@@ -251,6 +251,20 @@ static u32 frame_of_locked(u64 pfn) {
     return (u32)id;
 }
 
+bool mem_physical_bound(u64 pfn) {
+    AcquireSRWLockShared(&g_mem.phys_lock);
+    u32 id = frame_of_locked(pfn);
+    bool bound = id != MEM_INVALID_PFN && g_mem.id_to_real[id] != MEM_INVALID_PFN;
+    ReleaseSRWLockShared(&g_mem.phys_lock);
+    return bound;
+}
+
+static MemFramesFreedListener g_frames_freed_listener;
+
+void mem_set_frames_freed_listener(MemFramesFreedListener listener) {
+    g_frames_freed_listener = listener;
+}
+
 u8* mem_physical_ptr(u64 pfn) {
     AcquireSRWLockExclusive(&g_mem.phys_lock);
     u32 id = frame_of_locked(pfn);
@@ -305,6 +319,8 @@ void mem_physical_free(u64 count, const u64* pfns) {
         }
     }
     ReleaseSRWLockExclusive(&g_mem.phys_lock);
+    if (g_frames_freed_listener)
+        g_frames_freed_listener(count, pfns);
 }
 
 // ---------------------------------------------------------------------------------------------

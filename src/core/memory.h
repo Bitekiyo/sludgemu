@@ -64,6 +64,14 @@ void mem_physical_free(u64 count, const u64* pfns);
 // isn't an allocated frame.
 u8* mem_physical_ptr(u64 pfn);
 
+// Whether page frame `pfn` has system memory yet: frames are bound when first touched, and read as
+// zero until then (see mem_physical_alloc).
+bool mem_physical_bound(u64 pfn);
+
+// Called after frames are freed (no locks held), with their page numbers.
+typedef void (*MemFramesFreedListener)(u64 count, const u64* pfns);
+void mem_set_frames_freed_listener(MemFramesFreedListener listener);
+
 // Physical memory chunks (committed sections, nullptr until first used). Chunk i holds frames
 // [i * MEM_CHUNK_PAGES, (i + 1) * MEM_CHUNK_PAGES). Allocations that fit in a chunk get consecutive
 // frames of one chunk where possible, so the GPU can see them as one block.
@@ -170,7 +178,8 @@ enum MemWriteKind {
     MEM_DEVICE_WROTE, // a device finished writing [base, base + size) (see mem_expect_device_writes)
 };
 typedef void (*MemWriteListener)(u64 base, u64 size, MemWriteKind kind); // called without memory locks held
-void mem_set_write_listener(MemWriteListener listener);
+void mem_add_write_listener(MemWriteListener listener);
+void mem_remove_write_listener(MemWriteListener listener);
 void mem_watch_writes(const void* base, u64 size);
 
 // Ends the watch armed for exactly [base, base + size), unreported (its user is gone).

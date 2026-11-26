@@ -401,7 +401,7 @@ static bool page_writable(const void* p) {
 // being remapped and pages being backed or committed, and end unreported when other frames are mapped
 // at their range.
 static void test_write_watches() {
-    mem_set_write_listener(on_write);
+    mem_add_write_listener(on_write);
     MemAddressLimits limits = {};
     u8* a = (u8*)mem_reserve_placeholder(4 * PAGE, limits, 0, PAGE_READWRITE, 0);
     u8* b = (u8*)mem_reserve_placeholder(4 * PAGE, limits, 0, PAGE_READWRITE, 0);
@@ -488,14 +488,14 @@ static void test_write_watches() {
         CHECK(g_write_reports == 2 && g_write_base == (u64)gpu + MiB(5) && g_write_size == 0x400);
         CHECK(mem_release(gpu));
     }
-    mem_set_write_listener(nullptr);
+    mem_remove_write_listener(on_write);
 }
 
 // Protection is counted per page: watches sharing pages end only when their own pages are written,
 // a page stays protected while any watch needs it, unwatching releases only what nobody else needs,
 // and GPU-only memory isn't protected.
 static void test_watch_counts() {
-    mem_set_write_listener(on_write);
+    mem_add_write_listener(on_write);
     g_write_reports = 0;
     MemAddressLimits limits = {};
     u8* gpu = (u8*)mem_alloc_virtual(nullptr, MiB(16), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE, limits,
@@ -536,7 +536,7 @@ static void test_watch_counts() {
         mem_unwatch_writes(gpu_only, 4096);
         CHECK(mem_release(gpu_only));
     }
-    mem_set_write_listener(nullptr);
+    mem_remove_write_listener(on_write);
 }
 
 static u32 g_store_reports = 0;
@@ -589,7 +589,7 @@ static bool page_inaccessible(const void* p) {
 // aren't taken any more.
 static void test_taken_pages() {
     mem_set_taken_listener(on_taken);
-    mem_set_write_listener(on_write);
+    mem_add_write_listener(on_write);
     MemAddressLimits limits = {};
     u8* a = (u8*)mem_reserve_placeholder(2 * PAGE, limits, 0, PAGE_READWRITE, 0);
     u8* b = (u8*)mem_reserve_placeholder(2 * PAGE, limits, 0, PAGE_READWRITE, 0);
@@ -653,13 +653,13 @@ static void test_taken_pages() {
         mem_take_pages(gpu + MiB(2), PAGE);
         CHECK(mem_release(gpu)); // released while taken
     }
-    mem_set_write_listener(nullptr);
+    mem_remove_write_listener(on_write);
     mem_set_taken_listener(nullptr);
 }
 
 static void test_store_traps() {
     mem_set_store_listener(on_store);
-    mem_set_write_listener(on_write);
+    mem_add_write_listener(on_write);
     MemAddressLimits limits = {};
     u8* gpu = (u8*)mem_alloc_virtual(nullptr, MiB(16), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE, limits,
                                      MEM_RANGE_GPU, 0);
@@ -735,13 +735,13 @@ static void test_store_traps() {
 
     CHECK(mem_release(gpu));
     mem_set_store_listener(nullptr);
-    mem_set_write_listener(nullptr);
+    mem_remove_write_listener(on_write);
 }
 
 // Device writes: pending until their event is set, then reported like CPU writes; and the addresses
 // showing a frame, for writes through page numbers.
 static void test_device_writes() {
-    mem_set_write_listener(on_write);
+    mem_add_write_listener(on_write);
     g_write_reports = 0;
     HANDLE done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     MemSpan spans[2] = {{0x10000, 0x1000}, {0x50000, 0x2000}};
@@ -773,7 +773,7 @@ static void test_device_writes() {
         CHECK(mem_frame_addresses(frame, vas, 4) == 0);
         mem_physical_free(1, &frame);
     }
-    mem_set_write_listener(nullptr);
+    mem_remove_write_listener(on_write);
 }
 
 void test_xapu_decode();
