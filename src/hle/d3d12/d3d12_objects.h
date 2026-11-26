@@ -330,8 +330,9 @@ ConsoleResource* console_placed_texture(u64 gpu_address, const D3D12_RESOURCE_DE
 ID3D12Resource* console_resource_desktop(ConsoleResource* resource, u64* offset, GpuAccess access);
 
 // Logs the memory desktop textures take, by what they back, next to the adapter's memory budget and
-// the title's memory. Also logged when one can't be created for lack of memory, and by
-// console_memory_check as what they take (with reserved textures' tiles) reaches each new 256 MiB high.
+// the title's memory. console_memory_check logs it when what they take (with reserved textures' tiles)
+// reaches each new 256 MiB high, or after one couldn't be created for lack of memory. Both take the
+// texture and texture sync locks: call them with neither held.
 void console_memory_report(const char* why);
 void console_memory_check();
 

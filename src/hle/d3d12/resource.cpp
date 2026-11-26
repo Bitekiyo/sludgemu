@@ -49,6 +49,9 @@ bool console_translate_coherent(u64 address, u64 size, u64* desktop_address) {
 
 // --- desktop backing ---------------------------------------------------------------------------------
 
+// A texture couldn't be created for lack of memory: the next console_memory_check reports it.
+static volatile bool g_texture_out_of_memory;
+
 // Console resource flags that desktop D3D12 knows; the rest describe console hardware (compression,
 // tiling preferences) or are implied on desktop.
 static const u32 k_desktop_resource_flags =
@@ -182,11 +185,10 @@ static ID3D12Resource* create_texture(ConsoleResource* r) {
               r->desc.MipLevels, r->desc.Format, r->desc.Flags, (unsigned long)hr);
         static volatile long reported = 0;
         if (hr == E_OUTOFMEMORY && log_once_flag(&reported))
-            console_memory_report("out of memory");
+            g_texture_out_of_memory = true; // reported by the next check (locks are held here)
         return nullptr;
     }
     count_texture(r, desc);
-    console_memory_check();
     gpu_set_name(texture, "%s at 0x%llx (dim %d, %llux%ux%u, format %d)",
                  r->placed_view ? "texture of placed memory" : "texture", r->gpu_address, r->desc.Dimension,
                  r->desc.Width, r->desc.Height, r->desc.DepthOrArraySize, r->desc.Format);
@@ -567,8 +569,12 @@ void console_memory_check() {
     if (report)
         g_textures.next_report = ALIGN_DOWN(total, TEXTURE_REPORT_STEP) + TEXTURE_REPORT_STEP;
     ReleaseSRWLockExclusive(&g_textures.lock);
-    if (report)
+    if (g_texture_out_of_memory) {
+        g_texture_out_of_memory = false;
+        console_memory_report("out of memory");
+    } else if (report) {
         console_memory_report("new high");
+    }
 }
 
 static void uncount_texture(ConsoleResource* r) {

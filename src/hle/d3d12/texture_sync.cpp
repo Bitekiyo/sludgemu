@@ -734,7 +734,6 @@ struct TileBatch {
 };
 
 static TileBatch s_map_batch, s_unmap_batch; // under g_sync.lock
-static bool g_tiles_mapped;                  // by this texture_sync_record (memory reports)
 
 static void flush_tiles(ID3D12CommandQueue* queue, ID3D12Resource* texture, TileBatch* b) {
     if (!b->regions)
@@ -800,7 +799,6 @@ static bool update_tiles(ID3D12CommandQueue* queue, TextureUploadSources* source
                 if (g.count > TILE_BATCH || !gpu_tiles_alloc(g.count, tiles))
                     continue; // without VRAM its texels read zero (the pool logged why)
                 add_group(queue, texture, &s_map_batch, gpu_tile_heap(tiles[0]), g, tiles);
-                g_tiles_mapped = true;
             } else {
                 add_group(queue, texture, &s_unmap_batch, nullptr, g, tiles);
                 gpu_tiles_free(g.count, tiles);
@@ -854,7 +852,6 @@ bool texture_sync_record(ID3D12CommandQueue* queue, ID3D12GraphicsCommandList8* 
     u32 load_count = 0, copy_count = 0;
     u64 total = 0, staged_total = 0;
     bool copied = false;
-    g_tiles_mapped = false;
 
     AcquireSRWLockExclusive(&g_sync.lock);
     // Linear textures the GPU can copy from title memory are copied now; the others are detiled on
@@ -963,11 +960,9 @@ bool texture_sync_record(ID3D12CommandQueue* queue, ID3D12GraphicsCommandList8* 
         }
         load_count = 0;
     }
-    bool tiles_mapped = g_tiles_mapped;
     if (!load_count) {
         ReleaseSRWLockExclusive(&g_sync.lock);
-        if (tiles_mapped)
-            console_memory_check();
+        console_memory_check(); // textures made meanwhile, tiles mapped now
         return copied;
     }
     keep_source(sources, scratch->buffer);
@@ -1019,7 +1014,6 @@ bool texture_sync_record(ID3D12CommandQueue* queue, ID3D12GraphicsCommandList8* 
     scratch_barrier(list, scratch->buffer, D3D12_BARRIER_SYNC_COPY, D3D12_BARRIER_ACCESS_COPY_SOURCE,
                     D3D12_BARRIER_SYNC_NONE, D3D12_BARRIER_ACCESS_NO_ACCESS);
     ReleaseSRWLockExclusive(&g_sync.lock);
-    if (tiles_mapped)
-        console_memory_check();
+    console_memory_check();
     return true;
 }
