@@ -10,6 +10,7 @@
 
 #include "common/log.h"
 #include "gpu/console_layout.h"
+#include "gpu/formats.h"
 #include "hle/hle.h"
 
 // The texture computer is a C++ object: a virtual function table and the computed layout. Its
@@ -120,9 +121,98 @@ static HRESULT computer_get_texel_coordinate(TextureComputer*, UINT64, UINT32*, 
     return E_NOTIMPL;
 }
 
-static HRESULT computer_get_resource_tiling(TextureComputer*, UINT32*, void*, void*, UINT32*, UINT32, void*) {
-    LOG_W("xg", "XGTextureAddressComputer::GetResourceTiling is not implemented");
-    return E_NOTIMPL;
+// Tiled resources: titles stream textures in 64 KiB tiles, mapping page i of a texture's memory for
+// tile i, so tiles follow the layout in memory: a standard mip's tiles start where the mip does, and
+// the mips in the mip tail share the tail's tile(s) ("packed" mips).
+struct PackedMips {
+    u8 standard_mips;
+    u8 packed_mips;
+    u32 packed_tiles; // per array slice
+    u32 first_packed_tile;
+};
+
+struct TileShape {
+    u32 width, height, depth; // in texels
+};
+
+struct SubresourceTiling {
+    u32 width_in_tiles;
+    u16 height_in_tiles;
+    u16 depth_in_tiles;
+    u32 first_tile; // PACKED_TILE for mips in the tail
+};
+
+#define TILE_SIZE   0x10000u
+#define PACKED_TILE 0xFFFFFFFFu
+
+static HRESULT computer_get_resource_tiling(TextureComputer* self, UINT32* tile_count, PackedMips* packed,
+                                            TileShape* shape, UINT32* tiling_count, UINT32 first_tiling,
+                                            SubresourceTiling* tilings) {
+    const ConsolePlaneLayout& p = self->layout.planes[0];
+    u32 mips = self->layout.mip_levels;
+    u32 slices =
+        self->desc.dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : self->desc.depth_or_array_size;
+    // The tile shape is the swizzle block of the standard mips, which must be 64 KiB.
+    ConsoleSubresourceAddressing a = {};
+    bool tiled = p.standard_mip_count > 0 &&
+                 console_subresource_addressing(self->desc, self->layout, 0, 0, 0, &a, false) && !a.linear &&
+                 a.block_bytes_shift == 16;
+    if (!tiled && p.standard_mip_count > 0) {
+        LOG_W("xg", "GetResourceTiling of a texture without 64 KiB tiles (format %d, swizzle mode %u)",
+              self->desc.format, p.mips[0].swizzle_mode);
+        return E_INVALIDARG;
+    }
+    if (tile_count)
+        *tile_count = (UINT32)((self->layout.size + TILE_SIZE - 1) / TILE_SIZE);
+    u32 tail_tiles = 0;
+    u64 tail_offset = 0;
+    if (p.tail_mip_count) {
+        const ConsoleMipLayout& first_tail = p.mips[p.standard_mip_count];
+        tail_offset = p.base_offset + first_tail.offset;
+        tail_tiles = (u32)((first_tail.size + TILE_SIZE - 1) / TILE_SIZE);
+        tail_tiles = tail_tiles ? tail_tiles : 1;
+    }
+    if (packed) {
+        packed->standard_mips = (u8)p.standard_mip_count;
+        packed->packed_mips = (u8)p.tail_mip_count;
+        packed->packed_tiles = tail_tiles;
+        packed->first_packed_tile =
+            p.tail_mip_count ? (u32)(ALIGN_DOWN(tail_offset, (u64)TILE_SIZE) / TILE_SIZE) : 0;
+    }
+    FormatInfo f = format_info(self->desc.format);
+    u32 block_w = f.block_width ? f.block_width : 1, block_h = f.block_height ? f.block_height : 1;
+    if (shape) {
+        if (tiled) {
+            shape->width = (1u << a.block_shift[0]) * block_w;
+            shape->height = (1u << a.block_shift[1]) * block_h;
+            shape->depth = 1u << a.block_shift[2];
+        } else {
+            *shape = {0, 0, 0}; // everything is packed
+        }
+    }
+    if (tiling_count) {
+        u32 total = mips * slices;
+        u32 count = first_tiling < total ? total - first_tiling : 0;
+        count = count < *tiling_count ? count : *tiling_count;
+        for (u32 i = 0; i < count && tilings; i++) {
+            u32 sub = first_tiling + i, mip = sub % mips, slice = sub / mips;
+            const ConsoleMipLayout& m = p.mips[mip];
+            SubresourceTiling& t = tilings[i];
+            if (mip >= p.standard_mip_count) {
+                t = {0, 0, 0, PACKED_TILE};
+                continue;
+            }
+            u32 tw = 1u << a.block_shift[0], th = 1u << a.block_shift[1], td = 1u << a.block_shift[2];
+            u32 depth =
+                self->desc.dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? m.depth_or_array_size : 1;
+            t.width_in_tiles = (m.width + tw - 1) / tw;
+            t.height_in_tiles = (u16)((m.height + th - 1) / th);
+            t.depth_in_tiles = (u16)((depth + td - 1) / td);
+            t.first_tile = (u32)((slice * p.slice_size + p.base_offset + m.offset) / TILE_SIZE);
+        }
+        *tiling_count = count;
+    }
+    return S_OK;
 }
 
 static HRESULT computer_get_texture_view_descriptor(TextureComputer*, UINT32, void*) {
