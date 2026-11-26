@@ -6,7 +6,7 @@
 
 static bool create(GpuRing* r, u64 size) {
     D3D12_HEAP_PROPERTIES heap = {r->upload ? D3D12_HEAP_TYPE_UPLOAD : D3D12_HEAP_TYPE_DEFAULT};
-    D3D12_RESOURCE_DESC desc = {};
+    D3D12_RESOURCE_DESC1 desc = {};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
     desc.Width = size;
     desc.Height = 1;
@@ -17,10 +17,9 @@ static bool create(GpuRing* r, u64 size) {
     desc.Flags = r->upload ? D3D12_RESOURCE_FLAG_NONE : D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     ID3D12Resource* buffer = nullptr;
     u8* mapped = nullptr;
-    HRESULT hr = gpu_device()->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
-                                                       r->upload ? D3D12_RESOURCE_STATE_GENERIC_READ
-                                                                 : D3D12_RESOURCE_STATE_COMMON,
-                                                       nullptr, IID_PPV_ARGS(&buffer));
+    HRESULT hr = gpu_device()->CreateCommittedResource3(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                        D3D12_BARRIER_LAYOUT_UNDEFINED, nullptr, nullptr, 0,
+                                                        nullptr, IID_PPV_ARGS(&buffer));
     if (SUCCEEDED(hr) && r->upload) {
         hr = buffer->Map(0, nullptr, (void**)&mapped);
         if (FAILED(hr))

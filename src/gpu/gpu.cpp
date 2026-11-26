@@ -64,7 +64,14 @@ static void route_debug_messages(ID3D12Device* device) {
     }
     // A deprecation advisory the runtime raises from inside its own calls (DXGI checks features on
     // every present), which would bury everything else.
-    D3D12_MESSAGE_ID deny[] = {D3D12_MESSAGE_ID_DEPRECATED_API};
+    //
+    // Legacy resource state checks: every resource we create uses enhanced barriers, so they can only
+    // concern the buffers the runtime makes behind heaps opened over existing memory (our windows'
+    // heaps). Commands that take GPU addresses (vertex and index buffers, immediate writes, root
+    // descriptors) are checked against those buffers, with legacy state promotion across all the
+    // lists of a submission, while synchronization names our windows: one list writing a counter
+    // and another reading vertices elsewhere in the same heap reads as a state conflict.
+    D3D12_MESSAGE_ID deny[] = {D3D12_MESSAGE_ID_DEPRECATED_API, D3D12_MESSAGE_ID_INVALID_SUBRESOURCE_STATE};
     D3D12_INFO_QUEUE_FILTER filter = {};
     filter.DenyList.NumIDs = ARRAY_COUNT(deny);
     filter.DenyList.pIDList = deny;
