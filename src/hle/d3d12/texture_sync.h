@@ -42,6 +42,9 @@ bool texture_sync_tiles(const D3D12_RESOURCE_DESC1& desc);
 
 void texture_sync_add(ConsoleResource* r);
 void texture_sync_remove(ConsoleResource* r);
+// Tiles the reserved texture of `r` (at title address `start`) holds now; 0 for others (memory reports,
+// `r` is only compared, so it may be gone).
+u32 texture_sync_tiles_held(u64 start, const ConsoleResource* r);
 
 // Title memory [address, address + size) has new contents. Mapping changes call this themselves.
 void texture_sync_mark(u64 address, u64 size);

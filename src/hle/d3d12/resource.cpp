@@ -587,7 +587,26 @@ struct TextureSpan {
     u64 end;
     u64 desktop_bytes;
     TextureKind kind;
+    const ConsoleResource* resource; // only compared: it may be gone by the time the report runs
 };
+
+// Committed memory of this process by kind, from a walk of its address space: private memory inside and
+// outside title ranges, private write-combined memory (where Windows charges video memory allocations)
+// and mapped (section) memory.
+static void committed_memory(u64* title_private, u64* other_private, u64* video, u64* mapped) {
+    *title_private = *other_private = *video = *mapped = 0;
+    MEMORY_BASIC_INFORMATION m;
+    for (const u8* p = nullptr; VirtualQuery(p, &m, sizeof(m)); p = (const u8*)m.BaseAddress + m.RegionSize) {
+        if (m.State != MEM_COMMIT)
+            continue;
+        if (m.Type == MEM_MAPPED)
+            *mapped += m.RegionSize;
+        else if (m.Type == MEM_PRIVATE && mem_is_tracked(m.BaseAddress))
+            *title_private += m.RegionSize;
+        else if (m.Type == MEM_PRIVATE)
+            *((m.Protect & PAGE_WRITECOMBINE) ? video : other_private) += m.RegionSize;
+    }
+}
 
 static int compare_spans(const void* a, const void* b) {
     const TextureSpan* x = (const TextureSpan*)a;
@@ -617,7 +636,7 @@ void console_memory_report(const char* why) {
     TextureSpan* spans = (TextureSpan*)malloc((count ? count : 1) * sizeof(TextureSpan));
     for (u32 i = 0; spans && i < count; i++) {
         const ConsoleResource* r = g_textures.live[i];
-        spans[i] = {r->gpu_address, r->gpu_address + r->console_bytes, r->desktop_bytes, texture_kind(r)};
+        spans[i] = {r->gpu_address, r->gpu_address + r->console_bytes, r->desktop_bytes, texture_kind(r), r};
     }
     ReleaseSRWLockShared(&g_textures.lock);
 
@@ -651,6 +670,12 @@ void console_memory_report(const char* why) {
         (u64)process.WorkingSetSize >> 20, ((u64)mem_physical_chunks_created() * MEM_CHUNK_SIZE) >> 20,
         (mem_physical_bound_pages() << MEM_PAGE_SHIFT) >> 20, chunk_windows >> 20, block_windows >> 20,
         replaced_windows >> 20, page_table_tiles >> 20, downloads);
+    u64 title_private = 0, other_private = 0, video_private = 0, mapped_views = 0;
+    committed_memory(&title_private, &other_private, &video_private, &mapped_views);
+    LOG_I("d3d12",
+          "memory:   committed in this process's address space: private %llu MiB in title memory, %llu MiB "
+          "write-combined (video memory), %llu MiB other; mapped views %llu MiB",
+          title_private >> 20, video_private >> 20, other_private >> 20, mapped_views >> 20);
     if (!spans)
         return;
 
@@ -659,13 +684,22 @@ void console_memory_report(const char* why) {
     qsort(spans, count, sizeof(TextureSpan), compare_spans);
     for (u32 i = 0; i < count;) {
         TextureKind kind = spans[i].kind;
-        u32 textures = 0;
-        u64 desktop = 0, console = 0, distinct = 0, mapped = 0, bound = 0;
+        u32 textures = 0, small_count = 0;
+        u64 desktop = 0, console = 0, distinct = 0, mapped = 0, bound = 0, tiles_held = 0, small_tiles = 0;
+        u64 small_console = 0;
         u64 run_start = spans[i].start, run_end = spans[i].start;
         for (; i < count && spans[i].kind == kind; i++) {
             textures++;
             desktop += spans[i].desktop_bytes;
             console += spans[i].end - spans[i].start;
+            // Tiles of reserved textures; small textures (under a tile of title memory) take a whole one.
+            u64 held = (u64)texture_sync_tiles_held(spans[i].start, spans[i].resource) * GPU_TILE_SIZE;
+            tiles_held += held;
+            if (held && spans[i].end - spans[i].start < GPU_TILE_SIZE) {
+                small_count++;
+                small_tiles += held;
+                small_console += spans[i].end - spans[i].start;
+            }
             if (spans[i].start > run_end) {
                 distinct += run_end - run_start;
                 mapped += mapped_bytes(run_start, run_end);
@@ -678,10 +712,11 @@ void console_memory_report(const char* why) {
         mapped += mapped_bytes(run_start, run_end);
         bound += mem_physical_bound_pages_at((const void*)run_start, run_end - run_start);
         LOG_I("d3d12",
-              "memory:   %s: %u, %llu MiB as whole desktop textures; %llu MiB of title memory, %llu MiB "
+              "memory:   %s: %u, %llu MiB as whole desktop textures, %llu MiB of tiles (%u small ones under "
+              "a tile of title memory: %llu MiB of tiles for %llu MiB); %llu MiB of title memory, %llu MiB "
               "distinct, %llu MiB mapped (%llu MiB bound to system memory)",
-              k_texture_kind_names[kind], textures, desktop >> 20, console >> 20, distinct >> 20,
-              mapped >> 20, (bound << MEM_PAGE_SHIFT) >> 20);
+              k_texture_kind_names[kind], textures, desktop >> 20, tiles_held >> 20, small_count, small_tiles >> 20,
+              small_console >> 20, console >> 20, distinct >> 20, mapped >> 20, (bound << MEM_PAGE_SHIFT) >> 20);
     }
     free(spans);
 }
