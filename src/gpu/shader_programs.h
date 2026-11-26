@@ -30,6 +30,7 @@ struct ShaderProgram {
     u32 vertex_element_mask;
     u32 element_format[SHADER_MAX_VERTEX_ELEMENTS];
     u32 ps_target_mask;
+    bool ps_writes_depth;
     u32 sampler_count; // inline samplers: static samplers in the pipeline's root signature
     InlineSampler samplers[SHADER_MAX_INLINE_SAMPLERS];
     u16 table_reach[SHADER_MAX_ROOT_PARAMETERS]; // see TranslatedShader

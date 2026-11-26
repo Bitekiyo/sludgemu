@@ -783,6 +783,12 @@ ID3D12PipelineState* console_pipeline_desktop(ConsolePipelineState* pso, const P
     PipelineOutputs key = {};
     if (!pso->compute && outputs)
         key = *outputs;
+    // A pipeline that neither tests nor writes depth or stencil works with any depth target bound;
+    // desktop wants no depth format in it then (and its variants don't differ by depth target).
+    const ShaderProgram* ps = pso->programs[1];
+    if (!pso->fixed.depth_stencil.DepthEnable && !pso->fixed.depth_stencil.StencilEnable &&
+        !(ps && ps->ps_writes_depth))
+        key.depth_format = DXGI_FORMAT_UNKNOWN;
     AcquireSRWLockShared(&pso->lock);
     for (u32 i = 0; i < pso->variant_count; i++) {
         PipelineVariant& v = pso->variants[i];

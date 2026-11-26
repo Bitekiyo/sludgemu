@@ -139,6 +139,7 @@ static void build_program(Worker& w, ShaderProgram* p) {
                 p->vertex_element_mask = t.vertex_element_mask;
                 memcpy(p->element_format, t.element_format, sizeof(p->element_format));
                 p->ps_target_mask = t.ps_target_mask;
+                p->ps_writes_depth = t.ps_writes_depth;
                 p->sampler_count = t.sampler_count;
                 memcpy(p->samplers, t.samplers, sizeof(p->samplers));
                 memcpy(p->table_reach, t.table_reach, sizeof(p->table_reach));
