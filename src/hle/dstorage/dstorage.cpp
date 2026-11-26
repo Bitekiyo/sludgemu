@@ -20,6 +20,7 @@
 #include "common/log.h"
 #include "core/memory.h"
 #include "core/vfs.h"
+#include "hle/dstorage/bcpack.h"
 #include "hle/hle.h"
 
 // --- console ABI ---------------------------------------------------------------------------------
@@ -762,13 +763,27 @@ void ConsoleQueue::RetrieveErrorRecord(ConsoleErrorRecord* record) {
 
 static IDStorageCustomDecompressionQueue* g_decompression_queue = nullptr;
 
-static HRESULT inflate(libdeflate_decompressor* d, const void* src, u64 src_size, void* dst, u64 dst_size) {
+// A decoder thread's own state: the inflater, and room for data between two decoding steps.
+struct Decoder {
+    libdeflate_decompressor* inflater;
+    u8* scratch;
+    u64 scratch_size;
+};
+
+// Inflates `src` into up to `capacity` bytes of `dst`; `*size` gets the inflated size. Zlib streams
+// and raw deflate streams both occur.
+static libdeflate_result inflate_some(libdeflate_decompressor* d, const void* src, u64 src_size, void* dst,
+                                      u64 capacity, size_t* size) {
     const u8* s = (const u8*)src;
     bool zlib_header = src_size >= 2 && (s[0] & 0x0F) == 8 && ((s[0] << 8) | s[1]) % 31 == 0;
+    *size = 0;
+    return zlib_header ? libdeflate_zlib_decompress(d, src, src_size, dst, capacity, size)
+                       : libdeflate_deflate_decompress(d, src, src_size, dst, capacity, size);
+}
+
+static HRESULT inflate(libdeflate_decompressor* d, const void* src, u64 src_size, void* dst, u64 dst_size) {
     size_t actual = 0;
-    libdeflate_result r = zlib_header
-                              ? libdeflate_zlib_decompress(d, src, src_size, dst, dst_size, &actual)
-                              : libdeflate_deflate_decompress(d, src, src_size, dst, dst_size, &actual);
+    libdeflate_result r = inflate_some(d, src, src_size, dst, dst_size, &actual);
     if (r != LIBDEFLATE_SUCCESS || actual != dst_size) {
         LOG_W("dstorage", "zlib decode failed: result %d, %zu of %llu bytes", (int)r, actual, dst_size);
         return E_DSTORAGE_DECOMPRESSION_ERROR;
@@ -776,7 +791,43 @@ static HRESULT inflate(libdeflate_decompressor* d, const void* src, u64 src_size
     return S_OK;
 }
 
-static HRESULT decode_format(libdeflate_decompressor* d, const DSTORAGE_CUSTOM_DECOMPRESSION_REQUEST& req) {
+static u8* decoder_scratch(Decoder* d, u64 size) {
+    if (size <= d->scratch_size)
+        return d->scratch;
+    u8* grown = (u8*)realloc(d->scratch, size);
+    if (!grown)
+        return nullptr;
+    d->scratch = grown;
+    d->scratch_size = size;
+    return grown;
+}
+
+// BCPack data inflated first: the request doesn't carry its size here, but packed data is no larger
+// than the blocks it encodes in practice (encoders keep the blocks as they are otherwise), so room
+// for the blocks is tried first, then more.
+static HRESULT inflate_bcpack(Decoder* d, const DSTORAGE_CUSTOM_DECOMPRESSION_REQUEST& req, const u8** packed,
+                              u64* packed_size) {
+    u64 capacity = req.DstSize > 4096 ? req.DstSize : 4096;
+    for (u32 attempt = 0; attempt < 3; attempt++, capacity *= 2) {
+        u8* scratch = decoder_scratch(d, capacity);
+        if (!scratch)
+            return E_OUTOFMEMORY;
+        size_t size = 0;
+        libdeflate_result r = inflate_some(d->inflater, req.SrcBuffer, req.SrcSize, scratch, capacity, &size);
+        if (r == LIBDEFLATE_SUCCESS) {
+            *packed = scratch;
+            *packed_size = size;
+            return S_OK;
+        }
+        if (r != LIBDEFLATE_INSUFFICIENT_SPACE)
+            break;
+    }
+    LOG_W("dstorage", "zlib decode of BCPack data failed (%llu bytes in, %llu bytes of blocks)",
+          (unsigned long long)req.SrcSize, (unsigned long long)req.DstSize);
+    return E_DSTORAGE_DECOMPRESSION_ERROR;
+}
+
+static HRESULT decode_format(Decoder* d, const DSTORAGE_CUSTOM_DECOMPRESSION_REQUEST& req) {
     u8 format = (u8)req.CompressionFormat;
     if (format == FORMAT_UNSUPPORTED)
         return E_NOTIMPL;
@@ -786,19 +837,35 @@ static HRESULT decode_format(libdeflate_decompressor* d, const DSTORAGE_CUSTOM_D
         memcpy(req.DstBuffer, req.SrcBuffer, req.DstSize);
         return S_OK;
     }
-    if (format & (FORMAT_BCPACK_MASK | FORMAT_SWIZZLE_MASK)) {
+    if (format & FORMAT_SWIZZLE_MASK) {
         static volatile long logged = 0;
         if (InterlockedIncrement(&logged) <= 8)
-            LOG_E("dstorage", "custom format 0x%02x (BCPack/swizzle) is not implemented yet", format);
+            LOG_E("dstorage", "custom format 0x%02x (destination swizzling) is not implemented yet", format);
         return E_NOTIMPL;
     }
+    u32 bc_format = (format & FORMAT_BCPACK_MASK) >> FORMAT_BCPACK_SHIFT;
+    if (bc_format) {
+        const u8* packed = (const u8*)req.SrcBuffer;
+        u64 packed_size = req.SrcSize;
+        if (format & FORMAT_ZLIB) {
+            HRESULT hr = inflate_bcpack(d, req, &packed, &packed_size);
+            if (FAILED(hr))
+                return hr;
+        }
+        if (!bcpack_decode(bc_format, packed, packed_size, req.DstBuffer, req.DstSize)) {
+            LOG_W("dstorage", "BCPack decode failed: BC%u, %llu bytes into %llu", bc_format,
+                  (unsigned long long)packed_size, (unsigned long long)req.DstSize);
+            return E_DSTORAGE_DECOMPRESSION_ERROR;
+        }
+        return S_OK;
+    }
     if (format & FORMAT_ZLIB)
-        return inflate(d, req.SrcBuffer, req.SrcSize, req.DstBuffer, req.DstSize);
+        return inflate(d->inflater, req.SrcBuffer, req.SrcSize, req.DstBuffer, req.DstSize);
     return E_NOTIMPL;
 }
 
 // Decodes a request; a scattered one is spread over its pages, before the request completes.
-static HRESULT decode(libdeflate_decompressor* d, const DSTORAGE_CUSTOM_DECOMPRESSION_REQUEST& req) {
+static HRESULT decode(Decoder* d, const DSTORAGE_CUSTOM_DECOMPRESSION_REQUEST& req) {
     HRESULT hr = decode_format(d, req);
     Scatter s;
     if (!scatter_take(req.DstBuffer, &s))
@@ -814,7 +881,9 @@ static HRESULT decode(libdeflate_decompressor* d, const DSTORAGE_CUSTOM_DECOMPRE
 }
 
 static DWORD WINAPI decoder_thread(void*) {
-    libdeflate_decompressor* d = libdeflate_alloc_decompressor();
+    Decoder decoder = {libdeflate_alloc_decompressor(), nullptr, 0};
+    if (!decoder.inflater)
+        FATAL("out of memory starting a DirectStorage decoder");
     HANDLE event = g_decompression_queue->GetEvent();
     DSTORAGE_CUSTOM_DECOMPRESSION_REQUEST requests[16];
     DSTORAGE_CUSTOM_DECOMPRESSION_RESULT results[16];
@@ -827,7 +896,7 @@ static DWORD WINAPI decoder_thread(void*) {
                 break;
             for (UINT32 i = 0; i < count; i++) {
                 results[i].Id = requests[i].Id;
-                results[i].Result = decode(d, requests[i]);
+                results[i].Result = decode(&decoder, requests[i]);
             }
             g_decompression_queue->SetRequestResults(count, results);
         }

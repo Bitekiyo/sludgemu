@@ -6,11 +6,13 @@ add_executable(sludgemu_tests
     dsp_test.cpp
     xma_test.cpp
     layout_test.cpp
+    bcpack_test.cpp
     ${PROJECT_SOURCE_DIR}/src/common/log.cpp
     ${PROJECT_SOURCE_DIR}/src/core/memory.cpp
     ${PROJECT_SOURCE_DIR}/src/core/memory_tracking.cpp
     ${PROJECT_SOURCE_DIR}/src/gpu/console_layout.cpp
     ${PROJECT_SOURCE_DIR}/src/gpu/formats.cpp
+    ${PROJECT_SOURCE_DIR}/src/hle/dstorage/bcpack.cpp
     ${PROJECT_SOURCE_DIR}/src/hle/audio/xapu.cpp
     ${PROJECT_SOURCE_DIR}/src/hle/audio/xdsp.cpp
     ${PROJECT_SOURCE_DIR}/src/hle/audio/xma.cpp
