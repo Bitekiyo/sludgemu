@@ -190,16 +190,25 @@ static void create_chunk(u32 index) {
                          PAGE_READWRITE, nullptr, 0))
         FATAL("cannot map physical memory chunk %u (%lu)", index, GetLastError());
     g_mem.chunks[index] = section;
+    g_mem.chunks_created++;
     LOG_D("memory", "physical chunk %u committed (%llu MiB)", index, MEM_CHUNK_SIZE >> 20);
 }
 
-// Claims a region that has no real frame bound and no range slice preferring it, for a slice:
-// first in chunks that exist already, which keeps commit charge close to what is used. Returns its
+// Whether the chunks made so far have frames free beyond a slack of an eighth: worth filling before
+// another chunk takes commit charge (every chunk is committed whole). phys_lock held.
+static bool chunks_have_room() {
+    u64 capacity = (u64)g_mem.chunks_created * MEM_CHUNK_PAGES;
+    return capacity - g_mem.bound_real > capacity / 8;
+}
+
+// Claims a region that has no real frame bound and no range slice preferring it, for a slice: in
+// chunks that exist already, or in a new chunk once those are nearly full (slices often use little
+// of their region, so holes in claimed regions are filled first; see find_free_real). Returns its
 // first real frame, or MEM_INVALID_PFN. phys_lock held.
 static u32 claim_free_region() {
     const u32 regions = (u32)(g_mem.total_pages / REGION_PAGES);
     const u32 per_chunk = (u32)(MEM_CHUNK_PAGES / REGION_PAGES);
-    for (int pass = 0; pass < 2; pass++) {
+    for (int pass = 0; pass < (chunks_have_room() ? 1 : 2); pass++) {
         for (u32 r = 0; r < regions; r++) {
             bool created = g_mem.chunks[r / per_chunk] != nullptr;
             if (g_mem.region_claimed[r] || created != (pass == 0))
@@ -217,23 +226,28 @@ static u32 claim_free_region() {
     return MEM_INVALID_PFN;
 }
 
-// A free real frame, preferring regions no range slice has claimed. phys_lock held.
+// A free real frame: in chunks that exist, outside regions slices claimed if possible, then in the
+// holes of claimed regions; only then in a new chunk. phys_lock held.
 static u32 find_free_real() {
-    for (int pass = 0; pass < 2; pass++) {
-        u64 i = g_mem.real_hint;
-        for (u64 scanned = 0; scanned < g_mem.total_pages; scanned++, i++) {
-            if (i >= g_mem.total_pages)
-                i = 0;
-            if (pass == 0 && g_mem.region_claimed[i / REGION_PAGES]) {
-                u64 skip = REGION_PAGES - i % REGION_PAGES - 1; // to the end of this region
-                scanned += skip;
-                i += skip;
+    const u64 words = g_mem.total_pages / 64;
+    const u64 start = g_mem.real_hint / 64;
+    for (int pass = 0; pass < 4; pass++) {
+        bool existing_only = pass < 2, unclaimed_only = pass % 2 == 0;
+        for (u64 n = 0; n < words; n++) {
+            u64 w = (start + n) % words;
+            u64 first = w * 64;
+            if (existing_only && !g_mem.chunks[first / MEM_CHUNK_PAGES])
                 continue;
-            }
-            if (!bit_get(g_mem.real_bitmap, i)) {
-                g_mem.real_hint = i + 1 < g_mem.total_pages ? i + 1 : 0;
-                return (u32)i;
-            }
+            if (unclaimed_only && g_mem.region_claimed[first / REGION_PAGES])
+                continue;
+            u64 free = ~g_mem.real_bitmap[w];
+            if (!free)
+                continue;
+            unsigned long bit;
+            _BitScanForward64(&bit, free);
+            u64 i = first + bit;
+            g_mem.real_hint = i + 1 < g_mem.total_pages ? i + 1 : 0;
+            return (u32)i;
         }
     }
     FATAL("no free real page frame although allocated IDs reserve them");
@@ -245,11 +259,12 @@ static u32 bind_frame(u32 id, u32 preferred) {
     u32 real = g_mem.id_to_real[id];
     if (real != MEM_INVALID_PFN)
         return real;
-    if (preferred < g_mem.total_pages && !bit_get(g_mem.real_bitmap, preferred))
-        real = preferred;
-    else
-        real = find_free_real();
+    // The preferred frame only where it costs no new chunk while the others have room.
+    bool usable = preferred < g_mem.total_pages && !bit_get(g_mem.real_bitmap, preferred) &&
+                  (g_mem.chunks[preferred / MEM_CHUNK_PAGES] || !chunks_have_room());
+    real = usable ? preferred : find_free_real();
     bit_set(g_mem.real_bitmap, real);
+    g_mem.bound_real++;
     g_mem.id_to_real[id] = real;
     g_mem.real_to_id[real] = id;
     u32 chunk = real / (u32)MEM_CHUNK_PAGES;
@@ -339,6 +354,7 @@ static void physical_free(u64 count, const u64* pfns) {
         if (real != MEM_INVALID_PFN) {
             g_mem.id_to_real[id] = MEM_INVALID_PFN;
             bit_clear(g_mem.real_bitmap, real);
+            g_mem.bound_real--;
             bit_set(g_mem.dirty_bitmap, real);
             // Hand the RAM back; the frame is zeroed when it's bound again.
             DiscardVirtualMemory(real_ptr(real), MEM_PAGE_SIZE);

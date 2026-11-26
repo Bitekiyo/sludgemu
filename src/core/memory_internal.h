@@ -79,6 +79,8 @@ struct MemoryState {
     u64* dirty_bitmap; // 1 = real frame was used before, zeroed when bound again
     u64 id_hint;
     u64 real_hint;
+    u64 bound_real;     // real frames bound (bits set in real_bitmap)
+    u32 chunks_created; // chunks whose section exists
     SRWLOCK phys_lock;
 
     RangeSlot ranges[MAX_RANGES];
