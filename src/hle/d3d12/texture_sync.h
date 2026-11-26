@@ -1,5 +1,6 @@
 #pragma once
 
+#include "gpu/gpu_ring.h"
 #include "hle/d3d12/d3d12_objects.h"
 
 // Textures whose contents come from title memory.
@@ -32,8 +33,8 @@ void texture_sync_mark(u64 address, u64 size);
 // Whether uploads are waiting; cheap.
 bool texture_sync_pending();
 
-// What recorded uploads use: the textures they write, the title memory windows and the upload buffer
-// they read, each with a reference to retire (gpu_retire) once the list is submitted. Textures and
+// What recorded uploads use: the textures they write, the title memory windows they read and the
+// scratch ring, each with a reference to retire (gpu_retire) once the list is submitted. Textures and
 // windows can be retired by other threads (a texture's last view rewritten, a mapping change) before
 // the list is submitted; the references here keep them until the GPU is done.
 #define TEXTURE_UPLOAD_SOURCES 256
@@ -42,6 +43,9 @@ struct TextureUploadSources {
     u32 count;
 };
 
-// Records the waiting uploads into `list` (a direct or compute list). Returns whether anything was
-// recorded.
-bool texture_sync_record(ID3D12GraphicsCommandList8* list, TextureUploadSources* sources);
+// Records the waiting uploads into `list` (a direct or compute list), detiled on the GPU into the
+// queue's `scratch` ring; textures whose memory isn't one block for the GPU are copied into its
+// `staging` ring (an upload ring) first. Both rings get gpu_ring_submitted once the list is submitted.
+// Returns whether anything was recorded.
+bool texture_sync_record(ID3D12GraphicsCommandList8* list, TextureUploadSources* sources, GpuRing* scratch,
+                         GpuRing* staging);

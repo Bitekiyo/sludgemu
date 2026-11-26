@@ -140,11 +140,12 @@ struct ConsoleSubresourceAddressing {
     u16 bits_x[14], bits_y[14], bits_z[12]; // the pattern of each coordinate bit
 };
 
-// The addressing of a subresource, checked against the layout. Fails for layouts it doesn't
-// describe (planes of other than 1, 2, 4, 8 or 16 bytes per element, multisampled textures) and,
-// logged, if the check finds a difference.
+// The addressing of a subresource. Fails for layouts it doesn't describe (planes of other than 1, 2,
+// 4, 8 or 16 bytes per element, multisampled textures) and, with `check`, logged, if a spread of
+// elements doesn't come out where the layout puts them (checking costs layout computations; a kind
+// of texture checked once needn't be again).
 bool console_subresource_addressing(const ConsoleTextureDesc& desc, const ConsoleTextureLayout& layout,
-                                    u32 plane, u32 mip, u32 slice, ConsoleSubresourceAddressing* out);
+                                    u32 plane, u32 mip, u32 slice, ConsoleSubresourceAddressing* out, bool check);
 
 // Byte offset of element (x, y, z) of a subresource from the start of the texture.
 u64 console_subresource_offset(const ConsoleSubresourceAddressing& a, u32 x, u32 y, u32 z);

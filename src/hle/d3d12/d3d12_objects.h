@@ -4,6 +4,7 @@
 #include <windows.h>
 #include <d3d12.h>
 
+#include "gpu/gpu_ring.h"
 #include "gpu/gpu_window.h"
 #include "hle/d3d12/console_object.h"
 
@@ -55,9 +56,12 @@ struct ConsoleCommandQueue {
     SRWLOCK writer_lock;
     u32 next_writer;
     QueueSignalWriter writers[QUEUE_SIGNAL_WRITERS];
+    // Texture uploads (texture_sync.h), and detiled texture data on its way into textures; writer_lock
+    // guards them too.
     u32 next_uploader;
-    QueueSignalWriter
-        uploaders[QUEUE_UPLOADERS]; // texture uploads (texture_sync.h); writer_lock guards them too
+    QueueSignalWriter uploaders[QUEUE_UPLOADERS];
+    GpuRing scratch;
+    GpuRing staging; // an upload ring
 };
 
 // Console fences also have a GPU address holding their value, which command lists write to signal

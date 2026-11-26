@@ -25,7 +25,7 @@ static void check_texture(const ConsoleTextureDesc& d) {
     for (u32 slice = 0; slice < slices; slice++) {
         for (u32 mip = 0; mip < layout.mip_levels; mip++) {
             ConsoleSubresourceAddressing a;
-            if (!console_subresource_addressing(d, layout, 0, mip, slice, &a)) {
+            if (!console_subresource_addressing(d, layout, 0, mip, slice, &a, true)) {
                 printf("FAIL addressing: format %d %llux%ux%u layout 0x%x mip %u slice %u\n", d.format,
                        d.width, d.height, d.depth_or_array_size, d.layout, mip, slice);
                 g_failures++;

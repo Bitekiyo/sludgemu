@@ -623,7 +623,7 @@ static const SwizzlePattern* swizzle_pattern(const ConsoleTextureDesc& d, const 
 }
 
 bool console_subresource_addressing(const ConsoleTextureDesc& d, const ConsoleTextureLayout& layout,
-                                    u32 plane, u32 mip, u32 slice, ConsoleSubresourceAddressing* out) {
+                                    u32 plane, u32 mip, u32 slice, ConsoleSubresourceAddressing* out, bool check) {
     memset(out, 0, sizeof(*out));
     if (plane >= layout.plane_count || mip >= layout.mip_levels || d.sample_count > 1)
         return false;
@@ -677,6 +677,8 @@ bool console_subresource_addressing(const ConsoleTextureDesc& d, const ConsoleTe
         out->base = origin - origin_pattern;
     }
 
+    if (!check)
+        return true;
     // Corners and a spread of elements must come out where the layout puts them.
     u32 w = out->width, h = out->height, dd = out->depth;
     for (u32 k = 0; k < 16; k++) {

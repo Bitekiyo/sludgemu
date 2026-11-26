@@ -8,6 +8,8 @@
 #include "gpu/console_layout.h"
 #include "gpu/formats.h"
 #include "gpu/gpu.h"
+#include "gpu/gpu_window.h"
+#include "gpu/texture_untile.h"
 
 struct SyncEntry {
     u64 start;
@@ -15,6 +17,8 @@ struct SyncEntry {
     ConsoleResource* resource; // registered while alive (texture_sync_remove before destruction)
     bool dirty;
     bool linear; // laid out for CPU writes: copied by the GPU where the layout allows
+    // How its subresources are laid out, for detiling (made at the first upload; plan order).
+    ConsoleSubresourceAddressing* addressing;
 };
 
 static struct {
@@ -25,8 +29,9 @@ static struct {
     volatile long dirty; // entries marked and not uploaded yet
 } g_sync = {nullptr, 0, 0, SRWLOCK_INIT, 0};
 
-// Upload volume per submission: the rest waits for the next one.
-#define UPLOAD_BUDGET MiB(256)
+// Detiled data per submission: the rest waits for the next one (a texture larger than this goes
+// alone).
+#define UPLOAD_BUDGET MiB(128)
 
 bool texture_sync_tracks(const D3D12_RESOURCE_DESC1& desc) {
     const D3D12_RESOURCE_FLAGS written = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
@@ -72,7 +77,7 @@ void texture_sync_add(ConsoleResource* r) {
         r->desc.Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR || r->desc.Layout == CONSOLE_LAYOUT_SWIZZLE;
     // Its memory may hold the contents already; if it isn't mapped yet, the upload is skipped and the
     // mapping marks it again.
-    g_sync.entries[at] = {r->gpu_address, r->gpu_address + info.SizeInBytes, r, true, linear};
+    g_sync.entries[at] = {r->gpu_address, r->gpu_address + info.SizeInBytes, r, true, linear, nullptr};
     g_sync.count++;
     InterlockedIncrement(&g_sync.dirty);
     ReleaseSRWLockExclusive(&g_sync.lock);
@@ -87,6 +92,7 @@ void texture_sync_remove(ConsoleResource* r) {
             continue;
         if (g_sync.entries[i].dirty)
             InterlockedDecrement(&g_sync.dirty);
+        free(g_sync.entries[i].addressing);
         start = g_sync.entries[i].start;
         size = g_sync.entries[i].end - start;
         memmove(&g_sync.entries[i], &g_sync.entries[i + 1], (g_sync.count - i - 1) * sizeof(SyncEntry));
@@ -262,8 +268,8 @@ static bool copy_from_title_memory(ID3D12GraphicsCommandList8* list, ConsoleReso
     const ConsolePlaneLayout& p = layout.planes[0];
     bool unrestricted = unrestricted_copy_pitch();
     GpuAddress window;
-    if (!gpu_translate(r->gpu_address, size, &window))
-        return false;
+    if (!gpu_translate(r->gpu_address, 1, &window) || window.available < size)
+        return false; // not one block of memory for the GPU
     for (u32 m = 0; m < layout.mip_levels; m++) {
         u64 at = window.offset + p.base_offset + p.mips[m].offset;
         if (p.mips[m].swizzle_mode != 0 ||
@@ -298,21 +304,85 @@ static bool copy_from_title_memory(ID3D12GraphicsCommandList8* list, ConsoleReso
 #define MAX_SUBRESOURCES 512
 #define MAX_UPLOADS      64
 
-bool texture_sync_record(ID3D12GraphicsCommandList8* list, TextureUploadSources* sources) {
+// Console layouts whose addressing was checked against the layout (see
+// console_subresource_addressing): textures described the same way skip the check.
+#define CHECKED_LAYOUTS 4096
+static u64 g_checked[CHECKED_LAYOUTS]; // hashes of descriptions; under g_sync.lock
+
+static u64 desc_hash(const ConsoleTextureDesc& t) {
+    u64 h = 0xcbf29ce484222325ull;
+    const u8* b = (const u8*)&t;
+    for (usize i = 0; i < sizeof(t); i++)
+        h = (h ^ b[i]) * 0x100000001b3ull;
+    return h | 1;
+}
+
+// The addressing of every subresource of a texture, in plan order (slice by slice, mip by mip);
+// nullptr (logged) if its layout can't be detiled.
+static ConsoleSubresourceAddressing* make_addressing(const ConsoleResource* r, u32 count) {
+    ConsoleTextureDesc t = layout_desc(r->desc);
+    ConsoleTextureLayout layout;
+    if (!console_texture_layout(t, &layout))
+        return nullptr;
+    ConsoleSubresourceAddressing* a = (ConsoleSubresourceAddressing*)malloc(count * sizeof(*a));
+    if (!a)
+        return nullptr;
+    u64 h = desc_hash(t);
+    u32 slot = (u32)(h >> 40) % CHECKED_LAYOUTS;
+    bool checked = g_checked[slot] == h;
+    u32 mips = layout.mip_levels;
+    for (u32 i = 0; i < count; i++) {
+        // Each mip of the first slice is checked once per kind of texture.
+        bool check = !checked && i < mips;
+        if (!console_subresource_addressing(t, layout, 0, i % mips, i / mips, &a[i], check)) {
+            LOG_W_ONCE("d3d12", "textures of format %d in layout 0x%x can't be detiled; they get no contents",
+                       t.format, t.layout);
+            free(a);
+            return nullptr;
+        }
+    }
+    g_checked[slot] = h;
+    return a;
+}
+
+// A texture to detile in this submission: its subresources' places in the scratch ring.
+// Memory the GPU can't see as one block (frames that don't follow each other) is copied as it is into
+// the staging ring first, and detiled from there.
+#define NOT_STAGED ~0ull
+
+struct Load {
+    SyncEntry* entry;
+    ID3D12Resource* texture;
+    u64 source;       // desktop GPU address of the texture's memory (or its staged copy)
+    u64 staged;       // offset of its copy in this submission's staging region, or NOT_STAGED
+    u32 first, count; // in s_copies
+};
+
+static SubresourceCopy s_copies[MAX_UPLOADS * 16]; // under g_sync.lock
+
+static void scratch_barrier(ID3D12GraphicsCommandList8* list, ID3D12Resource* buffer,
+                            D3D12_BARRIER_SYNC sync_before, D3D12_BARRIER_ACCESS before,
+                            D3D12_BARRIER_SYNC sync_after, D3D12_BARRIER_ACCESS after) {
+    D3D12_BUFFER_BARRIER b = {sync_before, sync_after, before, after, buffer, 0, UINT64_MAX};
+    D3D12_BARRIER_GROUP g = {D3D12_BARRIER_TYPE_BUFFER, 1};
+    g.pBufferBarriers = &b;
+    list->Barrier(1, &g);
+}
+
+bool texture_sync_record(ID3D12GraphicsCommandList8* list, TextureUploadSources* sources, GpuRing* scratch,
+                         GpuRing* staging) {
     sources->count = 0;
     mem_poll_device_writes(); // finished ones mark their textures
     if (!g_sync.dirty)
         return false;
-    static SubresourceCopy s_copies[MAX_UPLOADS][MAX_SUBRESOURCES]; // under g_sync.lock
-    ConsoleResource* uploads[MAX_UPLOADS];
-    u32 copy_counts[MAX_UPLOADS];
-    u32 upload_count = 0;
-    u64 total = 0;
+    Load loads[MAX_UPLOADS];
+    u32 load_count = 0, copy_count = 0;
+    u64 total = 0, staged_total = 0;
     bool copied = false;
 
     AcquireSRWLockExclusive(&g_sync.lock);
-    // Linear textures the GPU can copy from title memory are copied now; the others are uploaded
-    // from the CPU within the budget, and the rest wait for the next submission.
+    // Linear textures the GPU can copy from title memory are copied now; the others are detiled on
+    // the GPU within the budget, and the rest wait for the next submission.
     for (u32 i = 0; i < g_sync.count; i++) {
         SyncEntry& e = g_sync.entries[i];
         if (!e.dirty)
@@ -321,99 +391,117 @@ bool texture_sync_record(ID3D12GraphicsCommandList8* list, TextureUploadSources*
         // would also fail writes the kernel makes.
         if (mem_device_writes_pending(e.start, e.end - e.start))
             continue;
+        const D3D12_RESOURCE_DESC1& d = e.resource->desc;
+        u32 subresources = (d.MipLevels ? d.MipLevels : 1) *
+                           (d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : d.DepthOrArraySize);
+        bool full = load_count == MAX_UPLOADS || (load_count && total >= UPLOAD_BUDGET) ||
+                    copy_count + subresources > ARRAY_COUNT(s_copies);
+        if (full && !e.linear)
+            continue;
         bool mapped = mem_is_mapped((const void*)e.start, e.end - e.start);
         // Watched before it is read: what the CPU writes from now on marks it again.
-        if (mapped && ((upload_count < MAX_UPLOADS && total < UPLOAD_BUDGET) || e.linear))
+        if (mapped)
             mem_watch_writes((const void*)e.start, e.end - e.start);
-        if (mapped && e.linear && copy_from_title_memory(list, e.resource, e.end - e.start, sources))
-            mapped = false, copied = true; // done
-        else if (mapped && (upload_count == MAX_UPLOADS || total >= UPLOAD_BUDGET))
+        if (mapped && e.linear && copy_from_title_memory(list, e.resource, e.end - e.start, sources)) {
+            e.dirty = false;
+            InterlockedDecrement(&g_sync.dirty);
+            copied = true;
+            continue;
+        }
+        if (full)
             continue;
         e.dirty = false;
         InterlockedDecrement(&g_sync.dirty);
         if (!mapped)
-            continue; // copied, or nothing to read yet (pages arrive with a later mapping)
-        u64 offset = total;
+            continue; // nothing to read yet: pages arrive with a later mapping, which marks it again
         u64 unused;
         ID3D12Resource* texture = console_resource_desktop(e.resource, &unused);
-        if (!texture || !plan_texture(e.resource, s_copies[upload_count], MAX_SUBRESOURCES,
-                                      &copy_counts[upload_count], &offset))
+        u32 count = 0;
+        u64 offset = total;
+        if (!texture || !plan_texture(e.resource, &s_copies[copy_count], ARRAY_COUNT(s_copies) - copy_count,
+                                      &count, &offset))
             continue;
-        if (!keep_source(sources, texture)) {
+        if (!e.addressing)
+            e.addressing = make_addressing(e.resource, count);
+        if (!e.addressing)
+            continue;
+        if (sources->count + 4 >= TEXTURE_UPLOAD_SOURCES) {
             e.dirty = true; // no room left: with the next submission
             InterlockedIncrement(&g_sync.dirty);
             continue;
         }
+        keep_source(sources, texture);
+        GpuAddress window = {};
+        if (gpu_translate(e.start, 1, &window) && window.available >= e.end - e.start) {
+            keep_source(sources, window.buffer);
+            loads[load_count++] = {&e, texture, window.desktop_address, NOT_STAGED, copy_count, count};
+        } else {
+            loads[load_count++] = {&e, texture, 0, staged_total, copy_count, count};
+            staged_total = ALIGN_UP(staged_total + (e.end - e.start), (u64)256);
+        }
+        copy_count += count;
         total = offset;
-        uploads[upload_count++] = e.resource;
     }
-    if (!upload_count) {
+    u64 base = 0, staged_base = 0;
+    if (load_count && (!gpu_ring_alloc(scratch, total, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, &base) ||
+                       (staged_total && !gpu_ring_alloc(staging, staged_total, 256, &staged_base)))) {
+        for (u32 l = 0; l < load_count; l++) { // with the next submission
+            loads[l].entry->dirty = true;
+            InterlockedIncrement(&g_sync.dirty);
+        }
+        load_count = 0;
+    }
+    if (!load_count) {
         ReleaseSRWLockExclusive(&g_sync.lock);
         return copied;
     }
-
-    ID3D12Resource* buffer = nullptr;
-    D3D12_HEAP_PROPERTIES heap = {D3D12_HEAP_TYPE_UPLOAD};
-    D3D12_RESOURCE_DESC desc = {};
-    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    desc.Width = total;
-    desc.Height = 1;
-    desc.DepthOrArraySize = 1;
-    desc.MipLevels = 1;
-    desc.SampleDesc.Count = 1;
-    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    u8* mapped = nullptr;
-    HRESULT hr = gpu_device()->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
-                                                       D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-                                                       IID_PPV_ARGS(&buffer));
-    if (SUCCEEDED(hr)) {
-        gpu_set_name(buffer, "texture upload (%llu KiB)", total >> 10);
-        hr = buffer->Map(0, nullptr, (void**)&mapped);
-    }
-    if (FAILED(hr)) {
-        LOG_E("d3d12", "cannot create a %llu MiB texture upload buffer (0x%08lx)", total >> 20,
-              (unsigned long)hr);
-        if (buffer)
-            buffer->Release();
-        // Try again with the next submission.
-        for (u32 u = 0; u < upload_count; u++)
-            for (u32 i = lower_bound(uploads[u]->gpu_address); i < g_sync.count; i++)
-                if (g_sync.entries[i].resource == uploads[u] && !g_sync.entries[i].dirty) {
-                    g_sync.entries[i].dirty = true;
-                    InterlockedIncrement(&g_sync.dirty);
-                    break;
-                }
-        ReleaseSRWLockExclusive(&g_sync.lock);
-        return copied;
-    }
-
-    for (u32 u = 0; u < upload_count; u++) {
-        ConsoleResource* r = uploads[u];
-        u64 unused;
-        ID3D12Resource* texture = console_resource_desktop(r, &unused);
-        ConsoleTextureDesc t = layout_desc(r->desc);
-        ConsoleTextureLayout layout;
-        if (!texture || !console_texture_layout(t, &layout))
-            continue;
-        texture_barrier(list, texture, true);
-        u32 mips = r->desc.MipLevels ? r->desc.MipLevels : 1;
-        for (u32 k = 0; k < copy_counts[u]; k++) {
-            const SubresourceCopy& c = s_copies[u][k];
-            if (!console_copy_subresource(t, layout, 0, c.mip, c.slice, (void*)r->gpu_address,
-                                          mapped + c.offset, c.row_pitch, c.slice_pitch, false))
+    keep_source(sources, scratch->buffer);
+    if (staged_total) {
+        keep_source(sources, staging->buffer);
+        for (u32 l = 0; l < load_count; l++) {
+            Load& ld = loads[l];
+            if (ld.staged == NOT_STAGED)
                 continue;
-            D3D12_TEXTURE_COPY_LOCATION dst = {texture, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+            u64 size = ld.entry->end - ld.entry->start;
+            mem_prepare((const void*)ld.entry->start, size);
+            memcpy(staging->mapped + staged_base + ld.staged, (const void*)ld.entry->start, size);
+            ld.source = staging->address + staged_base + ld.staged;
+        }
+    }
+
+    // Detile everything into the ring, then copy it into the textures.
+    scratch_barrier(list, scratch->buffer, D3D12_BARRIER_SYNC_NONE, D3D12_BARRIER_ACCESS_NO_ACCESS,
+                    D3D12_BARRIER_SYNC_COMPUTE_SHADING, D3D12_BARRIER_ACCESS_UNORDERED_ACCESS);
+    for (u32 l = 0; l < load_count; l++) {
+        const Load& ld = loads[l];
+        for (u32 k = 0; k < ld.count; k++) {
+            const SubresourceCopy& c = s_copies[ld.first + k];
+            gpu_untile(list, ld.source, ld.entry->addressing[k], scratch->address + base + c.offset,
+                       (u32)c.row_pitch, (u32)c.slice_pitch);
+        }
+    }
+    scratch_barrier(list, scratch->buffer, D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+                    D3D12_BARRIER_ACCESS_UNORDERED_ACCESS, D3D12_BARRIER_SYNC_COPY,
+                    D3D12_BARRIER_ACCESS_COPY_SOURCE);
+    for (u32 l = 0; l < load_count; l++) {
+        const Load& ld = loads[l];
+        const D3D12_RESOURCE_DESC1& d = ld.entry->resource->desc;
+        u32 mips = d.MipLevels ? d.MipLevels : 1;
+        texture_barrier(list, ld.texture, true);
+        for (u32 k = 0; k < ld.count; k++) {
+            const SubresourceCopy& c = s_copies[ld.first + k];
+            D3D12_TEXTURE_COPY_LOCATION dst = {ld.texture, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
             dst.SubresourceIndex = c.mip + c.slice * mips;
-            D3D12_TEXTURE_COPY_LOCATION src = {buffer, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
-            src.PlacedFootprint.Offset = c.offset;
-            src.PlacedFootprint.Footprint = {format_desktop_resource(r->desc.Format), c.width, c.height,
-                                             c.depth, (UINT)c.row_pitch};
+            D3D12_TEXTURE_COPY_LOCATION src = {scratch->buffer, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+            src.PlacedFootprint.Offset = base + c.offset;
+            src.PlacedFootprint.Footprint = {format_desktop_resource(d.Format), c.width, c.height, c.depth,
+                                             (UINT)c.row_pitch};
             list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
         }
-        texture_barrier(list, texture, false);
+        texture_barrier(list, ld.texture, false);
     }
+    scratch_barrier(list, scratch->buffer, D3D12_BARRIER_SYNC_COPY, D3D12_BARRIER_ACCESS_COPY_SOURCE,
+                    D3D12_BARRIER_SYNC_NONE, D3D12_BARRIER_ACCESS_NO_ACCESS);
     ReleaseSRWLockExclusive(&g_sync.lock);
-    buffer->Unmap(0, nullptr);
-    sources->resources[sources->count++] = buffer; // room was left for it
     return true;
 }

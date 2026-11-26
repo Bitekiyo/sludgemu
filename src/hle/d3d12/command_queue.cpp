@@ -35,6 +35,8 @@ static void queue_destroy(void* object) {
         gpu_retire(queue->uploaders[i].list);
         gpu_retire(queue->uploaders[i].allocator);
     }
+    gpu_ring_release(&queue->scratch);
+    gpu_ring_release(&queue->staging);
 }
 
 // Texture contents waiting for upload from title memory go first, from a list of the queue's own.
@@ -62,11 +64,15 @@ static void upload_textures(ConsoleCommandQueue* self) {
         return;
     }
     TextureUploadSources sources;
-    bool recorded = texture_sync_record(w.list, &sources);
+    self->scratch.slot = self->staging.slot = self->slot;
+    self->staging.upload = true;
+    bool recorded = texture_sync_record(w.list, &sources, &self->scratch, &self->staging);
     if (SUCCEEDED(w.list->Close()) && recorded) {
         ID3D12CommandList* list = w.list;
         self->desktop->ExecuteCommandLists(1, &list);
         w.submission = gpu_queue_submitted(self->slot);
+        gpu_ring_submitted(&self->scratch, w.submission);
+        gpu_ring_submitted(&self->staging, w.submission);
         self->next_uploader = (self->next_uploader + 1) % QUEUE_UPLOADERS; // this one is in flight
     }
     ReleaseSRWLockExclusive(&self->writer_lock);

@@ -114,6 +114,10 @@ add_executable(sludgemu WIN32
     gpu/presenter.cpp
     gpu/gpu.h
     gpu/gpu.cpp
+    gpu/gpu_ring.h
+    gpu/gpu_ring.cpp
+    gpu/texture_untile.h
+    gpu/texture_untile.cpp
     gpu/gpu_window.h
     gpu/gpu_window.cpp
     gpu/shader_programs.h
@@ -154,6 +158,7 @@ function(sludge_shader target hlsl entry profile name)
 endfunction()
 sludge_shader(sludgemu gpu/shaders/present.hlsl vs_main vs_6_0 present_vs)
 sludge_shader(sludgemu gpu/shaders/present.hlsl ps_main ps_6_0 present_ps)
+sludge_shader(sludgemu gpu/shaders/untile.hlsl cs_main cs_6_0 untile_cs)
 target_include_directories(sludgemu PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 target_link_libraries(sludgemu PRIVATE sludge_shader agility sludge_options shell32 user32 synchronization delayimp
     dstorage libdeflate::libdeflate_static opus addrlib d3d12 dxgi dxc)
