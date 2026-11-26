@@ -6,15 +6,15 @@
 // Textures whose contents come from title memory.
 //
 // Console textures live in title memory; desktop textures are separate GPU resources. A texture the
-// GPU only reads (no render target, depth or unordered access use) gets its contents uploaded from
-// title memory, detiled from the console layout, whenever that memory gets new contents: when the
-// texture is created (titles create textures over data they loaded), when pages are mapped into it
-// (physical page mappings, GPU page mapping copies), and when the CPU writes it (glyph caches, video
-// frames). Uploading a texture write-protects its memory (see mem_watch_writes): the first write after
-// that marks it again, so the next submission uploads what the CPU wrote before it, as the console's
-// GPU would read it. Memory devices write (DirectStorage requests, see mem_expect_device_writes) isn't
-// uploaded while they write it; their finished writes mark it like CPU writes. Linear textures are
-// copied by the GPU straight from title memory.
+// GPU only reads (no render target, depth or unordered access use) gets its contents from title memory
+// whenever that memory gets new contents: when the texture is created (titles create textures over
+// data they loaded), when pages are mapped into it (physical page mappings, GPU page mapping copies),
+// when the CPU writes it (glyph caches, video frames), and when a device finishes writing it
+// (DirectStorage requests, see mem_expect_device_writes; memory being written waits for that). Loading
+// a texture arms a write watch on its memory (see mem_watch_writes): the first write after that marks
+// it again, so the next submission loads what the CPU wrote before it, as the console's GPU would read
+// it. Loading is GPU work at the start of a submission: the GPU detiles the texture from title memory
+// (see gpu_untile), or copies a linear one straight from it.
 //
 // On desktop such textures stay in the common layout: title barriers keep their synchronization but
 // change no layouts, so uploads can run between any two submissions.
