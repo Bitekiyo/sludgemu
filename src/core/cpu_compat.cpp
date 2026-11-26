@@ -1,5 +1,5 @@
 // Console CPU instructions on hosts without them: CLZERO, MONITORX, MWAITX and SSE4a's EXTRQ and
-// INSERTQ (all AMD only).
+// INSERTQ (all AMD only), and CLWB (also missing on older Intel CPUs).
 //
 // EXTRQ and INSERTQ extract or insert a bit field in the low 64 bits of an XMM register. Compilers
 // emit them for packing (half floats, for one). The handler carries out each one on the registers in
@@ -9,6 +9,13 @@
 // so callers always re-check what they wait for. A MONITORX becomes a no-op and an MWAITX a PAUSE:
 // an early return every time, which turns the wait into a polite spin. Those are patched in place
 // on first use, as the replacement is exact.
+//
+// CLWB writes a cache line back to memory without evicting it. Titles write buffers back line by line
+// before the GPU reads them, since the console's GPU doesn't snoop every CPU cache. Here the GPU sees
+// title memory coherently or through uploads that read it, so there is nothing to write back. A CLWB is
+// patched in place on first use, as the loops around it would trap once per line: its opcode byte
+// becomes 1F, which makes it NOP Ev with the same prefixes and operand. The length stays the same, and
+// a single byte can't be seen half written by another thread running the same code.
 //
 // CLZERO:
 //
@@ -60,6 +67,8 @@ static volatile LONG64 g_sse4a_traps = 0;
 static bool g_emulate_clzero = false;
 static bool g_emulate_sse4a = false;
 static bool g_patch_monitorx = false;
+static bool g_patch_clwb = false;
+static volatile long g_reported_clwb = 0;
 static SRWLOCK g_patch_lock = SRWLOCK_INIT;
 
 // Host CPUID: CLZERO is extended leaf 0x80000008 EBX bit 0, MONITORX/MWAITX leaf 0x80000001 ECX bit 29.
@@ -89,6 +98,16 @@ static bool host_has_monitorx() {
         return false;
     __cpuid(r, 0x80000001);
     return (r[2] & (1 << 29)) != 0;
+}
+
+// CLWB: leaf 7 subleaf 0 EBX bit 24.
+static bool host_has_clwb() {
+    int r[4];
+    __cpuid(r, 0);
+    if ((u32)r[0] < 7)
+        return false;
+    __cpuidex(r, 7, 0);
+    return (r[1] & (1 << 24)) != 0;
 }
 
 // Flags of a 64-bit add (r = a + b) or subtract/compare (r = a - b).
@@ -282,6 +301,49 @@ static LONG patch_wait_instruction(u8* ip) {
     return ok ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH; // resumes on the replacement
 }
 
+// The opcode byte of the CLWB at `ip`, or nullptr if there is none before `end`: AE, or 1F once patched.
+static u8* clwb_opcode(u8* ip, const u8* end) {
+    // Legacy prefixes (segment and address size overrides may come with it), then REX, then 0F AE.
+    bool operand_size = false;
+    u8* p = ip;
+    for (; p < end && p - ip < 14; p++) {
+        if (*p == 0x66)
+            operand_size = true;
+        else if (*p != 0x67 && *p != 0x26 && *p != 0x2e && *p != 0x36 && *p != 0x3e && *p != 0x64 &&
+                 *p != 0x65)
+            break;
+    }
+    if (p < end && (*p & 0xf0) == 0x40)
+        p++;
+    if (!operand_size || end - p < 3 || p[0] != 0x0f || (p[1] != 0xae && p[1] != 0x1f))
+        return nullptr;
+    u8 modrm = p[2];
+    if (modrm >> 6 == 3 || (modrm >> 3 & 7) != 6)
+        return nullptr; // other members of the group (CLFLUSHOPT is /7, TPAUSE a register form)
+    return p + 1;
+}
+
+// Turns the CLWB at `ip` into a NOP (or finds another thread already did); whether it's one now.
+static bool patch_clwb(u8* ip, const PeImage* image) {
+    AcquireSRWLockExclusive(&g_patch_lock);
+    u8* opcode = clwb_opcode(ip, image->base + image->size);
+    bool ok = opcode != nullptr;
+    if (opcode && *opcode == 0xae) {
+        DWORD old;
+        ok = VirtualProtect(opcode, 1, PAGE_EXECUTE_READWRITE, &old) != 0;
+        if (ok) {
+            *(volatile u8*)opcode = 0x1f;
+            VirtualProtect(opcode, 1, old, &old);
+            FlushInstructionCache(GetCurrentProcess(), opcode, 1);
+            if (!InterlockedExchange(&g_reported_clwb, 1))
+                LOG_I("cpu", "host CPU lacks CLWB: patching it to NOP, first at %s+0x%x", image->name,
+                      image->rva_of(ip));
+        }
+    }
+    ReleaseSRWLockExclusive(&g_patch_lock);
+    return ok;
+}
+
 static LONG CALLBACK compat_handler(EXCEPTION_POINTERS* ep) {
     if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_ILLEGAL_INSTRUCTION)
         return EXCEPTION_CONTINUE_SEARCH;
@@ -308,6 +370,8 @@ static LONG CALLBACK compat_handler(EXCEPTION_POINTERS* ep) {
                   image->rva_of(ip));
         return run_clzero_loop(ep, image);
     }
+    if (g_patch_clwb && patch_clwb(ip, image))
+        return EXCEPTION_CONTINUE_EXECUTION; // resumes on the NOP
     if (g_patch_monitorx)
         return patch_wait_instruction(ip);
     return EXCEPTION_CONTINUE_SEARCH;
@@ -317,10 +381,12 @@ void cpu_compat_init() {
     g_emulate_clzero = !host_has_clzero();
     g_patch_monitorx = !host_has_monitorx();
     g_emulate_sse4a = !host_has_sse4a();
-    if (!g_emulate_clzero && !g_patch_monitorx && !g_emulate_sse4a)
+    g_patch_clwb = !host_has_clwb();
+    if (!g_emulate_clzero && !g_patch_monitorx && !g_emulate_sse4a && !g_patch_clwb)
         return;
-    LOG_I("cpu", "host CPU lacks%s%s%s; handling them for console code", g_emulate_clzero ? " CLZERO" : "",
-          g_patch_monitorx ? " MONITORX/MWAITX" : "", g_emulate_sse4a ? " SSE4a" : "");
+    LOG_I("cpu", "host CPU lacks%s%s%s%s; handling them for console code", g_emulate_clzero ? " CLZERO" : "",
+          g_patch_monitorx ? " MONITORX/MWAITX" : "", g_emulate_sse4a ? " SSE4a" : "",
+          g_patch_clwb ? " CLWB" : "");
     if (!AddVectoredExceptionHandler(1, compat_handler))
         LOG_E("cpu", "could not install the CPU compatibility handler");
 }
