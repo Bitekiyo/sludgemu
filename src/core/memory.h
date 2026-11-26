@@ -164,6 +164,37 @@ void mem_watch_writes(const void* base, u64 size);
 // Ends the watches overlapping [base, base + size), reporting them.
 void mem_end_write_watches(const void* base, u64 size);
 
+// Device writes: title memory that something other than the CPU writes (DirectStorage requests),
+// finishing when `done` is signaled. Until then mem_device_writes_pending reports the memory; once
+// mem_poll_device_writes finds `done` signaled (and closes it), the spans are reported to the write
+// listener like CPU writes. Spans are title addresses.
+struct MemSpan {
+    u64 base;
+    u64 size;
+};
+void mem_expect_device_writes(void* done, const MemSpan* spans, u32 count);
+// Whether device writes into [base, base + size) haven't finished. Doesn't report finished ones.
+bool mem_device_writes_pending(u64 base, u64 size);
+// Whether device writes are outstanding at all; cheap.
+bool mem_device_writes_outstanding();
+// Reports the device writes that finished.
+void mem_poll_device_writes();
+
+// The title addresses showing the page frame with page number `pfn`: up to `max` of them in `vas`,
+// returning how many there are.
+u32 mem_frame_addresses(u64 pfn, u64* vas, u32 max);
+
+// Store traps: every CPU store into [base, base + size) of tracked title memory is reported to the
+// store listener right after it completes, for values something else waits on (GPU work waiting for a
+// counter the CPU writes). The pages stay read-only: a store faults, runs alone with its page writable
+// (single-stepped), and the page is protected again before the report. Stores to the same pages
+// outside the range are reported too (the listener checks the values); stores through other
+// addresses showing the frames, through our views and by the kernel aren't seen. Traps last until the
+// range is released.
+typedef void (*MemStoreListener)(u64 base, u64 size); // called on the storing thread, no locks held
+void mem_set_store_listener(MemStoreListener listener);
+void mem_trap_stores(const void* base, u64 size);
+
 // Changes the host protection used for future mappings in the range containing `addr`.
 void mem_set_range_protect(const void* addr, u32 protect);
 bool mem_is_tracked(const void* addr);

@@ -4,6 +4,7 @@
 #include <stdlib.h>
 
 #include "common/log.h"
+#include "common/thread_slot.h"
 
 // One region of a placeholder range: a placeholder, or a view of consecutive real frames.
 struct MemRegion {
@@ -99,6 +100,7 @@ struct MemoryState {
 static MemoryState g_mem;
 
 static LONG CALLBACK on_access_fault(EXCEPTION_POINTERS* ep);
+static void traps_init();
 
 static inline bool bit_get(const u64* bm, u64 i) {
     return (bm[i >> 6] >> (i & 63)) & 1;
@@ -168,6 +170,8 @@ bool mem_init(u64 physical_bytes) {
 
     g_mem.gpu_lowest = GiB(2);
     g_mem.gpu_highest = (1ull << 40) - 1;
+
+    traps_init();
 
     // First in line: faults on pending pages are ours, not crashes.
     if (!AddVectoredExceptionHandler(1, on_access_fault)) {
@@ -297,7 +301,8 @@ static u32 bind_frame(u32 id, u32 preferred) {
 // phys_lock held (shared is enough).
 static u32 frame_of_locked(u64 pfn) {
     u64 id = pfn >> MEM_PAGE_NUMBER_SHIFT;
-    if ((pfn & ((1u << MEM_PAGE_NUMBER_SHIFT) - 1)) || id >= g_mem.total_pages ||
+    // Frame 0 is reserved (see mem_init): page number 0 names no frame.
+    if ((pfn & ((1u << MEM_PAGE_NUMBER_SHIFT) - 1)) || id == 0 || id >= g_mem.total_pages ||
         !bit_get(g_mem.id_bitmap, id))
         return MEM_INVALID_PFN;
     return (u32)id;
@@ -455,6 +460,146 @@ void mem_set_write_listener(MemWriteListener listener) {
     g_watches.listener = listener;
 }
 
+// Device writes (see mem_expect_device_writes): groups in the order they were expected.
+struct DeviceWrites {
+    HANDLE done;
+    MemSpan* spans;
+    u32 count;
+    u64 lo, hi; // bounds of the spans
+};
+
+static struct {
+    DeviceWrites* groups;
+    u32 count;
+    u32 capacity;
+    SRWLOCK lock;
+} g_device = {nullptr, 0, 0, SRWLOCK_INIT};
+
+void mem_expect_device_writes(void* done, const MemSpan* spans, u32 count) {
+    DeviceWrites g = {done, (MemSpan*)malloc((usize)count * sizeof(MemSpan)), count, UINT64_MAX, 0};
+    if (!g.spans)
+        FATAL("out of memory for device writes");
+    memcpy(g.spans, spans, (usize)count * sizeof(MemSpan));
+    for (u32 i = 0; i < count; i++) {
+        g.lo = spans[i].base < g.lo ? spans[i].base : g.lo;
+        g.hi = spans[i].base + spans[i].size > g.hi ? spans[i].base + spans[i].size : g.hi;
+    }
+    AcquireSRWLockExclusive(&g_device.lock);
+    if (g_device.count == g_device.capacity) {
+        u32 capacity = g_device.capacity ? g_device.capacity * 2 : 64;
+        DeviceWrites* grown = (DeviceWrites*)realloc(g_device.groups, capacity * sizeof(DeviceWrites));
+        if (!grown)
+            FATAL("out of memory for device writes");
+        g_device.groups = grown;
+        g_device.capacity = capacity;
+    }
+    g_device.groups[g_device.count++] = g;
+    ReleaseSRWLockExclusive(&g_device.lock);
+}
+
+bool mem_device_writes_outstanding() {
+    return *(volatile u32*)&g_device.count != 0;
+}
+
+bool mem_device_writes_pending(u64 base, u64 size) {
+    u64 end = base + size;
+    bool pending = false;
+    AcquireSRWLockShared(&g_device.lock);
+    for (u32 i = 0; i < g_device.count && !pending; i++) {
+        const DeviceWrites& g = g_device.groups[i];
+        if (g.lo >= end || g.hi <= base)
+            continue;
+        for (u32 k = 0; k < g.count && !pending; k++)
+            pending = g.spans[k].base < end && g.spans[k].base + g.spans[k].size > base;
+    }
+    ReleaseSRWLockShared(&g_device.lock);
+    return pending;
+}
+
+void mem_poll_device_writes() {
+    if (!mem_device_writes_outstanding())
+        return;
+    for (;;) {
+        // One finished group at a time, reported without the lock held.
+        DeviceWrites finished = {};
+        AcquireSRWLockExclusive(&g_device.lock);
+        for (u32 i = 0; i < g_device.count; i++) {
+            if (WaitForSingleObject(g_device.groups[i].done, 0) != WAIT_OBJECT_0)
+                continue;
+            finished = g_device.groups[i];
+            memmove(&g_device.groups[i], &g_device.groups[i + 1],
+                    (g_device.count - i - 1) * sizeof(DeviceWrites));
+            g_device.count--;
+            break;
+        }
+        ReleaseSRWLockExclusive(&g_device.lock);
+        if (!finished.done)
+            return;
+        CloseHandle(finished.done);
+        for (u32 k = 0; k < finished.count && g_watches.listener; k++)
+            g_watches.listener(finished.spans[k].base, finished.spans[k].size);
+        free(finished.spans);
+    }
+}
+
+// Store traps (see mem_trap_stores). Lock order: watches, then traps.
+struct StoreTrap {
+    u64 start;
+    u64 end;
+};
+
+static struct {
+    StoreTrap* entries;
+    u32 count;
+    u32 capacity;
+    SRWLOCK lock;
+    MemStoreListener listener;
+} g_traps = {nullptr, 0, 0, SRWLOCK_INIT, nullptr};
+
+// The trapped pages the current thread's store runs on with write access (a store can straddle two),
+// and the store's address: a repeated string store steps until it is done.
+static ThreadSlot g_trap_page[2];
+static ThreadSlot g_trap_ip;
+
+#define TRAP_FLAG 0x100u // EFLAGS.TF: single-step
+
+static void traps_init() {
+    g_trap_page[0].init();
+    g_trap_page[1].init();
+    g_trap_ip.init();
+}
+
+void mem_set_store_listener(MemStoreListener listener) {
+    g_traps.listener = listener;
+}
+
+// Whether a trap covers some of the host page at `page`. Trap lock held.
+static bool page_trapped_locked(u64 page) {
+    for (u32 i = 0; i < g_traps.count; i++)
+        if (g_traps.entries[i].start < page + HOST_PAGE_SIZE && g_traps.entries[i].end > page)
+            return true;
+    return false;
+}
+
+static void reprotect(u64 start, u64 end, u32 from, u32 to);
+
+// Trapped pages in [start, end) become read-only again: views, commits and ended watches leave pages
+// writable.
+static void reapply_traps(u64 start, u64 end) {
+    if (!g_traps.count)
+        return;
+    AcquireSRWLockShared(&g_traps.lock);
+    for (u32 i = 0; i < g_traps.count; i++) {
+        u64 lo = g_traps.entries[i].start & ~(u64)(HOST_PAGE_SIZE - 1);
+        u64 hi = ALIGN_UP(g_traps.entries[i].end, (u64)HOST_PAGE_SIZE);
+        lo = lo > start ? lo : start;
+        hi = hi < end ? hi : end;
+        if (lo < hi)
+            reprotect(lo, hi, PAGE_READWRITE, PAGE_READONLY);
+    }
+    ReleaseSRWLockShared(&g_traps.lock);
+}
+
 static u32 watch_lower_bound(u64 start) {
     u32 lo = 0, hi = g_watches.count;
     while (lo < hi) {
@@ -492,6 +637,7 @@ static void reprotect(u64 start, u64 end, u32 from, u32 to) {
 // Views and commits land with their range's protection: watched pages among them become read-only
 // again. Range lock held.
 static void reapply_watches(u64 start, u64 end) {
+    reapply_traps(start, end);
     if (!g_watches.count)
         return;
     AcquireSRWLockShared(&g_watches.lock);
@@ -859,8 +1005,10 @@ static u32 end_watches_locked(u64 lo, u64 hi, WatchReport* reports) {
             }
         }
     }
-    if (any)
+    if (any) {
         reprotect(ended_lo, ended_hi, PAGE_READONLY, PAGE_READWRITE);
+        reapply_traps(ended_lo, ended_hi);
+    }
     return report_count;
 }
 
@@ -895,6 +1043,130 @@ static bool end_watch_on_write(u64 addr) {
         return access_allowed((const void*)addr, 1);
     report_writes(reports, count);
     return true;
+}
+
+void mem_trap_stores(const void* base, u64 size) {
+    u64 start = (u64)base, end = start + size;
+    if (!size)
+        return;
+    AcquireSRWLockShared(&g_mem.range_lock);
+    RangeSlot* s = find_range_locked(base);
+    if (!s || (const u8*)end > s->info.base + s->info.size) {
+        ReleaseSRWLockShared(&g_mem.range_lock);
+        LOG_W("memory", "store trap at %p (+0x%llx) outside title memory; stores there aren't seen", base,
+              size);
+        return;
+    }
+    AcquireSRWLockExclusive(&g_traps.lock);
+    bool known = false;
+    for (u32 i = 0; i < g_traps.count && !known; i++)
+        known = g_traps.entries[i].start == start && g_traps.entries[i].end == end;
+    if (!known) {
+        if (g_traps.count == g_traps.capacity) {
+            u32 capacity = g_traps.capacity ? g_traps.capacity * 2 : 64;
+            StoreTrap* grown = (StoreTrap*)realloc(g_traps.entries, capacity * sizeof(StoreTrap));
+            if (!grown)
+                FATAL("out of memory for store traps");
+            g_traps.entries = grown;
+            g_traps.capacity = capacity;
+        }
+        g_traps.entries[g_traps.count++] = {start, end};
+    }
+    // Listed first: a store racing with this finds the trap once the lock is free.
+    reprotect(start & ~(u64)(HOST_PAGE_SIZE - 1), ALIGN_UP(end, (u64)HOST_PAGE_SIZE), PAGE_READWRITE,
+              PAGE_READONLY);
+    ReleaseSRWLockExclusive(&g_traps.lock);
+    ReleaseSRWLockShared(&g_mem.range_lock);
+}
+
+// Drops the traps in [start, end) (the range is being released).
+static void drop_traps(u64 start, u64 end) {
+    AcquireSRWLockExclusive(&g_traps.lock);
+    for (u32 i = 0; i < g_traps.count;) {
+        if (g_traps.entries[i].start >= start && g_traps.entries[i].end <= end)
+            g_traps.entries[i] = g_traps.entries[--g_traps.count];
+        else
+            i++;
+    }
+    ReleaseSRWLockExclusive(&g_traps.lock);
+}
+
+// A write fault on a trapped page: the page becomes writable and the storing instruction runs alone
+// (single-stepped); finish_trapped_store protects the page again and reports. A store faulting again
+// while it steps (another thread protected the page in between) just gets the page back.
+static bool trap_store(EXCEPTION_POINTERS* ep, u64 addr) {
+    if (!g_traps.count)
+        return false;
+    u64 page = addr & ~(u64)(HOST_PAGE_SIZE - 1);
+    AcquireSRWLockShared(&g_traps.lock);
+    bool trapped = page_trapped_locked(page);
+    ReleaseSRWLockShared(&g_traps.lock);
+    if (!trapped)
+        return false;
+    u64 first = g_trap_page[0].get();
+    if (first && first != page && g_trap_page[1].get() && g_trap_page[1].get() != page) {
+        LOG_E("memory", "a store at %p reaches a third trapped page", (void*)ep->ContextRecord->Rip);
+        return false;
+    }
+    DWORD old;
+    if (!VirtualProtect((void*)page, HOST_PAGE_SIZE, PAGE_READWRITE, &old))
+        return false;
+    if (!first) {
+        g_trap_page[0].set(page);
+        g_trap_ip.set(ep->ContextRecord->Rip);
+    } else if (first != page) {
+        g_trap_page[1].set(page);
+    }
+    ep->ContextRecord->EFlags |= TRAP_FLAG;
+    return true;
+}
+
+// The single step after a trapped store: its pages are protected again, before the report, so a store
+// the report doesn't see faults.
+static bool finish_trapped_store(EXCEPTION_POINTERS* ep) {
+    u64 pages[2] = {g_trap_page[0].get(), g_trap_page[1].get()};
+    if (!pages[0])
+        return false;
+    if (ep->ContextRecord->Rip == g_trap_ip.get()) { // a repeated string store isn't done yet
+        ep->ContextRecord->EFlags |= TRAP_FLAG;
+        return true;
+    }
+    ep->ContextRecord->EFlags &= ~TRAP_FLAG;
+    g_trap_page[0].set(0);
+    g_trap_page[1].set(0);
+    StoreTrap reports[MAX_WATCH_REPORTS];
+    u32 report_count = 0;
+    AcquireSRWLockShared(&g_traps.lock);
+    for (u32 k = 0; k < 2 && pages[k]; k++) {
+        reprotect(pages[k], pages[k] + HOST_PAGE_SIZE, PAGE_READWRITE, PAGE_READONLY);
+        for (u32 i = 0; i < g_traps.count && report_count < MAX_WATCH_REPORTS; i++)
+            if (g_traps.entries[i].start < pages[k] + HOST_PAGE_SIZE && g_traps.entries[i].end > pages[k])
+                reports[report_count++] = g_traps.entries[i];
+    }
+    ReleaseSRWLockShared(&g_traps.lock);
+    for (u32 i = 0; i < report_count && g_traps.listener; i++)
+        g_traps.listener(reports[i].start, reports[i].end - reports[i].start);
+    return true;
+}
+
+u32 mem_frame_addresses(u64 pfn, u64* vas, u32 max) {
+    u32 n = 0;
+    AcquireSRWLockShared(&g_mem.phys_lock);
+    u32 id = frame_of_locked(pfn);
+    if (id != MEM_INVALID_PFN && g_mem.frame_va[id]) {
+        if (n < max)
+            vas[n] = g_mem.frame_va[id];
+        n++;
+        for (u32 a = alias_lower_bound(id); a < g_mem.alias_count && g_mem.aliases[a].id == id; a++) {
+            if (g_mem.aliases[a].va == g_mem.frame_va[id])
+                continue;
+            if (n < max)
+                vas[n] = g_mem.aliases[a].va;
+            n++;
+        }
+    }
+    ReleaseSRWLockShared(&g_mem.phys_lock);
+    return n;
 }
 
 bool mem_frames_at(const void* va, u64 count, u64* pfns) {
@@ -1292,10 +1564,14 @@ static bool access_allowed(const void* addr, ULONG_PTR access) {
 // the access is retried if the page is there now.
 static LONG CALLBACK on_access_fault(EXCEPTION_POINTERS* ep) {
     const EXCEPTION_RECORD* e = ep->ExceptionRecord;
+    if (e->ExceptionCode == EXCEPTION_SINGLE_STEP)
+        return finish_trapped_store(ep) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
     if (e->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || e->NumberParameters < 2)
         return EXCEPTION_CONTINUE_SEARCH;
     const u8* addr = (const u8*)e->ExceptionInformation[1];
     if (e->ExceptionInformation[0] == 1 && end_watch_on_write((u64)addr))
+        return EXCEPTION_CONTINUE_EXECUTION;
+    if (e->ExceptionInformation[0] == 1 && trap_store(ep, (u64)addr))
         return EXCEPTION_CONTINUE_EXECUTION;
     AcquireSRWLockExclusive(&g_mem.range_lock);
     RangeSlot* s = find_range_locked(addr);
@@ -1424,6 +1700,7 @@ bool mem_release(void* base) {
         ReleaseSRWLockExclusive(&g_mem.range_lock);
         return false;
     }
+    drop_traps((u64)s->info.base, (u64)s->info.base + s->info.size);
     if (s->info.flags & MEM_RANGE_PLACEHOLDER) {
         AcquireSRWLockShared(&g_mem.phys_lock);
         for (u32 p = 0; p < range_pages(s); p++) {

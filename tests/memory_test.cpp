@@ -2,6 +2,7 @@
 // sludgemu_tests.exe (exit code = failures).
 
 #include <windows.h>
+#include <intrin.h>
 #include <stdio.h>
 
 #include "common/log.h"
@@ -469,6 +470,127 @@ static void test_write_watches() {
     mem_set_write_listener(nullptr);
 }
 
+static u32 g_store_reports = 0;
+static u64 g_store_base = 0, g_store_value = 0;
+
+static void on_store(u64 base, u64) {
+    g_store_reports++;
+    g_store_base = base;
+    g_store_value = *(volatile u64*)base; // the store is done when it is reported
+}
+
+struct StoreThread {
+    volatile u64* counter;
+    u32 stores;
+};
+
+static DWORD WINAPI store_thread(void* p) {
+    StoreThread* t = (StoreThread*)p;
+    for (u32 i = 1; i <= t->stores; i++)
+        *t->counter = 1000 + i;
+    return 0;
+}
+
+// Store traps: every store into the trapped bytes is reported after it is done, also on pages a watch
+// shares, by stores straddling two trapped pages and by repeated string stores; the pages stay
+// protected throughout, also while another thread stores.
+static void test_store_traps() {
+    mem_set_store_listener(on_store);
+    mem_set_write_listener(on_write);
+    MemAddressLimits limits = {};
+    u8* gpu = (u8*)mem_alloc_virtual(nullptr, MiB(16), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE, limits,
+                                     MEM_RANGE_GPU, 0);
+    CHECK(gpu != nullptr);
+    if (!gpu)
+        return;
+    volatile u64* counter = (volatile u64*)(gpu + 0x1000);
+    *counter = 1;
+    mem_trap_stores((const void*)counter, sizeof(u64));
+    CHECK(!page_writable((const void*)counter));
+    CHECK(*counter == 1 && g_store_reports == 0); // reads pass
+    *counter = 2;
+    CHECK(g_store_reports == 1 && g_store_base == (u64)counter && g_store_value == 2);
+    CHECK(!page_writable((const void*)counter));
+    *counter = 3;
+    CHECK(g_store_reports == 2 && g_store_value == 3 && *counter == 3);
+    gpu[0x1800] = 7; // elsewhere on the page: reported too, the listener checks the values
+    CHECK(g_store_reports == 3 && gpu[0x1800] == 7);
+
+    // A watch on the same page ends at the first write; the trap stays.
+    g_write_reports = 0;
+    mem_watch_writes(gpu + 0x1100, 0x100);
+    *counter = 4;
+    CHECK(g_write_reports == 1 && g_store_reports == 4 && g_store_value == 4);
+    CHECK(!page_writable((const void*)counter));
+
+    // A store straddling two trapped pages, and a repeated string store over a trapped page.
+    volatile u64* next = (volatile u64*)(gpu + 0x2000);
+    mem_trap_stores((const void*)next, sizeof(u64));
+    g_store_reports = 0;
+    *(volatile u64*)(gpu + 0x1FFC) = 0x1122334455667788ull;
+    CHECK(g_store_reports >= 2 && *next == 0x11223344u);
+    CHECK(!page_writable(gpu + 0x1000) && !page_writable(gpu + 0x2000));
+    g_store_reports = 0;
+    __stosb(gpu + 0x1F00, 0xAB, 0x200);
+    CHECK(g_store_reports >= 1 && gpu[0x1F00] == 0xAB && gpu[0x20FF] == 0xAB && gpu[0x2100] == 0);
+    CHECK(!page_writable(gpu + 0x1000) && !page_writable(gpu + 0x2000));
+
+    // Another thread storing while this one does: every store lands, the pages end up protected.
+    StoreThread t = {next, 2000};
+    HANDLE thread = CreateThread(nullptr, 0, store_thread, &t, 0, nullptr);
+    for (u32 i = 1; i <= 2000; i++)
+        *counter = i;
+    WaitForSingleObject(thread, INFINITE);
+    CloseHandle(thread);
+    CHECK(*counter == 2000 && *next == 3000);
+    CHECK(!page_writable(gpu + 0x1000) && !page_writable(gpu + 0x2000));
+
+    // Page number 0 names no frame.
+    CHECK(mem_physical_ptr(0) == nullptr);
+
+    CHECK(mem_release(gpu));
+    mem_set_store_listener(nullptr);
+    mem_set_write_listener(nullptr);
+}
+
+// Device writes: pending until their event is set, then reported like CPU writes; and the addresses
+// showing a frame, for writes through page numbers.
+static void test_device_writes() {
+    mem_set_write_listener(on_write);
+    g_write_reports = 0;
+    HANDLE done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    MemSpan spans[2] = {{0x10000, 0x1000}, {0x50000, 0x2000}};
+    mem_expect_device_writes(done, spans, 2);
+    CHECK(mem_device_writes_outstanding());
+    CHECK(mem_device_writes_pending(0x10800, 0x10) && mem_device_writes_pending(0x4F000, 0x1001));
+    CHECK(!mem_device_writes_pending(0x20000, 0x1000) && !mem_device_writes_pending(0x4F000, 0x1000));
+    mem_poll_device_writes();
+    CHECK(g_write_reports == 0);
+    SetEvent(done);
+    mem_poll_device_writes();
+    CHECK(g_write_reports == 2 && g_write_base == 0x50000 && g_write_size == 0x2000);
+    CHECK(!mem_device_writes_outstanding() && !mem_device_writes_pending(0x10800, 0x10));
+
+    MemAddressLimits limits = {};
+    u8* a = (u8*)mem_reserve_placeholder(2 * PAGE, limits, 0, PAGE_READWRITE, 0);
+    u8* b = (u8*)mem_reserve_placeholder(2 * PAGE, limits, 0, PAGE_READWRITE, 0);
+    u64 frame = 0;
+    CHECK(a && b && mem_physical_alloc(1, &frame));
+    if (a && b) {
+        u64 vas[4];
+        CHECK(mem_frame_addresses(frame, vas, 4) == 0); // not mapped anywhere yet
+        CHECK(mem_map_physical(a + PAGE, 1, &frame) && mem_map_physical(b, 1, &frame));
+        u32 n = mem_frame_addresses(frame, vas, 4);
+        CHECK(n == 2 && ((vas[0] == (u64)a + PAGE && vas[1] == (u64)b) ||
+                         (vas[1] == (u64)a + PAGE && vas[0] == (u64)b)));
+        CHECK(mem_frame_addresses(frame, vas, 1) == 2); // how many there are, even if fewer fit
+        CHECK(mem_release(a) && mem_release(b));
+        CHECK(mem_frame_addresses(frame, vas, 4) == 0);
+        mem_physical_free(1, &frame);
+    }
+    mem_set_write_listener(nullptr);
+}
+
 void test_xapu_decode();
 void test_xapu_convert();
 void test_xdsp();
@@ -490,6 +612,8 @@ int main() {
     test_lazy_commit();
     test_gpu_section_ranges();
     test_write_watches();
+    test_store_traps();
+    test_device_writes();
     test_xapu_decode();
     test_xapu_convert();
     test_xdsp();
