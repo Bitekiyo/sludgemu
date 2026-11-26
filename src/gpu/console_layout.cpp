@@ -484,6 +484,218 @@ u64 console_texel_offset(const ConsoleTextureDesc& d, const ConsoleTextureLayout
     return p.base_offset + out.addr;
 }
 
+// --- addressing for shaders --------------------------------------------------------------------------
+
+static u32 log2_exact(u32 v) {
+    u32 n = 0;
+    while ((1u << n) < v)
+        n++;
+    return (1u << n) == v ? n : 0xFF;
+}
+
+static u32 pattern(const u16* bits, u32 count, u32 v) {
+    u32 r = 0;
+    for (u32 bit = 0; bit < count && (v >> bit); bit++)
+        r ^= (v >> bit & 1) ? bits[bit] : 0;
+    return r;
+}
+
+u64 console_subresource_offset(const ConsoleSubresourceAddressing& a, u32 x, u32 y, u32 z) {
+    if (a.linear)
+        return a.base + (u64)z * a.slice_pitch + (u64)y * a.pitch + (u64)x * a.bytes_per_element;
+    u64 block = (u64)(y >> a.block_shift[1]) * a.row_blocks + (x >> a.block_shift[0]);
+    u32 in_block = pattern(a.bits_x, 14, x + a.tail[0]) ^ pattern(a.bits_y, 14, y + a.tail[1]) ^
+                   pattern(a.bits_z, 12, z + a.tail[2]) ^ a.block_xor;
+    return a.base + (u64)(z >> a.block_shift[2]) * a.slice_stride + (block << a.block_bytes_shift) + in_block;
+}
+
+// The block of a swizzled plane, in elements.
+static bool swizzle_block(const ConsoleTextureDesc& d, const ConsolePlaneLayout& p, u32* bw, u32* bh,
+                          u32* bd) {
+    FormatInfo info = format_info(d.format);
+    bool stencil = p.usage == CONSOLE_PLANE_STENCIL;
+    ADDR2_COMPUTE_SURFACE_INFO_INPUT in = {};
+    ADDR2_COMPUTE_SURFACE_INFO_OUTPUT out = {};
+    in.size = sizeof(in);
+    out.size = sizeof(out);
+    in.flags = surface_flags(d, info, stencil);
+    in.swizzleMode = (AddrSwizzleMode)p.mips[0].swizzle_mode;
+    in.resourceType = resource_type(d.dimension);
+    in.format = stencil ? ADDR_FMT_8 : addr_format(d.format, info);
+    in.bpp = p.bytes_per_element * 8;
+    in.width = (u32)d.width;
+    in.height = d.height;
+    in.numSlices = d.depth_or_array_size;
+    in.numMipLevels = mip_count(d);
+    in.numSamples = 1;
+    in.numFrags = 1;
+    if (Addr2ComputeSurfaceInfo(g_addrlib, &in, &out) != ADDR_OK)
+        return false;
+    *bw = out.blockWidth;
+    *bh = out.blockHeight;
+    *bd = d.dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? out.blockSlices : 1;
+    return true;
+}
+
+// Swizzle patterns depend only on the resource type, the swizzle mode and the element size: they are
+// measured once each, on a texture large enough to have every coordinate bit, by placing elements
+// with one coordinate bit set and taking away the block's own offset.
+struct SwizzlePattern {
+    u32 dimension, mode, bytes_per_element, flags;
+    bool valid;
+    u16 bits_x[14], bits_y[14], bits_z[12];
+};
+
+#define MAX_PATTERNS 64
+static SwizzlePattern g_patterns[MAX_PATTERNS];
+static u32 g_pattern_count;
+static SRWLOCK g_pattern_lock = SRWLOCK_INIT;
+
+static bool measure_pattern(const ConsoleTextureDesc& d, const ConsolePlaneLayout& p, u32 plane,
+                            SwizzlePattern* out) {
+    FormatInfo info = format_info(d.format);
+    bool volume = d.dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    u32 bw, bh, bd;
+    if (!swizzle_block(d, p, &bw, &bh, &bd))
+        return false;
+    u32 bytes_shift = log2_exact(bw * bh * bd * p.bytes_per_element);
+    // As large as textures get: 16384 elements square with 2048 array slices, volumes 2048 cubed.
+    u32 dim_shift = volume ? 11 : 14;
+    ConsoleTextureDesc probe = d;
+    probe.width = (1ull << dim_shift) * info.block_width;
+    probe.height = (1u << dim_shift) * info.block_height;
+    probe.depth_or_array_size = 1u << 11;
+    probe.mip_levels = 1;
+    ConsoleTextureLayout layout;
+    if (!console_texture_layout(probe, &layout))
+        return false;
+    const ConsolePlaneLayout& pp = layout.planes[plane];
+    u32 row_blocks = pp.mips[0].padded_width / bw;
+    u64 slice_size = pp.slice_size; // a slice (2D) or a block slice (volume) of the whole texture
+    u16* bits[3] = {out->bits_x, out->bits_y, out->bits_z};
+    u32 counts[3] = {14, 14, 12};
+    for (u32 k = 0; k < 3; k++) {
+        for (u32 bit = 0; bit < counts[k]; bit++) {
+            u32 c[3] = {0, 0, 0};
+            c[k] = 1u << bit;
+            if (bit >= (k == 2 ? 11u : dim_shift)) { // beyond any texture
+                bits[k][bit] = 0;
+                continue;
+            }
+            u64 at = console_texel_offset(probe, layout, plane, 0, c[0], c[1], c[2], 0, nullptr);
+            u64 own = (((u64)(c[1] / bh) * row_blocks + c[0] / bw) << bytes_shift) +
+                      (volume ? (u64)(c[2] / bd) * slice_size : (u64)c[2] * slice_size);
+            if (at == ~0ull || at < own || ((at - own) >> bytes_shift))
+                return false;
+            bits[k][bit] = (u16)(at - own);
+        }
+    }
+    return true;
+}
+
+static const SwizzlePattern* swizzle_pattern(const ConsoleTextureDesc& d, const ConsolePlaneLayout& p,
+                                             u32 plane) {
+    u32 mode = p.mips[0].swizzle_mode;
+    // The flags decide only which modes are allowed, not the patterns; the render target flag is kept
+    // for formats that need it to take render target modes.
+    u32 flags = d.flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    AcquireSRWLockShared(&g_pattern_lock);
+    for (u32 i = 0; i < g_pattern_count; i++) {
+        const SwizzlePattern& sp = g_patterns[i];
+        if (sp.dimension == d.dimension && sp.mode == mode && sp.bytes_per_element == p.bytes_per_element &&
+            sp.flags == flags) {
+            ReleaseSRWLockShared(&g_pattern_lock);
+            return sp.valid ? &sp : nullptr;
+        }
+    }
+    ReleaseSRWLockShared(&g_pattern_lock);
+    SwizzlePattern sp = {d.dimension, mode, p.bytes_per_element, flags};
+    sp.valid = measure_pattern(d, p, plane, &sp);
+    AcquireSRWLockExclusive(&g_pattern_lock);
+    const SwizzlePattern* result = nullptr;
+    if (g_pattern_count < MAX_PATTERNS) {
+        g_patterns[g_pattern_count] = sp;
+        result = sp.valid ? &g_patterns[g_pattern_count] : nullptr;
+        g_pattern_count++;
+    }
+    ReleaseSRWLockExclusive(&g_pattern_lock);
+    return result;
+}
+
+bool console_subresource_addressing(const ConsoleTextureDesc& d, const ConsoleTextureLayout& layout,
+                                    u32 plane, u32 mip, u32 slice, ConsoleSubresourceAddressing* out) {
+    memset(out, 0, sizeof(*out));
+    if (plane >= layout.plane_count || mip >= layout.mip_levels || d.sample_count > 1)
+        return false;
+    const ConsolePlaneLayout& p = layout.planes[plane];
+    const ConsoleMipLayout& m = p.mips[mip];
+    bool volume = d.dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    if (!p.bytes_per_element || log2_exact(p.bytes_per_element) > 4 ||
+        (!volume && slice >= d.depth_or_array_size))
+        return false;
+    out->bytes_per_element = p.bytes_per_element;
+    out->width = m.width;
+    out->height = m.height;
+    out->depth = volume ? m.depth_or_array_size : 1;
+    u64 origin = console_texel_offset(d, layout, plane, mip, 0, 0, volume ? 0 : slice, 0, nullptr);
+    if (origin == ~0ull)
+        return false;
+    if (m.swizzle_mode == ADDR_SW_LINEAR) {
+        out->linear = true;
+        out->base = origin;
+        out->pitch = m.pitch_bytes;
+        if (volume && out->depth > 1)
+            out->slice_pitch =
+                (u32)(console_texel_offset(d, layout, plane, mip, 0, 0, 1, 0, nullptr) - origin);
+    } else {
+        u32 bw, bh, bd;
+        const SwizzlePattern* sp = swizzle_pattern(d, p, plane);
+        if (!sp || !swizzle_block(d, p, &bw, &bh, &bd))
+            return false;
+        out->block_shift[0] = (u8)log2_exact(bw);
+        out->block_shift[1] = (u8)log2_exact(bh);
+        out->block_shift[2] = (u8)log2_exact(bd);
+        out->block_bytes_shift = (u8)log2_exact(bw * bh * bd * p.bytes_per_element);
+        out->row_blocks = m.padded_width / bw;
+        out->slice_stride = volume ? p.slice_size : 0;
+        memcpy(out->bits_x, sp->bits_x, sizeof(out->bits_x));
+        memcpy(out->bits_y, sp->bits_y, sizeof(out->bits_y));
+        if (volume)
+            memcpy(out->bits_z, sp->bits_z, sizeof(out->bits_z));
+        if (m.in_mip_tail) {
+            out->tail[0] = m.tail_x;
+            out->tail[1] = m.tail_y;
+            out->tail[2] = volume ? m.tail_z : 0;
+        }
+        if (!volume) // an array slice's bits, and the mip's depth in the tail, are XORed in once
+            out->block_xor = pattern(sp->bits_z, 12, slice + (m.in_mip_tail ? m.tail_z : 0));
+        // The origin is element (0, 0, 0): the base is what is left without its pattern.
+        u32 origin_pattern = pattern(out->bits_x, 14, out->tail[0]) ^ pattern(out->bits_y, 14, out->tail[1]) ^
+                             pattern(out->bits_z, 12, out->tail[2]) ^ out->block_xor;
+        if (origin_pattern > origin)
+            return false;
+        out->base = origin - origin_pattern;
+    }
+
+    // Corners and a spread of elements must come out where the layout puts them.
+    u32 w = out->width, h = out->height, dd = out->depth;
+    for (u32 k = 0; k < 16; k++) {
+        u32 x = k < 4 ? (k & 1) * (w - 1) : (u32)((k * 2654435761u) % w);
+        u32 y = k < 4 ? (k >> 1) * (h - 1) : (u32)((k * 40503u + 7) % h);
+        u32 z = (u32)((k * 97u) % dd);
+        u64 expect = console_texel_offset(d, layout, plane, mip, x, y, volume ? z : slice, 0, nullptr);
+        u64 got = console_subresource_offset(*out, x, y, z);
+        if (expect != got) {
+            LOG_W_ONCE("gpu",
+                       "texture addressing of swizzle mode %u, %u-byte elements, mip %u, differs from its "
+                       "layout at (%u, %u, %u): 0x%llx, not 0x%llx; such textures get no contents",
+                       m.swizzle_mode, p.bytes_per_element, mip, x, y, z, got, expect);
+            return false;
+        }
+    }
+    return true;
+}
+
 bool console_copy_subresource(const ConsoleTextureDesc& d, const ConsoleTextureLayout& layout, u32 plane,
                               u32 mip, u32 slice, void* texture, void* linear, u64 row_pitch, u64 slice_pitch,
                               bool into_texture) {

@@ -112,6 +112,43 @@ bool console_texture_layout(const ConsoleTextureDesc& desc, ConsoleTextureLayout
 u64 console_texel_offset(const ConsoleTextureDesc& desc, const ConsoleTextureLayout& layout, u32 plane,
                          u32 mip, u32 x, u32 y, u32 z_or_slice, u32 sample, u32* bit_position);
 
+// How the elements of one subresource (a mip of an array slice; a whole volume mip for 3D) of a plane
+// are laid out in texture memory, in a form a GPU shader evaluates. Swizzled layouts (as the layout
+// library computes them) put elements in blocks, row after row of blocks, volumes block slice after
+// block slice; inside a block, an element's place is the XOR of a fixed address pattern for every set
+// bit of its coordinates (all of them: higher bits pick pipes and banks), coordinates counted from the
+// mip's place in the mip tail, the array slice's own bits XORed in as well. Linear layouts are rows of
+// `pitch` bytes.
+//
+//   x' = x + tail[0], y' = y + tail[1], z' = z + tail[2]
+//   offset = base + (z >> block_shift[2]) * slice_stride
+//          + ((y >> block_shift[1]) * row_blocks + (x >> block_shift[0])) << block_bytes_shift
+//          + (pattern(x') ^ pattern(y') ^ pattern(z') ^ block_xor)
+struct ConsoleSubresourceAddressing {
+    u64 base;
+    u32 bytes_per_element;
+    u32 width, height, depth; // in elements
+    bool linear;
+    u32 pitch;       // linear: bytes per row
+    u32 slice_pitch; // linear volumes: bytes per depth slice
+    u8 block_shift[3];
+    u8 block_bytes_shift;
+    u32 row_blocks;                         // blocks per row
+    u64 slice_stride;                       // volumes: bytes from one block slice to the next
+    u32 block_xor;                          // the array slice's pattern
+    u32 tail[3];                            // where the mip sits in its block
+    u16 bits_x[14], bits_y[14], bits_z[12]; // the pattern of each coordinate bit
+};
+
+// The addressing of a subresource, checked against the layout. Fails for layouts it doesn't
+// describe (planes of other than 1, 2, 4, 8 or 16 bytes per element, multisampled textures) and,
+// logged, if the check finds a difference.
+bool console_subresource_addressing(const ConsoleTextureDesc& desc, const ConsoleTextureLayout& layout,
+                                    u32 plane, u32 mip, u32 slice, ConsoleSubresourceAddressing* out);
+
+// Byte offset of element (x, y, z) of a subresource from the start of the texture.
+u64 console_subresource_offset(const ConsoleSubresourceAddressing& a, u32 x, u32 y, u32 z);
+
 // Copies one subresource (mip `mip` of array slice `slice`; a whole volume mip for 3D) of a plane
 // between linear memory and texture memory in console layout.
 bool console_copy_subresource(const ConsoleTextureDesc& desc, const ConsoleTextureLayout& layout, u32 plane,

@@ -645,6 +645,7 @@ void test_xapu_decode();
 void test_xapu_convert();
 void test_xdsp();
 void test_xma();
+void test_layout_addressing();
 
 int main() {
     log_init(nullptr, LOG_LEVEL_WARN);
@@ -669,6 +670,7 @@ int main() {
     test_xapu_convert();
     test_xdsp();
     test_xma();
+    test_layout_addressing();
     printf("%s (%d failures)\n", g_failures ? "FAILED" : "passed", g_failures);
     return g_failures;
 }
