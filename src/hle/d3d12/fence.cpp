@@ -129,7 +129,7 @@ ID3D12Fence* console_sync_fence(u64 address) {
     // The counter's current value starts the fence; GPU-visible memory is mapped and readable. CPU
     // stores to it signal the fence while GPU work waits for it (console_counter_wait).
     u64 desktop;
-    if (!console_translate_gpu_address(address, sizeof(u64), &desktop))
+    if (!console_translate_coherent(address, sizeof(u64), &desktop))
         return nullptr;
     AcquireSRWLockExclusive(&g_fence_lock);
     c = find_counter(address);
@@ -181,6 +181,7 @@ static HRESULT WINAPI fence_set_event_on_completion(ConsoleFence* self, UINT64 v
 
 static HRESULT WINAPI fence_signal(ConsoleFence* self, UINT64 value) {
     *self->value = value;
+    gpu_page_tables_release(); // GPU work waiting for the value reads what the CPU wrote before
     return self->desktop->Signal(value);
 }
 
@@ -224,8 +225,10 @@ void console_counter_wait(u64 address, u64 value) {
             c->trapped = true;
         }
         u64 now = *(volatile u64*)address;
-        if (now > fence->GetCompletedValue())
+        if (now > fence->GetCompletedValue()) {
+            gpu_page_tables_release();
             fence->Signal(now);
+        }
         release_trap_locked(c, now);
     }
     ReleaseSRWLockExclusive(&g_fence_lock);
@@ -237,8 +240,10 @@ static void on_counter_store(u64 base, u64) {
     CounterFence* c = find_counter(base);
     if (c && c->address == base) {
         u64 value = *(volatile u64*)base;
-        if (value > c->fence->GetCompletedValue())
+        if (value > c->fence->GetCompletedValue()) {
+            gpu_page_tables_release(); // the GPU work it releases reads what the CPU wrote before
             c->fence->Signal(value);
+        }
         release_trap_locked(c, value);
     }
     ReleaseSRWLockExclusive(&g_fence_lock);

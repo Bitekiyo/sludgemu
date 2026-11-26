@@ -71,15 +71,19 @@ static void bvh_get_prebuild_info(BvhBuilder* self,
 }
 
 // Writes a 64-bit value to title GPU memory from the list, in order with its other work.
+// The title's CPU reads it as well as later GPU work: to title memory through a window too.
 static void write_u64(ConsoleCommandList* list, u64 address, u64 value) {
-    u64 desktop;
-    if (!console_translate_gpu_address(address, sizeof(u64), &desktop)) {
+    u64 desktop, coherent;
+    if (!console_translate_gpu_address(address, sizeof(u64), GPU_READ, &desktop) ||
+        !console_translate_coherent(address, sizeof(u64), &coherent)) {
         LOG_W_ONCE("d3d12", "acceleration structure postbuild info at 0x%llx is not GPU-visible", address);
         return;
     }
-    D3D12_WRITEBUFFERIMMEDIATE_PARAMETER params[2] = {{desktop, (u32)value},
-                                                      {desktop + 4, (u32)(value >> 32)}};
-    list->desktop->WriteBufferImmediate(2, params, nullptr);
+    D3D12_WRITEBUFFERIMMEDIATE_PARAMETER params[4] = {{desktop, (u32)value},
+                                                      {desktop + 4, (u32)(value >> 32)},
+                                                      {coherent, (u32)value},
+                                                      {coherent + 4, (u32)(value >> 32)}};
+    list->desktop->WriteBufferImmediate(4, params, nullptr);
 }
 
 // The postbuild information a build would report. Without a build, the structure's size is its

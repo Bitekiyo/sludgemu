@@ -150,7 +150,7 @@ struct BufferView {
 };
 
 static BufferView buffer_view(u64 buffer_address, u64 first_element, u32 num_elements, DXGI_FORMAT format,
-                              u32 structure_stride, bool raw) {
+                              u32 structure_stride, bool raw, GpuAccess access) {
     BufferView v = {};
     u32 element_bytes = buffer_element_bytes(format, structure_stride, raw);
     if (element_bytes == 0) {
@@ -159,7 +159,7 @@ static BufferView buffer_view(u64 buffer_address, u64 first_element, u32 num_ele
     }
     u64 bytes = (u64)num_elements * element_bytes;
     GpuAddress a;
-    if (!gpu_translate(buffer_address + first_element * element_bytes, bytes, &a))
+    if (!gpu_translate(buffer_address + first_element * element_bytes, bytes, access, &a))
         return v;
     v.raw = raw || structure_stride != 0;
     if (v.raw) {
@@ -283,7 +283,7 @@ static u32 rtv_plane(const D3D12_RENDER_TARGET_VIEW_DESC& d) {
 // no desktop texture.
 static ID3D12Resource* texture_view_target(const ConsoleResource* r) {
     u64 offset;
-    return r ? console_resource_desktop((ConsoleResource*)r, &offset) : nullptr;
+    return r ? console_resource_desktop((ConsoleResource*)r, &offset, GPU_READ) : nullptr;
 }
 
 // Null views keep the title's view dimension, with a format of their kind and nothing else: their
@@ -455,7 +455,7 @@ void write_constant_buffer_view(u64 address, u64 size, D3D12_CPU_DESCRIPTOR_HAND
     ID3D12Resource* desktop = nullptr;
     if (address && size && size / 4 <= 0xFFFFFFFFu)
         desktop =
-            apply_buffer_view(buffer_view(address, 0, (u32)(size / 4), DXGI_FORMAT_UNKNOWN, 0, true), &d);
+            apply_buffer_view(buffer_view(address, 0, (u32)(size / 4), DXGI_FORMAT_UNKNOWN, 0, true, GPU_READ), &d);
     if (!desktop)
         d = null_srv(D3D12_SRV_DIMENSION_BUFFER);
     gpu_device()->CreateShaderResourceView(desktop, &d, dest);
@@ -540,7 +540,7 @@ void WINAPI device_create_shader_resource_view(ConsoleDevice* self, void* resour
         d = desc ? *desc : whole_buffer_srv(r);
         desktop = apply_buffer_view(buffer_view(r->gpu_address, d.Buffer.FirstElement, d.Buffer.NumElements,
                                                 d.Format, d.Buffer.StructureByteStride,
-                                                (d.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) != 0),
+                                                (d.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) != 0, GPU_READ),
                                     &d);
     } else {
         const ConsoleResource* r = (const ConsoleResource*)resource;
@@ -566,7 +566,7 @@ void WINAPI device_create_unordered_access_view(ConsoleDevice* self, void* resou
         d = desc ? desktop_uav_desc(desc) : whole_buffer_uav(r);
         desktop = apply_buffer_view(buffer_view(r->gpu_address, d.Buffer.FirstElement, d.Buffer.NumElements,
                                                 d.Format, d.Buffer.StructureByteStride,
-                                                (d.Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW) != 0),
+                                                (d.Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW) != 0, GPU_WRITE),
                                     &d);
         // Raw views have no counters: translated shaders reach the counter memory themselves.
         if (d.Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW)
@@ -574,7 +574,7 @@ void WINAPI device_create_unordered_access_view(ConsoleDevice* self, void* resou
         if (desktop && counter) {
             GpuAddress c;
             u64 at = ((const ConsoleResource*)counter)->gpu_address + d.Buffer.CounterOffsetInBytes;
-            if (gpu_translate(at, 4, &c)) {
+            if (gpu_translate(at, 4, GPU_WRITE, &c)) {
                 desktop_counter = c.buffer;
                 d.Buffer.CounterOffsetInBytes = c.offset;
             } else {
@@ -741,7 +741,7 @@ void WINAPI device_create_placed_raw_srv_x(ConsoleDevice* self, const D3D12_RESO
         d.ViewDimension == D3D12_SRV_DIMENSION_BUFFER) {
         desktop = apply_buffer_view(buffer_view(desc->location, d.Buffer.FirstElement, d.Buffer.NumElements,
                                                 d.Format, d.Buffer.StructureByteStride,
-                                                (d.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) != 0),
+                                                (d.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) != 0, GPU_READ),
                                     &d);
     } else if (resource_desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
         if (desc->image_format)
@@ -782,11 +782,11 @@ void WINAPI device_create_placed_raw_uav_x(ConsoleDevice* self, const D3D12_RESO
         d.ViewDimension == D3D12_UAV_DIMENSION_BUFFER) {
         desktop = apply_buffer_view(buffer_view(desc->location, d.Buffer.FirstElement, d.Buffer.NumElements,
                                                 d.Format, d.Buffer.StructureByteStride,
-                                                (d.Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW) != 0),
+                                                (d.Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW) != 0, GPU_WRITE),
                                     &d);
         if (desktop && desc->counter_location && !(d.Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW)) {
             GpuAddress c;
-            if (gpu_translate(desc->counter_location + d.Buffer.CounterOffsetInBytes, 4, &c)) {
+            if (gpu_translate(desc->counter_location + d.Buffer.CounterOffsetInBytes, 4, GPU_WRITE, &c)) {
                 desktop_counter = c.buffer;
                 d.Buffer.CounterOffsetInBytes = c.offset;
             } else {

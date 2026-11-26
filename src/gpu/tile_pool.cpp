@@ -4,8 +4,9 @@
 #include <string.h>
 
 #include "common/log.h"
+#include "core/memory.h"
 
-#define MAX_TILE_HEAPS 256 // 16 GiB of tiles
+#define MAX_TILE_HEAPS GPU_TILE_MAX_HEAPS
 #define HEAP_WORDS     (GPU_TILE_HEAP_TILES / 64)
 // Empty heaps kept beyond those in use, so textures streaming in and out don't create and release
 // heaps all the time.
@@ -13,6 +14,7 @@
 
 struct TileHeap {
     ID3D12Heap* heap; // nullptr: an empty slot
+    u32 serial;       // of the heap, counting every heap made
     u32 free;
     u64 taken[HEAP_WORDS]; // a bit per tile: handed out, or freed and not reclaimed yet
 };
@@ -36,6 +38,7 @@ static struct {
     u32 batch_count;
     u32 batch_capacity;
     u32 sealed; // tiles of g_pool.freed in batches
+    u32 serial; // heaps made so far
 } g_pool = {SRWLOCK_INIT};
 
 static void release_tile_locked(u32 tile) {
@@ -94,12 +97,31 @@ static void reclaim_locked() {
 }
 
 static bool create_heap_locked(u32 slot) {
+    // Video memory counts towards the system's commit too: without room for it, tiles go without.
+    if (!mem_commit_available(GPU_TILE_HEAP_TILES * GPU_TILE_SIZE)) {
+        static volatile long logged = 0;
+        if (log_once_flag(&logged))
+            LOG_E("gpu", "the system is nearly out of commit; textures go without memory for some tiles");
+        return false;
+    }
     D3D12_HEAP_DESC desc = {};
     desc.SizeInBytes = GPU_TILE_HEAP_TILES * GPU_TILE_SIZE;
     desc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
     desc.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
-    // Every tile handed out is written before it is read, so the heap needn't be cleared.
-    desc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES | D3D12_HEAP_FLAG_CREATE_NOT_ZEROED;
+    // Tiles back buffers (page tables) and textures alike, which heaps allow from resource heap tier 2
+    // on (every current GPU). Every tile handed out is written before it is read, so the heap needn't
+    // be cleared.
+    static volatile long tier = -1;
+    if (tier < 0) {
+        D3D12_FEATURE_DATA_D3D12_OPTIONS o = {};
+        gpu_device()->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &o, sizeof(o));
+        tier = o.ResourceHeapTier;
+        if (tier < D3D12_RESOURCE_HEAP_TIER_2)
+            LOG_E("gpu", "the GPU's resource heap tier is 1: tiles can't back buffers and textures alike");
+    }
+    desc.Flags = D3D12_HEAP_FLAG_CREATE_NOT_ZEROED |
+                 (tier < D3D12_RESOURCE_HEAP_TIER_2 ? D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES
+                                                    : D3D12_HEAP_FLAG_ALLOW_ALL_BUFFERS_AND_TEXTURES);
     ID3D12Heap* heap = nullptr;
     HRESULT hr = gpu_device()->CreateHeap(&desc, IID_PPV_ARGS(&heap));
     if (FAILED(hr)) {
@@ -114,6 +136,7 @@ static bool create_heap_locked(u32 slot) {
     gpu_set_name(heap, "texture tiles %u", slot);
     TileHeap& h = g_pool.heaps[slot];
     h.heap = heap;
+    h.serial = ++g_pool.serial;
     h.free = GPU_TILE_HEAP_TILES;
     memset(h.taken, 0, sizeof(h.taken));
     g_pool.heap_count++;
@@ -188,6 +211,11 @@ void gpu_tiles_free(u32 count, const u32* tiles) {
 ID3D12Heap* gpu_tile_heap(u32 tile) {
     // A heap stays while any of its tiles is taken, and was made before they were handed out.
     return g_pool.heaps[tile / GPU_TILE_HEAP_TILES].heap;
+}
+
+u32 gpu_tile_heap_serial(u32 tile) {
+    const TileHeap& h = g_pool.heaps[tile / GPU_TILE_HEAP_TILES];
+    return h.heap ? h.serial : 0;
 }
 
 void gpu_tile_usage(u64* used, u64* reserved) {

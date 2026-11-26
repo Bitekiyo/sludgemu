@@ -353,6 +353,23 @@ u64 gpu_queue_submitted(u32 slot) {
     return number;
 }
 
+u64 gpu_queue_execute(ID3D12CommandQueue* queue, u32 slot, u32 count, ID3D12CommandList* const* lists) {
+    if (slot >= GPU_MAX_QUEUES) {
+        if (count)
+            queue->ExecuteCommandLists(count, lists);
+        return 0;
+    }
+    AcquireSRWLockExclusive(&g_submit_lock);
+    GpuQueueSlot& q = g_queues[slot];
+    if (count)
+        q.queue->ExecuteCommandLists(count, lists);
+    u64 number = ++q.submitted;
+    q.queue->Signal(q.fence, number);
+    collect_locked();
+    ReleaseSRWLockExclusive(&g_submit_lock);
+    return number;
+}
+
 u64 gpu_queue_completed(u32 slot) {
     if (slot >= GPU_MAX_QUEUES)
         return 0;
@@ -375,6 +392,15 @@ void gpu_queue_wait(u32 slot, u64 number) {
     if (fence->GetCompletedValue() < number)
         fence->SetEventOnCompletion(number, nullptr);
     fence->Release();
+}
+
+ID3D12Fence* gpu_queue_fence(u32 slot) {
+    if (slot >= GPU_MAX_QUEUES)
+        return nullptr;
+    AcquireSRWLockShared(&g_submit_lock);
+    ID3D12Fence* fence = g_queues[slot].fence;
+    ReleaseSRWLockShared(&g_submit_lock);
+    return fence;
 }
 
 void gpu_set_name(ID3D12Object* object, const char* format, ...) {

@@ -325,8 +325,9 @@ HRESULT console_create_committed_resource(ConsoleDevice* device, const D3D12_HEA
 ConsoleResource* console_placed_texture(u64 gpu_address, const D3D12_RESOURCE_DESC1& desc);
 
 // The desktop resource backing `resource` (created on first use) and the offset of the title
-// resource's first byte in it. nullptr if it can't be created.
-ID3D12Resource* console_resource_desktop(ConsoleResource* resource, u64* offset);
+// resource's first byte in it; `access` says whether the GPU work at hand may write a buffer. nullptr
+// if it can't be created.
+ID3D12Resource* console_resource_desktop(ConsoleResource* resource, u64* offset, GpuAccess access);
 
 // Logs the memory desktop textures take, by what they back, next to the adapter's memory budget and
 // the title's memory. Also logged when one can't be created for lack of memory, and by
@@ -339,7 +340,11 @@ bool console_texture_loses_uav(const D3D12_RESOURCE_DESC1& desc);
 
 // Translates title GPU addresses [address, address + size) to the desktop GPU address of the same
 // memory (see gpu_translate).
-bool console_translate_gpu_address(u64 address, u64 size, u64* desktop_address);
+bool console_translate_gpu_address(u64 address, u64 size, GpuAccess access, u64* desktop_address);
+
+// The same through a window over title memory: GPU writes there are seen by the CPU right away (see
+// gpu_window_translate). For values the CPU polls.
+bool console_translate_coherent(u64 address, u64 size, u64* desktop_address);
 
 // A descriptor heap. Console descriptors live in title memory and handles are plain addresses into
 // it (CPU and GPU handles alike), which title code steps through with the console descriptor sizes.

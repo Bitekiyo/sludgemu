@@ -5,8 +5,8 @@
 #include "gpu/formats.h"
 #include "hle/d3d12/command_list.h"
 
-static D3D12_GPU_VIRTUAL_ADDRESS translate(u64 address, u64 size, GpuAddress* out) {
-    if (!gpu_translate(address, size ? size : 1, out)) {
+static D3D12_GPU_VIRTUAL_ADDRESS translate(u64 address, u64 size, GpuAccess access, GpuAddress* out) {
+    if (!gpu_translate(address, size ? size : 1, access, out)) {
         LOG_W_ONCE("d3d12", "GPU address 0x%llx (+%llu) is outside GPU-visible memory", address, size);
         return 0;
     }
@@ -67,7 +67,7 @@ static void WINAPI list_draw_indexed_x(ConsoleCommandList* self, UINT64 index_bu
     GpuAddress a;
     D3D12_INDEX_BUFFER_VIEW view;
     view.SizeInBytes = (first_index + indices) * index_size;
-    view.BufferLocation = translate(index_buffer, view.SizeInBytes, &a);
+    view.BufferLocation = translate(index_buffer, view.SizeInBytes, GPU_READ, &a);
     view.Format = format;
     self->desktop->IASetIndexBuffer(&view);
     self->desktop->DrawIndexedInstanced(indices, 1, first_index, 0, 0);
@@ -92,8 +92,8 @@ static void WINAPI list_execute_indirect(ConsoleCommandList*, void*, UINT, void*
 static void WINAPI list_copy_buffer_region(ConsoleCommandList* self, void* dst, UINT64 dst_offset, void* src,
                                            UINT64 src_offset, UINT64 size) {
     u64 dst_base, src_base;
-    ID3D12Resource* d = list_resource(dst, &dst_base);
-    ID3D12Resource* s = list_resource(src, &src_base);
+    ID3D12Resource* d = list_resource(dst, &dst_base, GPU_WRITE);
+    ID3D12Resource* s = list_resource(src, &src_base, GPU_READ);
     if (!d || !s) {
         LOG_W_ONCE("d3d12", "CopyBufferRegion with a buffer outside GPU-visible memory skipped");
         return;
@@ -102,10 +102,11 @@ static void WINAPI list_copy_buffer_region(ConsoleCommandList* self, void* dst, 
 }
 
 // Buffer footprints move by where the console buffer starts in its desktop buffer.
-static bool copy_location(const D3D12_TEXTURE_COPY_LOCATION* in, D3D12_TEXTURE_COPY_LOCATION* out) {
+static bool copy_location(const D3D12_TEXTURE_COPY_LOCATION* in, D3D12_TEXTURE_COPY_LOCATION* out,
+                          GpuAccess access) {
     *out = *in;
     u64 base;
-    out->pResource = list_resource(in->pResource, &base);
+    out->pResource = list_resource(in->pResource, &base, access);
     if (!out->pResource)
         return false;
     if (in->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT) {
@@ -126,7 +127,7 @@ static void WINAPI list_copy_texture_region(ConsoleCommandList* self, const D3D1
                                             UINT x, UINT y, UINT z, const D3D12_TEXTURE_COPY_LOCATION* src,
                                             const D3D12_BOX* box) {
     D3D12_TEXTURE_COPY_LOCATION d, s;
-    if (!copy_location(dst, &d) || !copy_location(src, &s)) {
+    if (!copy_location(dst, &d, GPU_WRITE) || !copy_location(src, &s, GPU_READ)) {
         LOG_W_ONCE("d3d12", "CopyTextureRegion with a resource without desktop backing skipped");
         return;
     }
@@ -136,8 +137,8 @@ static void WINAPI list_copy_texture_region(ConsoleCommandList* self, const D3D1
 static void WINAPI list_copy_resource(ConsoleCommandList* self, void* dst, void* src) {
     ConsoleResource* dr = (ConsoleResource*)dst;
     u64 dst_base, src_base;
-    ID3D12Resource* d = list_resource(dst, &dst_base);
-    ID3D12Resource* s = list_resource(src, &src_base);
+    ID3D12Resource* d = list_resource(dst, &dst_base, GPU_WRITE);
+    ID3D12Resource* s = list_resource(src, &src_base, GPU_READ);
     if (!d || !s) {
         LOG_W_ONCE("d3d12", "CopyResource with a resource without desktop backing skipped");
         return;
@@ -152,8 +153,8 @@ static void WINAPI list_copy_resource(ConsoleCommandList* self, void* dst, void*
 static void WINAPI list_resolve_subresource(ConsoleCommandList* self, void* dst, UINT dst_subresource,
                                             void* src, UINT src_subresource, DXGI_FORMAT format) {
     u64 base;
-    ID3D12Resource* d = list_resource(dst, &base);
-    ID3D12Resource* s = list_resource(src, &base);
+    ID3D12Resource* d = list_resource(dst, &base, GPU_WRITE);
+    ID3D12Resource* s = list_resource(src, &base, GPU_READ);
     if (d && s && format_desktop(format) != DXGI_FORMAT_UNKNOWN)
         self->desktop->ResolveSubresource(d, dst_subresource, s, src_subresource, format_desktop(format));
 }
@@ -161,7 +162,7 @@ static void WINAPI list_resolve_subresource(ConsoleCommandList* self, void* dst,
 static void WINAPI list_copy_memory_to_memory_x(ConsoleCommandList* self, UINT64 dst, UINT64 src, UINT64 size,
                                                 UINT) {
     GpuAddress d, s;
-    if (translate(dst, size, &d) && translate(src, size, &s))
+    if (translate(dst, size, GPU_WRITE, &d) && translate(src, size, GPU_READ, &s))
         self->desktop->CopyBufferRegion(d.buffer, d.offset, s.buffer, s.offset, size);
 }
 
@@ -188,7 +189,7 @@ static bool uav_clear_args(ConsoleCommandList* self, D3D12_GPU_DESCRIPTOR_HANDLE
                            D3D12_GPU_DESCRIPTOR_HANDLE* out_gpu, D3D12_CPU_DESCRIPTOR_HANDLE* out_cpu,
                            ID3D12Resource** out_resource) {
     u64 base;
-    *out_resource = list_resource(resource, &base);
+    *out_resource = list_resource(resource, &base, GPU_WRITE);
     return *out_resource && list_gpu_descriptor(self, gpu.ptr, out_gpu) &&
            list_cpu_descriptor(cpu.ptr, 1, out_cpu);
 }
@@ -220,27 +221,31 @@ static void WINAPI list_discard_resource(ConsoleCommandList* self, void* resourc
     if (!r || r->desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
         return;
     u64 base;
-    ID3D12Resource* d = list_resource(resource, &base);
+    ID3D12Resource* d = list_resource(resource, &base, GPU_READ);
     if (d)
         self->desktop->DiscardResource(d, region);
 }
 
 // --- memory writes -----------------------------------------------------------------------------------
 
-// Small immediate writes: 32-bit values at title GPU addresses, ordered against earlier work.
+// Small immediate writes: 32-bit values at title GPU addresses, ordered against earlier work. Title
+// code polls such values (fences, counters) while the GPU writes them, so they go to title memory
+// through a window as well as to the page tables, for later GPU work reading them.
 static void write_values(ConsoleCommandList* self, u64 address, const u32* values, u32 count,
                          D3D12_WRITEBUFFERIMMEDIATE_MODE mode) {
-    D3D12_WRITEBUFFERIMMEDIATE_PARAMETER params[64];
-    D3D12_WRITEBUFFERIMMEDIATE_MODE modes[64];
+    D3D12_WRITEBUFFERIMMEDIATE_PARAMETER params[128];
+    D3D12_WRITEBUFFERIMMEDIATE_MODE modes[128];
     GpuAddress a;
-    if (count > ARRAY_COUNT(params) || !translate(address, (u64)count * 4, &a))
+    u64 coherent;
+    if (count > ARRAY_COUNT(params) / 2 || !translate(address, (u64)count * 4, GPU_READ, &a) ||
+        !console_translate_coherent(address, (u64)count * 4, &coherent))
         return;
     for (u32 i = 0; i < count; i++) {
-        params[i].Dest = a.desktop_address + i * 4;
-        params[i].Value = values[i];
-        modes[i] = mode;
+        params[i] = {a.desktop_address + i * 4, values[i]};
+        params[count + i] = {coherent + i * 4, values[i]};
+        modes[i] = modes[count + i] = mode;
     }
-    self->desktop->WriteBufferImmediate(count, params, modes);
+    self->desktop->WriteBufferImmediate(count * 2, params, modes);
 }
 
 // A write once earlier work is done: how titles signal fences and counters from the GPU. The value
@@ -323,7 +328,7 @@ static void WINAPI list_resolve_query_data(ConsoleCommandList* self, ConsoleQuer
                                            D3D12_QUERY_TYPE type, UINT start, UINT count, void* dst,
                                            UINT64 dst_offset) {
     u64 base;
-    ID3D12Resource* d = list_resource(dst, &base);
+    ID3D12Resource* d = list_resource(dst, &base, GPU_WRITE); // the CPU reads it back through a download
     if (heap && d)
         self->desktop->ResolveQueryData(heap->desktop, type, start, count, d, base + dst_offset);
 }
@@ -332,7 +337,7 @@ static void WINAPI list_set_predication(ConsoleCommandList* self, void* buffer, 
                                         D3D12_PREDICATION_OP op) {
     ListState& st = self->state;
     u64 base;
-    st.predication = list_resource(buffer, &base);
+    st.predication = list_resource(buffer, &base, GPU_READ);
     st.predication_offset = st.predication ? base + offset : 0;
     st.predication_op = op;
     self->desktop->SetPredication(st.predication, st.predication_offset, op);

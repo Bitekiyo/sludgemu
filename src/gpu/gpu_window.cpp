@@ -115,9 +115,14 @@ static void fill(const Window* w, u64 address, GpuAddress* out) {
 #define WINDOW_GRANULE MiB(64)
 
 static MemBlock window_extent(const MemBlock& block, u64 address, u64 size) {
+    // Physical memory is seen through the chunk's window whatever the extent, so translations there
+    // cover what is accessed and back nothing more (memory only the GPU uses stays in video memory).
+    u32 chunk;
+    u64 chunk_offset;
+    u64 granule = mem_linear_location(block.host, &chunk, &chunk_offset) ? MEM_PAGE_SIZE : WINDOW_GRANULE;
     u64 block_end = (u64)block.base + block.size;
-    u64 lo = ALIGN_DOWN(address, WINDOW_GRANULE);
-    u64 hi = ALIGN_UP(address + size, WINDOW_GRANULE);
+    u64 lo = ALIGN_DOWN(address, granule);
+    u64 hi = ALIGN_UP(address + size, granule);
     lo = lo > (u64)block.base ? lo : (u64)block.base;
     hi = hi < block_end ? hi : block_end;
     AcquireSRWLockShared(&g_windows.lock);
@@ -312,7 +317,7 @@ void gpu_window_usage(u64* chunks, u64* blocks, u64* replaced) {
     ReleaseSRWLockShared(&g_windows.lock);
 }
 
-bool gpu_translate(u64 address, u64 size, GpuAddress* out) {
+bool gpu_window_translate(u64 address, u64 size, GpuAddress* out) {
     return translate(address, size, false, out);
 }
 

@@ -31,9 +31,17 @@ static const ConsoleClass k_resource_class = {"ID3D12Resource", k_resource_iids,
 
 static void* const* g_resource_table = nullptr;
 
-bool console_translate_gpu_address(u64 address, u64 size, u64* desktop_address) {
+bool console_translate_gpu_address(u64 address, u64 size, GpuAccess access, u64* desktop_address) {
     GpuAddress a;
-    if (!gpu_translate(address, size, &a))
+    if (!gpu_translate(address, size, access, &a))
+        return false;
+    *desktop_address = a.desktop_address;
+    return true;
+}
+
+bool console_translate_coherent(u64 address, u64 size, u64* desktop_address) {
+    GpuAddress a;
+    if (!gpu_window_translate(address, size, &a))
         return false;
     *desktop_address = a.desktop_address;
     return true;
@@ -213,10 +221,10 @@ D3D12_RESOURCE_ALLOCATION_INFO console_resource_allocation_info(const D3D12_RESO
     return {layout.size, layout.base_alignment};
 }
 
-ID3D12Resource* console_resource_desktop(ConsoleResource* r, u64* offset) {
+ID3D12Resource* console_resource_desktop(ConsoleResource* r, u64* offset, GpuAccess access) {
     if (r->desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
         GpuAddress a;
-        if (!gpu_translate(r->gpu_address, r->desc.Width, &a))
+        if (!gpu_translate(r->gpu_address, r->desc.Width, access, &a))
             return nullptr;
         *offset = a.offset;
         return a.buffer;
@@ -623,6 +631,8 @@ void console_memory_report(const char* why) {
     K32GetPerformanceInfo(&system, sizeof(system));
     u64 chunk_windows = 0, block_windows = 0, replaced_windows = 0;
     gpu_window_usage(&chunk_windows, &block_windows, &replaced_windows);
+    u64 page_table_tiles = 0, downloads = 0;
+    gpu_page_tables_usage(&page_table_tiles, &downloads);
     LOG_I("d3d12",
           "memory (%s): whole desktop textures %llu MiB, tiles %llu MiB (heaps %llu MiB); VRAM %llu of %llu "
           "MiB, shared %llu of %llu MiB; title physical memory %llu of %llu MiB used; commit %llu MiB",
@@ -634,12 +644,13 @@ void console_memory_report(const char* why) {
         "d3d12",
         "memory:   system: commit %llu of %llu MiB, %llu MiB RAM free; this process: private %llu MiB "
         "(VRAM is charged here too), working set %llu MiB; physical memory chunks %llu MiB (%llu MiB bound); "
-        "GPU windows over chunks %llu MiB, over other memory %llu MiB (+%llu MiB replaced)",
+        "GPU windows over chunks %llu MiB, over other memory %llu MiB (+%llu MiB replaced); page tables %llu "
+        "MiB of tiles, %llu pages copied back",
         (u64)system.CommitTotal * system.PageSize >> 20, (u64)system.CommitLimit * system.PageSize >> 20,
         (u64)system.PhysicalAvailable * system.PageSize >> 20, (u64)process.PrivateUsage >> 20,
         (u64)process.WorkingSetSize >> 20, ((u64)mem_physical_chunks_created() * MEM_CHUNK_SIZE) >> 20,
         (mem_physical_bound_pages() << MEM_PAGE_SHIFT) >> 20, chunk_windows >> 20, block_windows >> 20,
-        replaced_windows >> 20);
+        replaced_windows >> 20, page_table_tiles >> 20, downloads);
     if (!spans)
         return;
 

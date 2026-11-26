@@ -44,12 +44,19 @@ bool gpu_device_lost(HRESULT hr);
 u32 gpu_queue_register(ID3D12CommandQueue* queue);
 void gpu_queue_unregister(u32 slot);
 u64 gpu_queue_submitted(u32 slot); // returns the submission's number
+// Executes `lists` (none: a submission of nothing) on `queue`, registered in `slot`, and counts the
+// submission in one step, so a retire point taken meanwhile includes work already handed to the queue.
+// Returns the submission's number (0 for a queue without a slot, whose work runs uncounted).
+u64 gpu_queue_execute(ID3D12CommandQueue* queue, u32 slot, u32 count, ID3D12CommandList* const* lists);
 
 // The number of the last submission the queue finished.
 u64 gpu_queue_completed(u32 slot);
 
 // Blocks until the queue finished submission `number`.
 void gpu_queue_wait(u32 slot, u64 number);
+
+// The fence counting the queue's submissions, for other queues to wait on (alive as long as the slot).
+ID3D12Fence* gpu_queue_fence(u32 slot);
 
 // Names a desktop object for the debug layer's messages (printf-style); nothing without the layer.
 void gpu_set_name(ID3D12Object* object, const char* format, ...);

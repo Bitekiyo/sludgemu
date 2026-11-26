@@ -300,6 +300,8 @@ static void on_written(u64 base, u64 size, MemWriteKind kind) {
         texture_sync_mark(base, size);
         return;
     }
+    if (kind == MEM_WATCH_DROPPED)
+        return; // other memory mapped there: the mapping listener marks the textures
     AcquireSRWLockExclusive(&g_sync.lock);
     for (u32 i = lower_bound(base); i < g_sync.count && g_sync.entries[i].start == base; i++) {
         SyncEntry& e = g_sync.entries[i];
@@ -472,7 +474,7 @@ static bool copy_from_title_memory(ID3D12GraphicsCommandList8* list, ConsoleReso
     const ConsolePlaneLayout& p = layout.planes[0];
     bool unrestricted = unrestricted_copy_pitch();
     GpuAddress window;
-    if (!gpu_translate_contiguous(r->gpu_address, size, &window))
+    if (!gpu_translate_current(r->gpu_address, size, &window))
         return false; // not one block of memory for the GPU
     for (u32 m = 0; m < layout.mip_levels; m++) {
         u64 at = window.offset + p.base_offset + p.mips[m].offset;
@@ -482,7 +484,7 @@ static bool copy_from_title_memory(ID3D12GraphicsCommandList8* list, ConsoleReso
             return false;
     }
     u64 unused;
-    ID3D12Resource* texture = console_resource_desktop(r, &unused);
+    ID3D12Resource* texture = console_resource_desktop(r, &unused, GPU_READ);
     if (!texture || sources->count + 2 >= TEXTURE_UPLOAD_SOURCES)
         return false;
     keep_source(sources, window.buffer);
@@ -887,7 +889,7 @@ bool texture_sync_record(ID3D12CommandQueue* queue, ID3D12GraphicsCommandList8* 
             continue;
         }
         u64 unused;
-        ID3D12Resource* texture = console_resource_desktop(e.resource, &unused);
+        ID3D12Resource* texture = console_resource_desktop(e.resource, &unused, GPU_READ);
         if (texture && !e.addressing)
             e.addressing = make_addressing(e.resource, subresources);
         if (!texture || !e.addressing) {
@@ -920,7 +922,8 @@ bool texture_sync_record(ID3D12CommandQueue* queue, ID3D12GraphicsCommandList8* 
         if (traced)
             LOG_I("d3d12", "texture trace: %p detiled on the GPU (%u subresources)", (void*)e.resource,
                   count);
-        if (gpu_translate_contiguous(e.start, e.end - e.start, &window)) {
+        // The GPU's copy where the page tables hold one (GPU work may have written it), else title memory.
+        if (gpu_translate_current(e.start, e.end - e.start, &window)) {
             keep_source(sources, window.buffer);
             loads[load_count++] = {&e, texture, window.desktop_address, NOT_STAGED, copy_count, count};
         } else {

@@ -71,8 +71,8 @@ static void upload_textures(ConsoleCommandQueue* self) {
     bool recorded = texture_sync_record(self->desktop, w.list, &sources, &self->scratch, &self->staging);
     if (SUCCEEDED(w.list->Close()) && recorded) {
         ID3D12CommandList* list = w.list;
-        self->desktop->ExecuteCommandLists(1, &list);
-        w.submission = gpu_queue_submitted(self->slot);
+        gpu_page_tables_submit(self->desktop); // uploads may read title memory through the page tables
+        w.submission = gpu_queue_execute(self->desktop, self->slot, 1, &list);
         gpu_ring_submitted(&self->scratch, w.submission);
         gpu_ring_submitted(&self->staging, w.submission);
         self->next_uploader = (self->next_uploader + 1) % QUEUE_UPLOADERS; // this one is in flight
@@ -121,10 +121,15 @@ struct SubmitBatch {
     u32 count;
 };
 
-static void flush(ID3D12CommandQueue* queue, SubmitBatch* b) {
-    if (b->count)
-        queue->ExecuteCommandLists(b->count, b->lists);
+// Submits the batch after the page table work it needs: descriptors mirrored for it may have reached
+// pages the page tables map only now. Returns the submission's number, or `last` if there was nothing.
+static u64 flush(ConsoleCommandQueue* self, SubmitBatch* b, u64 last) {
+    if (!b->count)
+        return last;
+    gpu_page_tables_submit(self->desktop);
+    u64 number = gpu_queue_execute(self->desktop, self->slot, b->count, b->lists);
     b->count = 0;
+    return number;
 }
 
 // Each console list runs its parts in order, with the fence signals and waits between them. A console
@@ -135,6 +140,7 @@ static void WINAPI queue_execute_command_lists(ConsoleCommandQueue* self, UINT c
     upload_textures(self);
     SubmitBatch b;
     b.count = 0;
+    u64 last = 0; // the call's last submission
     for (UINT i = 0; i < count; i++) {
         ConsoleCommandList* list = lists[i];
         if (!list)
@@ -142,9 +148,9 @@ static void WINAPI queue_execute_command_lists(ConsoleCommandQueue* self, UINT c
         for (UINT k = 0; k < i; k++) {
             if (lists[k] != list)
                 continue;
-            flush(self->desktop, &b);
+            last = flush(self, &b, last);
             list->submitted_slot = self->slot;
-            list->submitted_number = gpu_queue_submitted(self->slot);
+            list->submitted_number = last;
             break;
         }
         if (list->submitted_slot != GPU_NO_QUEUE &&
@@ -157,11 +163,11 @@ static void WINAPI queue_execute_command_lists(ConsoleCommandQueue* self, UINT c
         for (u32 s = 0; s < list->segment_count; s++) {
             const ListSegment& seg = list->segments[s];
             if (b.count == SUBMIT_BATCH)
-                flush(self->desktop, &b);
+                last = flush(self, &b, last);
             b.lists[b.count++] = seg.list;
             if (s + 1 == list->segment_count)
                 break;
-            flush(self->desktop, &b);
+            last = flush(self, &b, last);
             if (seg.sync == LIST_SYNC_SIGNAL) {
                 self->desktop->Signal(seg.fence, seg.value);
             } else {
@@ -171,8 +177,8 @@ static void WINAPI queue_execute_command_lists(ConsoleCommandQueue* self, UINT c
             }
         }
     }
-    flush(self->desktop, &b);
-    u64 submission = gpu_queue_submitted(self->slot);
+    last = flush(self, &b, last);
+    u64 submission = last ? last : gpu_queue_submitted(self->slot);
     for (UINT i = 0; i < count; i++) {
         if (lists[i]) {
             lists[i]->submitted_slot = self->slot;
@@ -194,7 +200,7 @@ static void WINAPI queue_execute_command_lists_2x(ConsoleCommandQueue* self, UIN
 // first: a reader never sees a value ahead of its time.
 static void write_fence_value(ConsoleCommandQueue* self, ConsoleFence* fence, u64 value) {
     if (!fence->value_desktop &&
-        !console_translate_gpu_address((u64)fence->value, sizeof(u64), &fence->value_desktop)) {
+        !console_translate_coherent((u64)fence->value, sizeof(u64), &fence->value_desktop)) {
         LOG_W_ONCE("d3d12", "fence value memory is not GPU-visible; queue signals won't update it");
         return;
     }
@@ -225,8 +231,7 @@ static void write_fence_value(ConsoleCommandQueue* self, ConsoleFence* fence, u6
     }
     if (SUCCEEDED(hr)) {
         ID3D12CommandList* list = w.list;
-        self->desktop->ExecuteCommandLists(1, &list);
-        w.submission = gpu_queue_submitted(self->slot);
+        w.submission = gpu_queue_execute(self->desktop, self->slot, 1, &list);
     } else {
         if (!gpu_device_lost(hr))
             LOG_E("d3d12", "cannot write a fence value from the queue (0x%08lx)", (unsigned long)hr);
@@ -321,7 +326,7 @@ static HRESULT WINAPI queue_present_x(ConsoleCommandQueue* self, UINT plane_coun
         if (in.color_space != DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709)
             LOG_W_ONCE("present", "plane color space %d is shown as SDR", in.color_space);
         u64 offset;
-        out[i].texture = console_resource_desktop(in.resources[0], &offset);
+        out[i].texture = console_resource_desktop(in.resources[0], &offset, GPU_READ);
         if (in.source_rects)
             out[i].source = in.source_rects[0];
         static const f32 k_full[4] = {0.0f, 0.0f, 1.0f, 1.0f};

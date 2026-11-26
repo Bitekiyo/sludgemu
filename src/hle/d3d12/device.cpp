@@ -335,6 +335,7 @@ HRESULT console_create_device(void* adapter, const ConsoleDeviceParams* params, 
         console_command_allocator_init();
         console_command_list_init();
         gpu_window_init();
+        gpu_page_tables_init();
         texture_sync_init();
         console_resource_init();
         console_descriptor_heap_init();

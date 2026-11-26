@@ -123,6 +123,8 @@ add_executable(sludgemu WIN32
     gpu/gpu_window.cpp
     gpu/tile_pool.h
     gpu/tile_pool.cpp
+    gpu/page_tables.h
+    gpu/page_tables.cpp
     gpu/shader_programs.h
     gpu/shader_programs.cpp
     gpu/formats.h

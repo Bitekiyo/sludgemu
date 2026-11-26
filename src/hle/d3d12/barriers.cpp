@@ -181,7 +181,7 @@ static void add_transition(ID3D12GraphicsCommandList7* list, BarrierBatch* b,
                            const D3D12_RESOURCE_TRANSITION_BARRIER& t) {
     ConsoleResource* r = (ConsoleResource*)t.pResource;
     u64 offset;
-    ID3D12Resource* desktop = r ? console_resource_desktop(r, &offset) : nullptr;
+    ID3D12Resource* desktop = r ? console_resource_desktop(r, &offset, GPU_READ) : nullptr;
     if (!desktop) {
         LOG_W_ONCE("d3d12", "ResourceBarrier: transition of a resource without desktop backing skipped");
         return;
@@ -250,7 +250,7 @@ static void record_buffer_group(ID3D12GraphicsCommandList7* list, const D3D12_BA
         D3D12_BUFFER_BARRIER b = g.pBufferBarriers[i];
         u64 offset;
         b.pResource =
-            b.pResource ? console_resource_desktop((ConsoleResource*)b.pResource, &offset) : nullptr;
+            b.pResource ? console_resource_desktop((ConsoleResource*)b.pResource, &offset, GPU_READ) : nullptr;
         if (!b.pResource) {
             LOG_W_ONCE("d3d12", "Barrier: buffer without desktop backing skipped");
             continue;
@@ -279,7 +279,7 @@ static void record_texture_group(ID3D12GraphicsCommandList7* list, const D3D12_B
         D3D12_TEXTURE_BARRIER b = g.pTextureBarriers[i];
         const ConsoleResource* r = (const ConsoleResource*)b.pResource;
         u64 offset;
-        b.pResource = r ? console_resource_desktop((ConsoleResource*)r, &offset) : nullptr;
+        b.pResource = r ? console_resource_desktop((ConsoleResource*)r, &offset, GPU_READ) : nullptr;
         if (!b.pResource) {
             LOG_W_ONCE("d3d12", "Barrier: texture without desktop backing skipped");
             continue;

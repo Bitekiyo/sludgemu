@@ -1,84 +1,78 @@
-# GPU memory: page tables
+# GPU memory: windows and page tables
 
 Console titles share one memory between CPU and GPU, and the GPU reaches it through page tables:
 an address is a page of 64 KiB anywhere in physical memory, the same frame can sit at several
 addresses (titles alias render target memory, move texture pages around, map pools twice), and
 memory can be GPU-only. Desktop GPUs have video memory of their own, reached through resources.
 
-This layer gives the title's GPU addresses page tables of their own, in video memory.
+This layer gives the GPU two ways to title memory, chosen page by page:
+
+- **Windows** (`gpu/gpu_window.h`): desktop buffers over heaps opened on the title's own pages. The
+  GPU reads and writes the CPU's memory in place, coherent with the CPU's caches line by line, as on
+  console. Nothing is copied, but a window covers one block of memory: pages that follow each other
+  for the title must follow each other in RAM.
+- **Page tables** (`gpu/page_tables.h`): reserved buffers whose pages map to tiles of video memory.
+  Any layout of frames works (aliases, pools mapped out of order), and the memory needs no RAM, but
+  where the CPU uses it too, copies keep the two in step.
+
+## Which pages go where
+
+Memory both CPU and GPU use is windowed: the title's own graphics allocations (one block each),
+write-combined memory (what the CPU writes for the GPU to read once) and physical memory something
+has written. Memory the CPU can't reach, and physical memory nothing has written yet (render target
+memory, buffers the GPU fills), goes to the page tables, as do accesses a window can't serve (frames
+mapped out of order). A page keeps its way once chosen, so every view of it sees the same memory;
+when the title maps other frames there, it is chosen again.
 
 ## Page tables
 
 Title GPU address space is covered by **segments**: reserved buffers of 4 GiB starting every 2 GiB
-(segment *k* covers `[k * 2 GiB, k * 2 GiB + 4 GiB)`). Desktop buffer views can't start more than
+(segment *k* covers `[k * 2 GiB, k * 2 GiB + 4 GiB)`). Desktop buffer views can't reach more than
 4 GiB into their resource, so a single buffer can't cover a large range; with overlapping segments,
 any access of up to 2 GiB starting in granule *k* lies inside segment *k*. Segments are created when
 the GPU first reaches their granule.
 
-A page of title memory the GPU reads or writes is backed by a **tile** of video memory
-(`gpu/tile_pool.h`) and mapped into the segments that reach it. The tile belongs to what backs the
-page, not to the address:
-
-- in ranges of physical memory, the **frame** mapped there: aliases share the tile, so a frame
-  mapped at two addresses is the same memory for the GPU, as on console;
-- in other graphics ranges (title allocations that aren't physical memory), the page itself.
-
-Translating a title GPU address (`gpu_translate`) gives the segment and the offset in it. Pages
-get their tiles when a translation first reaches them; mapping happens on the queue of the next
-submission, before it runs. When the title maps other frames at an address or unmaps it, the
-segments follow at the next submission, and tiles nothing maps any more go back to the pool once
-the GPU is done with them.
-
-Memory the GPU never reaches as a buffer gets no tile of its own.
-
-## Textures
-
-Desktop textures lay texels out their own way, so they are resources of their own, but their memory
-follows the same pages:
-
-- **Render targets, depth and UAV textures** are reserved textures whose tiles map onto the tiles of
-  the frames under them. Titles alias such memory (a render target in one pass, a buffer or another
-  target in the next, with contents undefined across the switch), and on the desktop it is then the
-  same video memory too: the GPU takes what the console's takes. Their contents never need title
-  memory.
-- **Textures the GPU only reads** get their contents from title memory, where files and the CPU put
-  them; their tiles hold the desktop layout and are mapped where the title mapped memory
-  (`hle/d3d12/texture_sync`). Their data is in RAM once and in video memory once.
+A page the page tables serve is backed by a **tile** of video memory (`gpu/tile_pool.h`) mapped into
+the segments that reach it. The tile belongs to what backs the page, not to the address: in physical
+memory the **frame** mapped there (every address showing it shares the tile, as on console), in other
+graphics memory the page itself. Mapping happens on the page tables' own copy queue, which every title
+submission waits for; tiles nothing maps any more go back to the pool once the GPU is done with them.
 
 ## Coherence
 
-A page with a tile has two copies, the tile and title memory. Which one is current:
+A tiled page the CPU can reach (through any address showing its frame) has two copies:
 
-- **CPU writes** (title stores, file reads, DirectStorage requests, the kernel) go to title memory.
-  Pages with tiles are write-watched (`mem_watch_writes`); the first write after an upload marks
-  the page, and the next submission uploads it before the title's work.
-- **GPU writes** go to the tile. Pages work may write (copy destinations, unordered access views,
-  query resolves) are taken from the CPU after the submission (no access); the first CPU access
-  waits for the GPU and downloads the tile.
-- **Pages the CPU polls** while the GPU writes them (fence values, counters written at the end of
-  work) stay in title memory: the GPU writes them through a window over the page, so the CPU sees
-  each value as the GPU writes it.
+- **CPU writes** go to title memory. Tiled pages are write-watched (`mem_watch_writes`); the first
+  write after an upload marks the page, and the next submission, or the next CPU release of GPU work
+  (a counter store or fence signal), uploads it first. Device writes (file reads, DirectStorage) are
+  reported and uploaded the same way.
+- **GPU writes** go to the tile. Pages GPU work may write (unordered access views, copy destinations,
+  query resolves) are taken from the CPU at each submission (no access, `mem_take_pages`); the first
+  CPU access waits for the GPU and copies the tile back. Shared memory is windowed, so this is rare.
+- **Small values the CPU polls** (fence values, counters written at the end of work) are written to
+  title memory through a window as well as to the page tables.
 
-Memory both CPU and GPU use is resident twice; memory only one of them uses, once.
+Texture uploads (`hle/d3d12/texture_sync`) read whichever copy is current.
+
+## Textures
+
+Desktop textures lay texels out their own way, so they are resources of their own. Textures the GPU
+only reads are reserved textures whose tiles hold the desktop layout and are mapped where the title
+mapped memory; their contents come from title memory. Render target, depth and UAV textures are whole
+desktop textures for now; mapping their tiles onto the frames under them would let aliased memory be
+the same video memory, as on console.
+
+## Open points
+
+- Page mapping changes a title orders on a queue (`CopyPageMappings` on a command queue) are applied
+  when called and reach the page tables at the next submission, not after the work queued before them.
+- Root descriptors carry no size; through the page tables they reach 64 KiB (a constant buffer's
+  maximum). Raw buffers read further through a root descriptor would need the reach of the program.
+- A small value written by the GPU through both ways (fence values, counters) can be overwritten in the
+  tile by an upload of the same page made before the write ran.
 
 ## System memory
 
-Physical memory no longer needs to be laid out so that what is contiguous for the title is
-contiguous in RAM, since the GPU doesn't read it in place: frames are bound densely, and only what
-the CPU (or a device writing for it) touches is backed by RAM.
-
-## Status
-
-Being built in steps, each one working:
-
-1. Pages the CPU can't access until a listener brings them up to date (the memory core).
-2. Segments, tiles per frame or page, translation through segments, uploads of CPU writes,
-   GPU-written pages taken from the CPU and downloaded on access, windows for polled pages; page
-   table work runs on a queue of its own that title submissions wait for.
-3. Texture uploads read title memory only (no windows over texture memory).
-4. Render target, depth and UAV textures on frame tiles.
-5. Dense frame binding in system memory.
-
-Measured before, in a title's loading screen: 8.2 GB of physical memory sections held
-3.9 GB of data, render target memory was backed in RAM by buffer views over it (2.4 GB), and video
-memory allocations count towards the process's commit as well (Windows charges them in full).
+Title memory grows commit on demand. Before committing more, the system's remaining commit is checked
+(`mem_commit_available`): commit is shared with every process and with video memory allocations, and
+title memory that takes the last of it makes the whole system fail, so the title stops first.

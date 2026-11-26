@@ -98,19 +98,35 @@ bool list_cpu_descriptor(u64 handle, u32 count, D3D12_CPU_DESCRIPTOR_HANDLE* out
     return true;
 }
 
-ID3D12Resource* list_resource(void* console_resource, u64* offset) {
+ID3D12Resource* list_resource(void* console_resource, u64* offset, GpuAccess access) {
     *offset = 0;
     if (!console_resource)
         return nullptr;
-    return console_resource_desktop((ConsoleResource*)console_resource, offset);
+    return console_resource_desktop((ConsoleResource*)console_resource, offset, access);
 }
 
 // Root descriptors and buffer views: title GPU addresses become desktop ones. Address 0 stays 0.
-static u64 desktop_address(u64 address, u64 size) {
+static u64 desktop_address(u64 address, u64 size, GpuAccess access) {
     u64 out = 0;
-    if (address && !console_translate_gpu_address(address, size ? size : 1, &out))
+    if (address && !console_translate_gpu_address(address, size ? size : 1, access, &out))
         LOG_W_ONCE("d3d12", "GPU address 0x%llx is outside GPU-visible memory", address);
     return out;
+}
+
+// Root descriptors carry no size: what the shader reads past the address must be mapped as well. A
+// constant buffer reaches at most 64 KiB (4096 vectors); raw buffers as far as the title's data goes,
+// which nothing states, so the same is assumed.
+#define ROOT_DESCRIPTOR_REACH KiB(64)
+
+static u64 root_address(u64 address, GpuAccess access) {
+    GpuAddress a;
+    if (!address)
+        return 0;
+    if (!gpu_translate_reach(address, ROOT_DESCRIPTOR_REACH, access, &a)) {
+        LOG_W_ONCE("d3d12", "GPU address 0x%llx is outside GPU-visible memory", address);
+        return 0;
+    }
+    return a.desktop_address;
 }
 
 // --- state -------------------------------------------------------------------------------------------
@@ -607,32 +623,32 @@ static void WINAPI list_set_graphics_root_32bit_constants(ConsoleCommandList* se
 }
 
 static void WINAPI list_set_compute_root_cbv(ConsoleCommandList* self, UINT index, UINT64 address) {
-    u64 a = desktop_address(address, 0);
+    u64 a = root_address(address, GPU_READ);
     record_root_arg(self, false, index, ROOT_ARG_CBV, a);
 }
 
 static void WINAPI list_set_graphics_root_cbv(ConsoleCommandList* self, UINT index, UINT64 address) {
-    u64 a = desktop_address(address, 0);
+    u64 a = root_address(address, GPU_READ);
     record_root_arg(self, true, index, ROOT_ARG_CBV, a);
 }
 
 static void WINAPI list_set_compute_root_srv(ConsoleCommandList* self, UINT index, UINT64 address) {
-    u64 a = desktop_address(address, 0);
+    u64 a = root_address(address, GPU_READ);
     record_root_arg(self, false, index, ROOT_ARG_SRV, a);
 }
 
 static void WINAPI list_set_graphics_root_srv(ConsoleCommandList* self, UINT index, UINT64 address) {
-    u64 a = desktop_address(address, 0);
+    u64 a = root_address(address, GPU_READ);
     record_root_arg(self, true, index, ROOT_ARG_SRV, a);
 }
 
 static void WINAPI list_set_compute_root_uav(ConsoleCommandList* self, UINT index, UINT64 address) {
-    u64 a = desktop_address(address, 0);
+    u64 a = root_address(address, GPU_WRITE);
     record_root_arg(self, false, index, ROOT_ARG_UAV, a);
 }
 
 static void WINAPI list_set_graphics_root_uav(ConsoleCommandList* self, UINT index, UINT64 address) {
-    u64 a = desktop_address(address, 0);
+    u64 a = root_address(address, GPU_WRITE);
     record_root_arg(self, true, index, ROOT_ARG_UAV, a);
 }
 
@@ -652,7 +668,7 @@ static void WINAPI list_ia_set_index_buffer(ConsoleCommandList* self, const D3D1
         return;
     }
     s.index_buffer = *view;
-    s.index_buffer.BufferLocation = desktop_address(view->BufferLocation, view->SizeInBytes);
+    s.index_buffer.BufferLocation = desktop_address(view->BufferLocation, view->SizeInBytes, GPU_READ);
     self->desktop->IASetIndexBuffer(&s.index_buffer);
 }
 
@@ -667,7 +683,7 @@ static void WINAPI list_ia_set_vertex_buffers(ConsoleCommandList* self, UINT sta
         D3D12_VERTEX_BUFFER_VIEW& v = s.vertex_buffers[start + i];
         if (views) {
             v = views[i];
-            v.BufferLocation = desktop_address(v.BufferLocation, v.SizeInBytes);
+            v.BufferLocation = desktop_address(v.BufferLocation, v.SizeInBytes, GPU_READ);
             s.vertex_buffer_mask |= 1u << (start + i);
         } else {
             v = {};
