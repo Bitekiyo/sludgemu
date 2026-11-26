@@ -142,6 +142,14 @@ static void log_exception(const char* kind, EXCEPTION_POINTERS* ep) {
                              ? "read"
                              : (er->ExceptionInformation[0] == 1 ? "write" : "execute");
         LOG_E("crash", "  %s of address 0x%llx", op, (unsigned long long)er->ExceptionInformation[1]);
+        // What the address is to Windows now: unmapped, reserved, or protected against the access
+        // (write watches and titles protect pages). VirtualQuery takes none of our locks.
+        MEMORY_BASIC_INFORMATION mbi;
+        if (VirtualQuery((const void*)er->ExceptionInformation[1], &mbi, sizeof(mbi)))
+            LOG_E("crash",
+                  "  that page: state 0x%lx, protect 0x%lx, type 0x%lx; region %p+0x%llx of allocation %p",
+                  mbi.State, mbi.Protect, mbi.Type, mbi.BaseAddress, (unsigned long long)mbi.RegionSize,
+                  mbi.AllocationBase);
     }
     validate_loader_index();
     LOG_E("crash", "  rax=%016llx rbx=%016llx rcx=%016llx rdx=%016llx", c->Rax, c->Rbx, c->Rcx, c->Rdx);

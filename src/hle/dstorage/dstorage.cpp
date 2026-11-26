@@ -446,6 +446,7 @@ class ConsoleQueue : public IUnknown {
         AcquireSRWLockExclusive(&m_lock);
         process_locked();
         ReleaseSRWLockExclusive(&m_lock);
+        log_failures();
     }
 
     // Requests being processed are canceled by the desktop queue; waiting ones are dropped.
@@ -500,6 +501,7 @@ class ConsoleQueue : public IUnknown {
 
     void enqueue(const PendingCommand& c);
     void process_locked();
+    void log_failures();
     void send(const ConsoleRequest* r);
     void add_write(u64 base, u64 size);
     void finish_writes();
@@ -517,6 +519,7 @@ class ConsoleQueue : public IUnknown {
     }
 
     IDStorageQueue1* m_desktop;
+    u32 m_failures_logged = 0;
     ConsoleQueueDesc1 m_desc;
     u16 m_capacity;
     SRWLOCK m_lock = SRWLOCK_INIT;
@@ -714,6 +717,28 @@ void ConsoleQueue::send(const ConsoleRequest* r) {
         }
     }
     m_desktop->EnqueueRequest(&d);
+}
+
+// Failures reach titles through status arrays (and error records, if they ask); new ones are logged
+// too. The queue's error event is set from the first failure on, so only then is the record read.
+void ConsoleQueue::log_failures() {
+    HANDLE error = m_desktop->GetErrorEvent();
+    if (!error || WaitForSingleObject(error, 0) != WAIT_OBJECT_0)
+        return;
+    DSTORAGE_ERROR_RECORD d;
+    m_desktop->RetrieveErrorRecord(&d);
+    if (d.FailureCount <= m_failures_logged)
+        return;
+    m_failures_logged = d.FailureCount;
+    const DSTORAGE_REQUEST& req = d.FirstFailure.Request.Request;
+    if (d.FirstFailure.CommandType == DSTORAGE_COMMAND_TYPE_REQUEST)
+        LOG_W("dstorage", "%u requests failed; the first (0x%08lx): %s, %u bytes into %p", d.FailureCount,
+              (unsigned long)d.FirstFailure.HResult,
+              d.FirstFailure.Request.RequestName[0] ? d.FirstFailure.Request.RequestName : "(unnamed)",
+              req.Destination.Memory.Size, req.Destination.Memory.Buffer);
+    else
+        LOG_W("dstorage", "%u commands failed; the first (0x%08lx) of type %d", d.FailureCount,
+              (unsigned long)d.FirstFailure.HResult, d.FirstFailure.CommandType);
 }
 
 void ConsoleQueue::RetrieveErrorRecord(ConsoleErrorRecord* record) {
