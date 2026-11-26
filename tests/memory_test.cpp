@@ -164,6 +164,25 @@ static void test_runs_and_remaps() {
         CHECK(shows_frame(base + (4 + i) * PAGE, i == 3 ? other[0] : run[i]));
     query_allocation(base + 4 * PAGE, &alloc, &size, &state);
     CHECK(size == 3 * PAGE);
+    // Mapping the frames that are there again changes nothing: no notification, the views stay.
+    u64 again[8] = {run[0], run[1], run[2], other[0], run[4], run[5], run[6], run[7]};
+    notified = g_notifications;
+    CHECK(mem_map_physical(base + 4 * PAGE, 8, again));
+    CHECK(g_notifications == notified);
+    query_allocation(base + 4 * PAGE, &alloc, &size, &state);
+    CHECK(alloc == base + 4 * PAGE && size == 3 * PAGE);
+    // A span where one page changes notifies that page alone (here: back to the run, then away again).
+    again[3] = run[3];
+    CHECK(mem_map_physical(base + 4 * PAGE, 8, again));
+    CHECK(g_notifications == notified + 1 && g_last_notified == base + 7 * PAGE);
+    again[3] = other[0];
+    void* again_vas[8];
+    for (u32 i = 0; i < 8; i++)
+        again_vas[i] = base + (4 + i) * PAGE;
+    CHECK(mem_map_physical_scatter(again_vas, 8, again));
+    CHECK(g_notifications == notified + 2 && g_last_notified == base + 7 * PAGE);
+    for (u32 i = 0; i < 8; i++)
+        CHECK(shows_frame(base + (4 + i) * PAGE, i == 3 ? other[0] : run[i]));
     // The frames are no longer consecutive at page 7: three blocks.
     CHECK(mem_backing_block(base + 5 * PAGE, &block));
     CHECK(block.base == base + 4 * PAGE && block.size == 3 * PAGE && block.host == mem_physical_ptr(run[0]));

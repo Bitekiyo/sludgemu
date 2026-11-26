@@ -894,9 +894,21 @@ static LONG CALLBACK on_access_fault(EXCEPTION_POINTERS* ep) {
     return backed ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
 }
 
+// The frame a page mapping entry names, or MEM_INVALID_PFN. Titles release slots by mapping page
+// number 0 over them (console page numbers start above it), so 0 unmaps like a missing array.
+static u32 entry_frame(const u64* pfns, u64 i) {
+    bool frame = pfns && pfns[i] != MEM_INVALID_PFN && pfns[i] != 0;
+    return frame ? (u32)(pfns[i] >> MEM_PAGE_NUMBER_SHIFT) : MEM_INVALID_PFN;
+}
+
 // Maps (or unmaps, for MEM_INVALID_PFN entries or pfns == nullptr) `count` consecutive pages at
-// `va`. Frames are backed when first touched (see "Lazy backing"). Range lock held exclusively.
-static bool map_span_locked(void* va, u64 count, const u64* pfns) {
+// `va`. Frames are backed when first touched (see "Lazy backing"). Pages that keep their frame are
+// left as they are: titles map the same frames again often (whole pools every frame), and that is
+// no change. [*changed_first, + *changed_count) gets the pages that did change (count 0: none).
+// Range lock held exclusively.
+static bool map_span_locked(void* va, u64 count, const u64* pfns, u64* changed_first, u64* changed_count) {
+    *changed_first = 0;
+    *changed_count = 0;
     RangeSlot* s = find_range_locked(va);
     if (!s || !(s->info.flags & MEM_RANGE_PLACEHOLDER) || ((uptr)va & (MEM_PAGE_SIZE - 1))) {
         LOG_E("memory", "physical map target %p is not a page in a placeholder range", va);
@@ -915,6 +927,24 @@ static bool map_span_locked(void* va, u64 count, const u64* pfns) {
             return false;
         }
     }
+    // The pages whose frame changes: [lo, hi) of the span.
+    u64 lo = count, hi = 0;
+    AcquireSRWLockShared(&g_mem.phys_lock);
+    for (u64 i = 0; i < count; i++) {
+        if (frame_at_locked(s, first + (u32)i) != entry_frame(pfns, i)) {
+            lo = lo < i ? lo : i;
+            hi = i + 1;
+        }
+    }
+    ReleaseSRWLockShared(&g_mem.phys_lock);
+    if (lo >= hi)
+        return true;
+    first += (u32)lo;
+    pfns = pfns ? pfns + lo : nullptr;
+    count = hi - lo;
+    *changed_first = lo;
+    *changed_count = count;
+
     if (pfns && !s->pending) {
         s->pending = (u32*)malloc((u64)range_pages(s) * sizeof(u32));
         if (!s->pending)
@@ -931,45 +961,63 @@ static bool map_span_locked(void* va, u64 count, const u64* pfns) {
     ReleaseSRWLockShared(&g_mem.phys_lock);
     unmap_run(s, first, (u32)count);
     for (u64 i = 0; s->pending && i < count; i++) {
-        // Titles release slots by mapping page number 0 over them (console page numbers start
-        // above it), so 0 unmaps like a missing array.
-        bool frame = pfns && pfns[i] != MEM_INVALID_PFN && pfns[i] != 0;
-        s->pending[first + i] = frame ? (u32)(pfns[i] >> MEM_PAGE_NUMBER_SHIFT) : MEM_INVALID_PFN;
-        if (frame)
+        s->pending[first + i] = entry_frame(pfns, i);
+        if (s->pending[first + i] != MEM_INVALID_PFN)
             note_mapped(s->pending[first + i], (u64)page_va(s, first + (u32)i));
     }
     return true;
 }
 
 bool mem_map_physical(void* va, u64 count, const u64* pfns) {
+    u64 first, changed;
     AcquireSRWLockExclusive(&g_mem.range_lock);
-    bool ok = map_span_locked(va, count, pfns);
+    bool ok = map_span_locked(va, count, pfns, &first, &changed);
     ReleaseSRWLockExclusive(&g_mem.range_lock);
-    if (ok)
-        notify_mapping_changed((const u8*)va, count << MEM_PAGE_SHIFT);
+    if (ok && changed)
+        notify_mapping_changed((const u8*)va + (first << MEM_PAGE_SHIFT), changed << MEM_PAGE_SHIFT);
     return ok;
 }
 
 bool mem_map_physical_scatter(void* const* vas, u64 count, const u64* pfns) {
+    // Entries at consecutive addresses form spans, which map_span_locked turns into runs. The changed
+    // part of each span is noted for the listeners, called once the range lock is released.
+    struct Change {
+        const u8* base;
+        u64 size;
+    };
+    Change local[16];
+    Change* changes = local;
+    u64 change_count = 0, change_capacity = ARRAY_COUNT(local);
     AcquireSRWLockExclusive(&g_mem.range_lock);
     bool ok = true;
-    // Entries at consecutive addresses form spans, which map_span_locked turns into runs.
     for (u64 i = 0; ok && i < count;) {
         u64 span = 1;
         while (i + span < count && (u8*)vas[i + span] == (u8*)vas[i] + (span << MEM_PAGE_SHIFT))
             span++;
-        ok = map_span_locked(vas[i], span, pfns ? pfns + i : nullptr);
+        u64 first, changed;
+        ok = map_span_locked(vas[i], span, pfns ? pfns + i : nullptr, &first, &changed);
+        if (ok && changed) {
+            if (change_count == change_capacity) {
+                change_capacity *= 2;
+                Change* grown = (Change*)malloc(change_capacity * sizeof(Change));
+                if (!grown)
+                    FATAL("out of memory mapping pages");
+                memcpy(grown, changes, change_count * sizeof(Change));
+                if (changes != local)
+                    free(changes);
+                changes = grown;
+            }
+            changes[change_count++] = {(const u8*)vas[i] + (first << MEM_PAGE_SHIFT),
+                                       changed << MEM_PAGE_SHIFT};
+        }
         i += span;
     }
     ReleaseSRWLockExclusive(&g_mem.range_lock);
     // Spans before a failed one did change.
-    for (u64 i = 0; i < count;) {
-        u64 span = 1;
-        while (i + span < count && (u8*)vas[i + span] == (u8*)vas[i] + (span << MEM_PAGE_SHIFT))
-            span++;
-        notify_mapping_changed((const u8*)vas[i], span << MEM_PAGE_SHIFT);
-        i += span;
-    }
+    for (u64 i = 0; i < change_count; i++)
+        notify_mapping_changed(changes[i].base, changes[i].size);
+    if (changes != local)
+        free(changes);
     return ok;
 }
 
