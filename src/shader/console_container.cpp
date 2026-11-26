@@ -34,8 +34,11 @@ static u32 read_u32(const u8* p) {
     return v;
 }
 
-// The DXIL part of a DXBC container, or nullptr.
-static const u8* dxil_part(const u8* b, usize size, u32* part_size) {
+#define PART_DXIL 0x4C495844u // "DXIL"
+#define PART_ISG1 0x31475349u // "ISG1": input signature
+
+// A part of a DXBC container, or nullptr.
+static const u8* container_part(const u8* b, usize size, u32 fourcc, u32* part_size) {
     if (size < 32 || read_u32(b) != 0x43425844u) // "DXBC"
         return nullptr;
     u32 count = read_u32(b + 28);
@@ -48,12 +51,41 @@ static const u8* dxil_part(const u8* b, usize size, u32* part_size) {
         u32 n = read_u32(b + at + 4);
         if ((usize)at + 8 + n > size)
             return nullptr;
-        if (read_u32(b + at) == 0x4C495844u) { // "DXIL"
+        if (read_u32(b + at) == fourcc) {
             *part_size = n;
             return b + at + 8;
         }
     }
     return nullptr;
+}
+
+// The input signature: element count, offset of the elements, then 32-byte elements (stream, semantic
+// name offset, semantic index, system value, component type, register, mask byte, read mask byte,
+// minimum precision); names are NUL terminated, at offsets from the part's start.
+#define SIGNATURE_ELEMENT_SIZE 32
+
+static bool read_inputs(const u8* isg, u32 size, ConsoleContainerShader* out) {
+    if (size < 8)
+        return false;
+    u32 count = read_u32(isg), at = read_u32(isg + 4);
+    if (at > size || count > (size - at) / SIGNATURE_ELEMENT_SIZE)
+        return false;
+    for (u32 i = 0; i < count; i++) {
+        const u8* e = isg + at + i * SIGNATURE_ELEMENT_SIZE;
+        u32 name = read_u32(e + 4);
+        if (name >= size || !memchr(isg + name, 0, size - name))
+            return false;
+        if (read_u32(e + 12) != 0) // system values don't come from the input layout
+            continue;
+        if (out->input_count == CONTAINER_MAX_INPUTS || read_u32(e + 20) > 255)
+            return false;
+        ContainerInput& in = out->inputs[out->input_count++];
+        in.semantic = (const char*)isg + name;
+        in.semantic_index = read_u32(e + 8);
+        in.reg = (u8)read_u32(e + 20);
+        in.mask = e[24] & 0xF;
+    }
+    return true;
 }
 
 // The compressed shader object inside the DXIL part: "XBCH", version, compressed size, 0,
@@ -75,7 +107,7 @@ bool console_container_open(const void* bytecode, usize size, ShaderStage stage,
                             const char** error) {
     memset(out, 0, sizeof(*out));
     u32 dxil_size = 0;
-    const u8* dxil = bytecode ? dxil_part((const u8*)bytecode, size, &dxil_size) : nullptr;
+    const u8* dxil = bytecode ? container_part((const u8*)bytecode, size, PART_DXIL, &dxil_size) : nullptr;
     if (!dxil) {
         *error = "not a shader container with a DXIL part";
         return false;
@@ -119,6 +151,13 @@ bool console_container_open(const void* bytecode, usize size, ShaderStage stage,
 
     if (stage == SHADER_VERTEX) {
         out->user_sgprs = (u8)((read_u32(object + VS_RSRC2) >> 1) & 31);
+        u32 isg_size = 0;
+        const u8* isg = container_part((const u8*)bytecode, size, PART_ISG1, &isg_size);
+        if (!isg || !read_inputs(isg, isg_size, out)) {
+            *error = "vertex shader container without a readable input signature";
+            console_container_close(out);
+            return false;
+        }
         return true;
     }
     if (stage != SHADER_PIXEL) {

@@ -343,6 +343,7 @@ static const u8 k_subobject_align[30] = {8, 8, 8, 8, 8, 8, 8, 8, 4, 4, 4, 4, 8, 
 struct StreamPipeline {
     ConsoleRootSignature* root_signature;
     D3D12_SHADER_BYTECODE vs, ps;
+    D3D12_INPUT_LAYOUT_DESC layout; // the title's, valid while the pipeline is made
     PipelineFixedState fixed;
 };
 
@@ -447,6 +448,7 @@ static bool read_stream(const D3D12_PIPELINE_STATE_STREAM_DESC* desc, StreamPipe
             D3D12_INPUT_LAYOUT_DESC layout;
             memcpy(&layout, p, sizeof(layout));
             input_layout(layout, &out->fixed);
+            out->layout = layout;
             break;
         }
         case STREAM_STRIP_CUT:
@@ -467,6 +469,27 @@ static bool read_stream(const D3D12_PIPELINE_STATE_STREAM_DESC* desc, StreamPipe
     return true;
 }
 
+// Container vertex shaders leave loading their inputs to the driver's fetch subroutine, which loads
+// each input layout element the shader has an input for (matched by semantic) into that input's
+// registers.
+static void fetch_layout(const D3D12_INPUT_LAYOUT_DESC& layout, const ConsoleContainerShader& vs,
+                         ShaderInfo* info) {
+    for (u32 i = 0; i < layout.NumElements && i < SHADER_MAX_VERTEX_ELEMENTS; i++) {
+        const D3D12_INPUT_ELEMENT_DESC& e = layout.pInputElementDescs[i];
+        for (u32 k = 0; e.SemanticName && k < vs.input_count; k++) {
+            const ContainerInput& in = vs.inputs[k];
+            if (in.semantic_index != e.SemanticIndex || _stricmp(in.semantic, e.SemanticName) != 0)
+                continue;
+            u32 vgpr = CONTAINER_FETCH_FIRST_VGPR + 4u * in.reg;
+            if (in.mask && vgpr + 4 <= 256) {
+                info->fetch_vgpr[i] = (u8)vgpr;
+                info->fetch_components[i] = in.mask & 8 ? 4 : in.mask & 4 ? 3 : in.mask & 2 ? 2 : 1;
+            }
+            break;
+        }
+    }
+}
+
 // Programs from the stream's shader containers.
 static bool request_stream_programs(ConsolePipelineState* pso, const StreamPipeline& sp, const char** why) {
     const ConsoleRootSignature* rs = pso->root_signature;
@@ -484,6 +507,7 @@ static bool request_stream_programs(ConsolePipelineState* pso, const StreamPipel
     info.user_sgprs = vs.user_sgprs;
     info.element_count = pso->fixed.element_count;
     memcpy(info.elements, pso->fixed.elements, sizeof(info.elements));
+    fetch_layout(sp.layout, vs, &info);
     pso->programs[0] = shader_program_get(vs.code, vs.code_size, info);
     console_container_close(&vs);
     if (sp.ps.pShaderBytecode && sp.ps.BytecodeLength) {

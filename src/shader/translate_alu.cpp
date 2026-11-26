@@ -458,6 +458,8 @@ static bool emit_scalar(Translator& t, const RdnaInst& in) {
         write_sgpr(t, d, 0, fmt(t, "0x%08xu", in.offset + 4));
         write_sgpr(t, d, 1, "0u");
         return true;
+    case OP_S_SWAPPC_B64:
+        return emit_fetch_subroutine(t, in);
     case OP_S_GETREG_B32:
         write_sgpr(t, d, 0, "0u"); // hardware registers: nothing a translated program depends on
         return true;

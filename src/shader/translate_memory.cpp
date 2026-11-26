@@ -703,6 +703,45 @@ static bool emit_vertex_fetch(Translator& t, const RdnaInst& in, u32 slot) {
     return true;
 }
 
+bool emit_fetch_subroutine(Translator& t, const RdnaInst& in) {
+    bool any = false;
+    for (u32 i = 0; i < t.info->element_count; i++)
+        any |= t.info->fetch_components[i] != 0;
+    if (t.info->stage != SHADER_VERTEX || !any) {
+        translator_fail(t, "s_swappc_b64 at 0x%x without a fetch subroutine to call", in.offset);
+        return false;
+    }
+    static const char k_comp[4] = {'x', 'y', 'z', 'w'};
+    for (u32 i = 0; i < t.info->element_count; i++) {
+        u32 count = t.info->fetch_components[i];
+        if (!count)
+            continue;
+        FormatLayout layout;
+        if (!vertex_format_layout(t.info->elements[i].format, &layout)) {
+            translator_fail(t, "vertex element %u in format %u", i, t.info->elements[i].format);
+            return false;
+        }
+        if ((t.out->vertex_element_mask & (1u << i)) && !t.fetch_typed[i]) {
+            translator_fail(t, "vertex element %u fetched both raw and formatted", i);
+            return false;
+        }
+        t.out->vertex_element_mask |= 1u << i;
+        t.fetch_typed[i] = true;
+        t.fetch_class[i] = layout.value_class;
+        t.vs_fetch_components[i] = 4; // typed: all four components, missing ones read as 0, 0, 0, 1
+        for (u32 c = 0; c < count; c++) {
+            u32 component = c < layout.components ? layout.order[c] : c;
+            const char* value = fmt(t, "input.e%u.%c", i, k_comp[component & 3]);
+            write_vgpr(t, in, t.info->fetch_vgpr[i] + c,
+                       layout.value_class != 1 ? fmt(t, "asuint(%s)", value) : value);
+        }
+    }
+    // The return address, which the subroutine jumps back to.
+    write_sgpr(t, in.dst[0], 0, fmt(t, "0x%08xu", in.offset + 4));
+    write_sgpr(t, in.dst[0], 1, "0u");
+    return true;
+}
+
 static bool emit_buffer(Translator& t, const RdnaInst& in) {
     if (in.op == OP_BUFFER_GL0_INV || in.op == OP_BUFFER_GL1_INV)
         return true;

@@ -505,6 +505,20 @@ static void transfer(const Translator& t, TagState& s, const RdnaInst& in, u32 i
         else if (in.dst[0].kind == OPND_SGPR)
             s.constant_known[(in.dst[0].reg & 127) / 64] &= ~(1ull << ((in.dst[0].reg & 127) % 64));
         return;
+    case OP_S_SWAPPC_B64: // the fetch subroutine: the return address, and the inputs it loads
+        for (u32 i = 0; i < 2; i++) {
+            set_tag(s, in.dst[0], i, TAG_NONE);
+            set_descriptor(s, in.dst[0], i, NO_DESCRIPTOR);
+        }
+        set_constant(s, in.dst[0], 0, in.offset + 4);
+        set_constant(s, in.dst[0], 1, 0u);
+        for (u32 i = 0; i < t.info->element_count; i++)
+            for (u32 c = 0; c < t.info->fetch_components[i]; c++) {
+                u32 r = (t.info->fetch_vgpr[i] + c) & 255;
+                s.vgpr[r] = TAG_NONE;
+                s.vgpr_const[r] = false;
+            }
+        return;
     case OP_S_GETPC_B64:
         set_tag(s, in.dst[0], 0, make_tag(TAG_PC, 0));
         set_tag(s, in.dst[0], 1, TAG_NONE);

@@ -195,3 +195,6 @@ u32 mask_dwords(const Translator& t);
 
 bool emit_alu(Translator& t, const RdnaInst& in);    // translate_alu.cpp
 bool emit_memory(Translator& t, const RdnaInst& in); // translate_memory.cpp
+// A vertex shader's call of the driver's fetch subroutine (see ShaderInfo::fetch_vgpr): its loads, in
+// line. translate_memory.cpp
+bool emit_fetch_subroutine(Translator& t, const RdnaInst& in);

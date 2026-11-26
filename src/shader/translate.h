@@ -87,6 +87,11 @@ struct ShaderInfo {
     // Vertex shaders: the input layout; fetches are matched to elements by slot and offset.
     u8 element_count;
     VertexElement elements[SHADER_MAX_VERTEX_ELEMENTS];
+    // Vertex shaders that leave loading their inputs to the driver's fetch subroutine (they call it with
+    // s_swappc_b64): the subroutine loads element i into fetch_components[i] VGPRs from fetch_vgpr[i]
+    // (0: not loaded), converted by the element's format.
+    u8 fetch_vgpr[SHADER_MAX_VERTEX_ELEMENTS];
+    u8 fetch_components[SHADER_MAX_VERTEX_ELEMENTS];
 
     // Pixel shaders: which input VGPRs exist (SPI_PS_INPUT_ADDR layout) and the export formats.
     u32 ps_input_addr;
