@@ -571,16 +571,24 @@ void mem_trap_stores(const void* base, u64 size) {
     watch_or_trap(base, size, true);
 }
 
-void mem_unwatch_writes(const void* base, u64 size) {
+static void end_armed(const void* base, u64 size, bool trap) {
     if (!g_track.live)
         return;
     AcquireSRWLockShared(&g_mem.range_lock);
     AcquireSRWLockExclusive(&g_track.lock);
-    u32 id = find_watch((u64)base, size, false);
+    u32 id = find_watch((u64)base, size, trap);
     if (id != NO_NODE)
         end_watch(id, nullptr, nullptr);
     ReleaseSRWLockExclusive(&g_track.lock);
     ReleaseSRWLockShared(&g_mem.range_lock);
+}
+
+void mem_unwatch_writes(const void* base, u64 size) {
+    end_armed(base, size, false);
+}
+
+void mem_untrap_stores(const void* base, u64 size) {
+    end_armed(base, size, true);
 }
 
 void mem_end_write_watches(const void* base, u64 size) {
@@ -721,6 +729,8 @@ static bool page_protected(u64 key) {
     return c && *c;
 }
 
+static void finish_trapped_pages(const u64* pages, const u64* keys, Report* reports, u32* report_count);
+
 bool tracking_write_fault(EXCEPTION_POINTERS* ep, u64 addr) {
     if (!g_track.live)
         return false;
@@ -740,15 +750,33 @@ bool tracking_write_fault(EXCEPTION_POINTERS* ep, u64 addr) {
         }
         ReleaseSRWLockExclusive(&g_track.lock);
     }
+    Report stores[MAX_REPORTS];
+    u32 store_count = 0;
     if (trapped) {
         // The store runs alone with the page writable (single-stepped); tracking_single_step
         // protects it again and reports.
         u64 first = g_step_page[0].get();
         bool known = first == page || g_step_page[1].get() == page;
         if (!known && first && g_step_page[1].get()) {
-            LOG_E("memory", "a store at %p reaches a third trapped page", (void*)ep->ContextRecord->Rip);
-            handled = false;
-        } else {
+            if (ep->ContextRecord->Rip == g_step_ip.get()) {
+                // A repeated string store (memcpy's rep movsb) moving on: it is done with the pages
+                // before, which are protected again now.
+                u64 done[2] = {first, g_step_page[1].get()};
+                u64 done_keys[2] = {g_step_key[0].get(), g_step_key[1].get()};
+                for (u32 k = 0; k < 2; k++) {
+                    g_step_page[k].set(0);
+                    g_step_key[k].set(0);
+                }
+                AcquireSRWLockShared(&g_track.lock);
+                finish_trapped_pages(done, done_keys, stores, &store_count);
+                ReleaseSRWLockShared(&g_track.lock);
+                first = 0;
+            } else {
+                LOG_E("memory", "a store at %p reaches a third trapped page", (void*)ep->ContextRecord->Rip);
+                handled = false;
+            }
+        }
+        if (handled) {
             DWORD old;
             if (!VirtualProtect((void*)page, HOST_PAGE, mapping_protect(s) & 0xFF, &old)) {
                 handled = false;
@@ -767,7 +795,64 @@ bool tracking_write_fault(EXCEPTION_POINTERS* ep, u64 addr) {
     }
     ReleaseSRWLockShared(&g_mem.range_lock);
     report_writes(reports, report_count);
+    for (u32 i = 0; i < store_count && g_track.store_listener; i++)
+        g_track.store_listener(stores[i].base, stores[i].size);
     return handled;
+}
+
+void tracking_describe_write_fault(u64 addr) {
+    u64 page = addr & ~(u64)(HOST_PAGE - 1);
+    AcquireSRWLockShared(&g_mem.range_lock);
+    const RangeSlot* s = find_range_locked((const void*)addr);
+    if (!s) {
+        ReleaseSRWLockShared(&g_mem.range_lock);
+        LOG_E("memory", "unclaimed write fault at 0x%llx: not title memory", addr);
+        return;
+    }
+    u32 pending = MEM_INVALID_PFN, id = MEM_INVALID_PFN, region_first = 0, region_real = MEM_INVALID_PFN;
+    if (s->info.flags & MEM_RANGE_PLACEHOLDER) {
+        u32 p = (u32)((page - (u64)s->info.base) >> MEM_PAGE_SHIFT);
+        pending = s->pending ? s->pending[p] : MEM_INVALID_PFN;
+        AcquireSRWLockShared(&g_mem.phys_lock);
+        id = frame_at_locked(s, p);
+        const MemRegion& r = s->regions[region_find(s, p)];
+        region_first = r.first_page;
+        region_real = r.pfn;
+        ReleaseSRWLockShared(&g_mem.phys_lock);
+    }
+    u64 key = canonical(s, page, false);
+    u64 backed_key = canonical(s, page, true);
+    AcquireSRWLockShared(&g_track.lock);
+    const u16* count = key ? page_count(key, false) : nullptr;
+    u32 n = count ? *count : 0;
+    ReleaseSRWLockShared(&g_track.lock);
+    LOG_E(
+        "memory",
+        "unclaimed write fault at 0x%llx: range %p+0x%llx flags 0x%x protect 0x%x; pending frame 0x%x, frame "
+        "0x%x, region from page %u real 0x%x; key 0x%llx (backed 0x%llx), protection count %u",
+        addr, s->info.base, s->info.size, s->info.flags, s->info.protect, pending, id, region_first,
+        region_real, key, backed_key, n);
+    ReleaseSRWLockShared(&g_mem.range_lock);
+}
+
+// Protects trapped pages a store has finished with again (those still trapped), noting the traps over
+// them for the store listener. Range lock and tracking lock held shared.
+static void finish_trapped_pages(const u64* pages, const u64* keys, Report* reports, u32* report_count) {
+    for (u32 k = 0; k < 2 && pages[k]; k++) {
+        const RangeSlot* s = find_range_locked((const void*)pages[k]);
+        if (!s || !page_protected(keys[k]))
+            continue;
+        protect_va(s, pages[k], pages[k] + HOST_PAGE, true);
+        u64 granule = keys[k] >> GRANULE_SHIFT;
+        for (u32 n = g_track.buckets[granule_hash(granule)]; n != NO_NODE; n = g_track.nodes[n].next) {
+            const GranuleNode& node = g_track.nodes[n];
+            const Watch& w = g_track.watches[node.watch];
+            if (node.granule != granule || !w.trap || *report_count == MAX_REPORTS)
+                continue;
+            if (watch_covers(w, keys[k])) // spans are host page aligned
+                reports[(*report_count)++] = {w.base, w.size};
+        }
+    }
 }
 
 bool tracking_single_step(EXCEPTION_POINTERS* ep) {
@@ -789,21 +874,7 @@ bool tracking_single_step(EXCEPTION_POINTERS* ep) {
     u32 report_count = 0;
     AcquireSRWLockShared(&g_mem.range_lock);
     AcquireSRWLockShared(&g_track.lock);
-    for (u32 k = 0; k < 2 && pages[k]; k++) {
-        const RangeSlot* s = find_range_locked((const void*)pages[k]);
-        if (!s || !page_protected(keys[k]))
-            continue;
-        protect_va(s, pages[k], pages[k] + HOST_PAGE, true);
-        u64 granule = keys[k] >> GRANULE_SHIFT;
-        for (u32 n = g_track.buckets[granule_hash(granule)]; n != NO_NODE; n = g_track.nodes[n].next) {
-            const GranuleNode& node = g_track.nodes[n];
-            const Watch& w = g_track.watches[node.watch];
-            if (node.granule != granule || !w.trap || report_count == MAX_REPORTS)
-                continue;
-            if (watch_covers(w, keys[k])) // spans are host page aligned
-                reports[report_count++] = {w.base, w.size};
-        }
-    }
+    finish_trapped_pages(pages, keys, reports, &report_count);
     ReleaseSRWLockShared(&g_track.lock);
     ReleaseSRWLockShared(&g_mem.range_lock);
     for (u32 i = 0; i < report_count && g_track.store_listener; i++)

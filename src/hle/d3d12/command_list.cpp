@@ -370,7 +370,7 @@ static void release_segment_fences(ConsoleCommandList* self) {
     }
 }
 
-bool list_split(ConsoleCommandList* self, ListSyncKind sync, ID3D12Fence* fence, u64 value) {
+bool list_split(ConsoleCommandList* self, ListSyncKind sync, ID3D12Fence* fence, u64 value, u64 counter) {
     if (!self->recording)
         return false;
     fence->AddRef();
@@ -379,6 +379,7 @@ bool list_split(ConsoleCommandList* self, ListSyncKind sync, ID3D12Fence* fence,
     seg.sync = sync;
     seg.fence = fence;
     seg.value = value;
+    seg.counter = counter;
     if (FAILED(begin_segment(self, self->segment_count))) {
         // Keep recording somewhere: the rest of the list goes nowhere, as after a failed Reset.
         self->recording = false;
@@ -488,7 +489,8 @@ static void wait_value(ConsoleCommandList* self, u64 address, D3D12_COMPARISON_F
                    address, func, mask);
         return;
     }
-    list_split(self, LIST_SYNC_WAIT, fence, func == D3D12_COMPARISON_FUNC_GREATER ? value + 1 : value);
+    list_split(self, LIST_SYNC_WAIT, fence, func == D3D12_COMPARISON_FUNC_GREATER ? value + 1 : value,
+               address);
 }
 
 static void WINAPI list_wait_32bit_value_x(ConsoleCommandList* self, UINT64 address,

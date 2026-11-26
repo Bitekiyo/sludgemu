@@ -891,6 +891,8 @@ static LONG CALLBACK on_access_fault(EXCEPTION_POINTERS* ep) {
                  access_allowed(addr, e->ExceptionInformation[0]);
     }
     ReleaseSRWLockExclusive(&g_mem.range_lock);
+    if (!backed && s && e->ExceptionInformation[0] == 1)
+        tracking_describe_write_fault((u64)addr);
     return backed ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
 }
 

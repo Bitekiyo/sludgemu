@@ -201,10 +201,13 @@ u32 mem_frame_addresses(u64 pfn, u64* vas, u32 max);
 // (single-stepped), and the page is protected again before the report. Like watches, traps are on
 // memory: stores through any address showing it are reported. Stores to the same pages outside the
 // range are reported too (the listener checks the values); stores through our views and by the
-// kernel aren't seen. Traps last until the range is released.
+// kernel aren't seen. Traps last until mem_untrap_stores or until the range is released: every store
+// to their pages costs two exceptions, and kernel writes there fail, so they should be short-lived.
 typedef void (*MemStoreListener)(u64 base, u64 size); // called on the storing thread, no locks held
 void mem_set_store_listener(MemStoreListener listener);
 void mem_trap_stores(const void* base, u64 size);
+// Ends the trap armed for exactly [base, base + size).
+void mem_untrap_stores(const void* base, u64 size);
 
 // Changes the host protection used for future mappings in the range containing `addr`.
 void mem_set_range_protect(const void* addr, u32 protect);

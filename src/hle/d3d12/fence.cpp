@@ -93,6 +93,8 @@ ConsoleFence* console_fence_at(u64 address) {
 struct CounterFence {
     u64 address; // 0: free
     ID3D12Fence* fence;
+    u64 waited;   // the highest value queued GPU work waits for
+    bool trapped; // CPU stores to the counter are trapped (see console_counter_wait)
 };
 
 static CounterFence g_counters[COUNTER_CAPACITY];
@@ -124,13 +126,11 @@ ID3D12Fence* console_sync_fence(u64 address) {
     if (fence)
         return fence;
 
-    // The counter's current value starts the fence; GPU-visible memory is mapped and readable. The
-    // CPU's stores to it signal the fence too (titles release GPU work by writing a counter): trapped
-    // before the value is read, so none is missed.
+    // The counter's current value starts the fence; GPU-visible memory is mapped and readable. CPU
+    // stores to it signal the fence while GPU work waits for it (console_counter_wait).
     u64 desktop;
     if (!console_translate_gpu_address(address, sizeof(u64), &desktop))
         return nullptr;
-    mem_trap_stores((const void*)address, sizeof(u64));
     AcquireSRWLockExclusive(&g_fence_lock);
     c = find_counter(address);
     if (c && c->address == address) {
@@ -140,6 +140,8 @@ ID3D12Fence* console_sync_fence(u64 address) {
                                                 IID_PPV_ARGS(&fence)))) {
             c->address = address;
             c->fence = fence;
+            c->waited = 0;
+            c->trapped = false;
             g_counter_count++;
         }
     } else {
@@ -198,17 +200,48 @@ static const ConsoleEntry k_fence_impl[] = {
     CONSOLE_ENTRY(12, fence_get_gpu_address_x),
 };
 
+// The counter reached `value`: the trap goes once nothing waits for more. Every store to a trapped
+// page costs two exceptions, and the title's memory around a counter may be anything later, so traps
+// last only while GPU work waits. g_fence_lock held exclusively.
+static void release_trap_locked(CounterFence* c, u64 value) {
+    if (c->trapped && value >= c->waited) {
+        mem_untrap_stores((const void*)c->address, sizeof(u64));
+        c->trapped = false;
+    }
+}
+
+// GPU work on a queue waits for the counter at `address` to reach `value`. Titles release such work
+// by storing the value from the CPU, which the trap reports (on_counter_store); trapped before the
+// counter is read, so no store is missed.
+void console_counter_wait(u64 address, u64 value) {
+    AcquireSRWLockExclusive(&g_fence_lock);
+    CounterFence* c = find_counter(address);
+    ID3D12Fence* fence = c && c->address == address ? c->fence : nullptr;
+    if (fence) {
+        c->waited = value > c->waited ? value : c->waited;
+        if (!c->trapped) {
+            mem_trap_stores((const void*)address, sizeof(u64));
+            c->trapped = true;
+        }
+        u64 now = *(volatile u64*)address;
+        if (now > fence->GetCompletedValue())
+            fence->Signal(now);
+        release_trap_locked(c, now);
+    }
+    ReleaseSRWLockExclusive(&g_fence_lock);
+}
+
 // A CPU store into a counter GPU work waits on: the counter's fence follows it.
 static void on_counter_store(u64 base, u64) {
-    AcquireSRWLockShared(&g_fence_lock);
+    AcquireSRWLockExclusive(&g_fence_lock);
     CounterFence* c = find_counter(base);
-    ID3D12Fence* fence = c && c->address == base ? c->fence : nullptr;
-    ReleaseSRWLockShared(&g_fence_lock);
-    if (!fence)
-        return;
-    u64 value = *(volatile u64*)base;
-    if (value > fence->GetCompletedValue())
-        fence->Signal(value);
+    if (c && c->address == base) {
+        u64 value = *(volatile u64*)base;
+        if (value > c->fence->GetCompletedValue())
+            c->fence->Signal(value);
+        release_trap_locked(c, value);
+    }
+    ReleaseSRWLockExclusive(&g_fence_lock);
 }
 
 void console_fence_init() {

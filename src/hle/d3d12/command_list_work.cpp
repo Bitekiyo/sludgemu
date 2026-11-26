@@ -252,7 +252,7 @@ static void write_bottom_of_pipe(ConsoleCommandList* self, u64 dst, u64 value, u
     write_values(self, dst, halves, words, D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT);
     ID3D12Fence* fence = words == 2 ? console_sync_fence(dst) : nullptr;
     if (fence)
-        list_split(self, LIST_SYNC_SIGNAL, fence, value);
+        list_split(self, LIST_SYNC_SIGNAL, fence, value, 0);
 }
 
 static void WINAPI list_write_32bit_bottom_of_pipe_x(ConsoleCommandList* self, UINT64 dst, UINT value, UINT,

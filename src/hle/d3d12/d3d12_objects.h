@@ -82,6 +82,8 @@ ConsoleFence* console_fence_at(u64 address);
 // fence's own, or one made on first use for memory the title writes and waits on from the GPU.
 // Borrowed; nullptr if the address isn't GPU-visible.
 ID3D12Fence* console_sync_fence(u64 address);
+// A queue reaches GPU work waiting for the counter at `address` to reach `value` (see fence.cpp).
+void console_counter_wait(u64 address, u64 value);
 
 // The allocation callback lets titles supply console command buffer memory. Recording goes to
 // desktop command lists instead, so it is kept but never called.
@@ -189,6 +191,7 @@ struct ListSegment {
     ListSyncKind sync;  // between this part and the next (none after the last)
     ID3D12Fence* fence; // referenced
     u64 value;
+    u64 counter; // waits: the title counter the fence follows, or 0
 };
 
 struct ConsoleCommandList {

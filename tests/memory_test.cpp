@@ -614,6 +614,28 @@ static void test_store_traps() {
     CHECK(*counter == 2000 && *next == 3000);
     CHECK(!page_writable(gpu + 0x1000) && !page_writable(gpu + 0x2000));
 
+    // A repeated string store across many trapped pages (memcpy's rep movsb over memory full of
+    // counters): it finishes, every trap reports, and the pages are protected again.
+    for (u32 p = 3; p < 8; p++)
+        mem_trap_stores(gpu + p * 0x1000, sizeof(u64));
+    static u8 source[0x6000];
+    memset(source, 0x5A, sizeof(source));
+    g_store_reports = 0;
+    __movsb(gpu + 0x1800, source, sizeof(source));
+    CHECK(gpu[0x1800] == 0x5A && gpu[0x77FF] == 0x5A && gpu[0x7800] == 0);
+    CHECK(g_store_reports >= 7);
+    for (u32 p = 1; p < 8; p++)
+        CHECK(!page_writable(gpu + p * 0x1000));
+
+    // Untrapped, a page takes stores without reports (the other traps there stay).
+    mem_untrap_stores(gpu + 0x5000, sizeof(u64));
+    CHECK(page_writable(gpu + 0x5000) && !page_writable(gpu + 0x4000));
+    g_store_reports = 0;
+    gpu[0x5008] = 1;
+    CHECK(g_store_reports == 0);
+    for (u32 p = 3; p < 8; p++)
+        mem_untrap_stores(gpu + p * 0x1000, sizeof(u64));
+
     // Page number 0 names no frame.
     CHECK(mem_physical_ptr(0) == nullptr);
 

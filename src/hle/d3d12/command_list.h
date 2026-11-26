@@ -23,7 +23,8 @@ ID3D12Resource* list_resource(void* console_resource, u64* offset);
 
 // Ends the current desktop list and continues on a new one with the same state; `sync` happens
 // between the two on the queue. False (and the sync is lost) if the list can't be split.
-bool list_split(ConsoleCommandList* list, ListSyncKind sync, ID3D12Fence* fence, u64 value);
+// `counter`: for waits on a title counter (see console_sync_fence), its address; otherwise 0.
+bool list_split(ConsoleCommandList* list, ListSyncKind sync, ID3D12Fence* fence, u64 value, u64 counter);
 
 extern const ConsoleEntry k_list_work_entries[];
 extern const u32 k_list_work_entry_count;

@@ -160,10 +160,13 @@ static void WINAPI queue_execute_command_lists(ConsoleCommandQueue* self, UINT c
             if (s + 1 == list->segment_count)
                 break;
             flush(self->desktop, &b);
-            if (seg.sync == LIST_SYNC_SIGNAL)
+            if (seg.sync == LIST_SYNC_SIGNAL) {
                 self->desktop->Signal(seg.fence, seg.value);
-            else
+            } else {
+                if (seg.counter)
+                    console_counter_wait(seg.counter, seg.value);
                 self->desktop->Wait(seg.fence, seg.value);
+            }
         }
     }
     flush(self->desktop, &b);
