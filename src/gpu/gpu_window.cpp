@@ -297,6 +297,21 @@ static bool translate(u64 address, u64 size, bool quiet, GpuAddress* out) {
     return true;
 }
 
+void gpu_window_usage(u64* chunks, u64* blocks, u64* replaced) {
+    *chunks = *blocks = *replaced = 0;
+    AcquireSRWLockShared(&g_chunk_lock);
+    for (u32 i = 0; g_chunk_windows && i < mem_physical_chunk_count(); i++)
+        *chunks += g_chunk_windows[i].buffer ? MEM_CHUNK_SIZE : 0;
+    ReleaseSRWLockShared(&g_chunk_lock);
+    AcquireSRWLockShared(&g_windows.lock);
+    for (u32 i = 0; i < g_windows.list.count; i++)
+        if (g_windows.list.entries[i].own_heap)
+            *blocks += g_windows.list.entries[i].end - g_windows.list.entries[i].base;
+    for (u32 i = 0; i < g_windows.replaced_count; i++)
+        *replaced += g_windows.replaced[i].end - g_windows.replaced[i].base;
+    ReleaseSRWLockShared(&g_windows.lock);
+}
+
 bool gpu_translate(u64 address, u64 size, GpuAddress* out) {
     return translate(address, size, false, out);
 }

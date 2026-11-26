@@ -23,6 +23,16 @@ const GpuOptions& gpu_options();
 ID3D12Device13* gpu_device();
 IDXGIFactory6* gpu_factory();
 
+// The adapter's memory as the OS accounts it to this process: `local` is the GPU's own (VRAM),
+// `shared` system memory it uses. Budgets are what the OS lets the process keep resident.
+struct GpuVideoMemory {
+    u64 local_usage;
+    u64 local_budget;
+    u64 shared_usage;
+    u64 shared_budget;
+};
+bool gpu_video_memory(GpuVideoMemory* out);
+
 // True if `hr` says the device is lost. The first time, logs why (DRED details with the debug
 // layer). The removal is also reported on its own once the runtime notices it.
 bool gpu_device_lost(HRESULT hr);
@@ -47,6 +57,16 @@ void gpu_set_name(ID3D12Object* object, const char* format, ...);
 // Releases a desktop object once no queue can still be using it: after every queue finished what
 // it had been given when the object was retired.
 void gpu_retire(IUnknown* object);
+
+// The same point for memory of our own (tiles, see gpu/tile_pool.h): taken when something stops being
+// used, reached once every queue finished what it had been given by then.
+#define GPU_MAX_QUEUES 16
+struct GpuRetirePoint {
+    u64 after[GPU_MAX_QUEUES];      // per queue slot: the submission that must complete first
+    u32 generation[GPU_MAX_QUEUES]; // which queue held the slot (a queue leaving drains its work)
+};
+void gpu_retire_point(GpuRetirePoint* out);
+bool gpu_retire_point_reached(const GpuRetirePoint& point);
 
 // Waits until every queue finished all submitted work.
 void gpu_wait_idle();

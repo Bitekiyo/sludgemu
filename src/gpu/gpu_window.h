@@ -29,6 +29,11 @@ bool gpu_translate(u64 address, u64 size, GpuAddress* out);
 // to reach such memory.
 bool gpu_translate_contiguous(u64 address, u64 size, GpuAddress* out);
 
+// Bytes of title memory the GPU sees through heaps opened over it (memory reports): physical memory
+// chunks, other blocks, and windows over other blocks replaced by larger ones but kept (see
+// gpu_window.cpp).
+void gpu_window_usage(u64* chunks, u64* blocks, u64* replaced);
+
 // Changes whenever title mappings under translated addresses change (never 0): views made of
 // addresses translated before a change may show memory the title no longer maps there.
 u32 gpu_window_generation();

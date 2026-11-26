@@ -121,6 +121,8 @@ add_executable(sludgemu WIN32
     gpu/texture_untile.cpp
     gpu/gpu_window.h
     gpu/gpu_window.cpp
+    gpu/tile_pool.h
+    gpu/tile_pool.cpp
     gpu/shader_programs.h
     gpu/shader_programs.cpp
     gpu/formats.h

@@ -1,0 +1,198 @@
+#include "gpu/tile_pool.h"
+
+#include <stdlib.h>
+#include <string.h>
+
+#include "common/log.h"
+
+#define MAX_TILE_HEAPS 256 // 16 GiB of tiles
+#define HEAP_WORDS     (GPU_TILE_HEAP_TILES / 64)
+// Empty heaps kept beyond those in use, so textures streaming in and out don't create and release
+// heaps all the time.
+#define SPARE_HEAPS 2
+
+struct TileHeap {
+    ID3D12Heap* heap; // nullptr: an empty slot
+    u32 free;
+    u64 taken[HEAP_WORDS]; // a bit per tile: handed out, or freed and not reclaimed yet
+};
+
+// Tiles freed together: reusable once the GPU reached `point`.
+struct FreedBatch {
+    GpuRetirePoint point;
+    u32 count; // the next `count` tiles of g_pool.freed
+};
+
+static struct {
+    SRWLOCK lock;
+    TileHeap heaps[MAX_TILE_HEAPS];
+    u32 heap_count;
+    u32 taken; // tiles taken in all heaps
+    // Freed tiles in order: the sealed batches' first, then those freed since the last seal.
+    u32* freed;
+    u32 freed_count;
+    u32 freed_capacity;
+    FreedBatch* batches;
+    u32 batch_count;
+    u32 batch_capacity;
+    u32 sealed; // tiles of g_pool.freed in batches
+} g_pool = {SRWLOCK_INIT};
+
+static void release_tile_locked(u32 tile) {
+    TileHeap& h = g_pool.heaps[tile / GPU_TILE_HEAP_TILES];
+    u32 i = gpu_tile_offset(tile);
+    h.taken[i / 64] &= ~(1ull << (i % 64));
+    h.free++;
+    g_pool.taken--;
+}
+
+// The tiles freed since the last seal form a batch, reusable once the GPU finished what was submitted
+// until now (later than when they were freed, so never too early).
+static void seal_locked() {
+    u32 open = g_pool.freed_count - g_pool.sealed;
+    if (!open)
+        return;
+    if (g_pool.batch_count == g_pool.batch_capacity) {
+        u32 capacity = g_pool.batch_capacity ? g_pool.batch_capacity * 2 : 64;
+        FreedBatch* grown = (FreedBatch*)realloc(g_pool.batches, capacity * sizeof(FreedBatch));
+        if (!grown)
+            return; // they stay open: sealed with a later batch
+        g_pool.batches = grown;
+        g_pool.batch_capacity = capacity;
+    }
+    FreedBatch& b = g_pool.batches[g_pool.batch_count++];
+    gpu_retire_point(&b.point);
+    b.count = open;
+    g_pool.sealed += open;
+}
+
+// Takes back the tiles of batches the GPU is done with (oldest first), and releases empty heaps beyond
+// the spares.
+static void reclaim_locked() {
+    u32 batches = 0, tiles = 0;
+    while (batches < g_pool.batch_count && gpu_retire_point_reached(g_pool.batches[batches].point))
+        tiles += g_pool.batches[batches++].count;
+    if (!batches)
+        return;
+    for (u32 i = 0; i < tiles; i++)
+        release_tile_locked(g_pool.freed[i]);
+    memmove(g_pool.freed, g_pool.freed + tiles, (g_pool.freed_count - tiles) * sizeof(u32));
+    g_pool.freed_count -= tiles;
+    g_pool.sealed -= tiles;
+    memmove(g_pool.batches, g_pool.batches + batches, (g_pool.batch_count - batches) * sizeof(FreedBatch));
+    g_pool.batch_count -= batches;
+
+    u32 empty = 0;
+    for (u32 i = MAX_TILE_HEAPS; i-- > 0;) {
+        TileHeap& h = g_pool.heaps[i];
+        if (!h.heap || h.free != GPU_TILE_HEAP_TILES || ++empty <= SPARE_HEAPS)
+            continue;
+        gpu_retire(h.heap); // resources may still name its tiles in mappings nothing reads
+        h.heap = nullptr;
+        g_pool.heap_count--;
+    }
+}
+
+static bool create_heap_locked(u32 slot) {
+    D3D12_HEAP_DESC desc = {};
+    desc.SizeInBytes = GPU_TILE_HEAP_TILES * GPU_TILE_SIZE;
+    desc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+    desc.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+    // Every tile handed out is written before it is read, so the heap needn't be cleared.
+    desc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES | D3D12_HEAP_FLAG_CREATE_NOT_ZEROED;
+    ID3D12Heap* heap = nullptr;
+    HRESULT hr = gpu_device()->CreateHeap(&desc, IID_PPV_ARGS(&heap));
+    if (FAILED(hr)) {
+        static volatile long logged = 0;
+        if (!gpu_device_lost(hr) && log_once_flag(&logged))
+            LOG_E("gpu",
+                  "cannot create a heap for texture tiles (0x%08lx, %u heaps of %llu MiB in use); "
+                  "textures go without memory for some tiles",
+                  (unsigned long)hr, g_pool.heap_count, desc.SizeInBytes >> 20);
+        return false;
+    }
+    gpu_set_name(heap, "texture tiles %u", slot);
+    TileHeap& h = g_pool.heaps[slot];
+    h.heap = heap;
+    h.free = GPU_TILE_HEAP_TILES;
+    memset(h.taken, 0, sizeof(h.taken));
+    g_pool.heap_count++;
+    return true;
+}
+
+bool gpu_tiles_alloc(u32 count, u32* tiles) {
+    if (!count || count > GPU_TILE_HEAP_TILES)
+        return false;
+    AcquireSRWLockExclusive(&g_pool.lock);
+    seal_locked();
+    reclaim_locked();
+    // The lowest heap with room: tiles gather in few heaps, and the others can empty.
+    u32 slot = MAX_TILE_HEAPS, empty_slot = MAX_TILE_HEAPS;
+    for (u32 i = 0; i < MAX_TILE_HEAPS && slot == MAX_TILE_HEAPS; i++) {
+        if (g_pool.heaps[i].heap && g_pool.heaps[i].free >= count)
+            slot = i;
+        else if (!g_pool.heaps[i].heap && empty_slot == MAX_TILE_HEAPS)
+            empty_slot = i;
+    }
+    if (slot == MAX_TILE_HEAPS) {
+        if (empty_slot == MAX_TILE_HEAPS || !create_heap_locked(empty_slot)) {
+            ReleaseSRWLockExclusive(&g_pool.lock);
+            return false;
+        }
+        slot = empty_slot;
+    }
+    TileHeap& h = g_pool.heaps[slot];
+    u32 n = 0;
+    for (u32 w = 0; w < HEAP_WORDS && n < count; w++) {
+        while (h.taken[w] != ~0ull && n < count) {
+            unsigned long bit;
+            _BitScanForward64(&bit, ~h.taken[w]);
+            h.taken[w] |= 1ull << bit;
+            tiles[n++] = slot * GPU_TILE_HEAP_TILES + w * 64 + bit;
+        }
+    }
+    h.free -= count;
+    g_pool.taken += count;
+    ReleaseSRWLockExclusive(&g_pool.lock);
+    return true;
+}
+
+void gpu_tiles_free(u32 count, const u32* tiles) {
+    if (!count)
+        return;
+    AcquireSRWLockExclusive(&g_pool.lock);
+    if (g_pool.freed_count + count > g_pool.freed_capacity) {
+        u32 capacity = g_pool.freed_capacity ? g_pool.freed_capacity : 4096;
+        while (capacity < g_pool.freed_count + count)
+            capacity *= 2;
+        u32* grown = (u32*)realloc(g_pool.freed, capacity * sizeof(u32));
+        if (!grown) {
+            // Out of memory: wait for the GPU rather than hand out tiles it may be using.
+            ReleaseSRWLockExclusive(&g_pool.lock);
+            LOG_E("gpu", "freed tile list full; waiting for the GPU to go idle");
+            gpu_wait_idle();
+            AcquireSRWLockExclusive(&g_pool.lock);
+            for (u32 i = 0; i < count; i++)
+                release_tile_locked(tiles[i]);
+            ReleaseSRWLockExclusive(&g_pool.lock);
+            return;
+        }
+        g_pool.freed = grown;
+        g_pool.freed_capacity = capacity;
+    }
+    memcpy(g_pool.freed + g_pool.freed_count, tiles, count * sizeof(u32));
+    g_pool.freed_count += count;
+    ReleaseSRWLockExclusive(&g_pool.lock);
+}
+
+ID3D12Heap* gpu_tile_heap(u32 tile) {
+    // A heap stays while any of its tiles is taken, and was made before they were handed out.
+    return g_pool.heaps[tile / GPU_TILE_HEAP_TILES].heap;
+}
+
+void gpu_tile_usage(u64* used, u64* reserved) {
+    AcquireSRWLockShared(&g_pool.lock);
+    *used = (u64)g_pool.taken * GPU_TILE_SIZE;
+    *reserved = (u64)g_pool.heap_count * GPU_TILE_HEAP_TILES * GPU_TILE_SIZE;
+    ReleaseSRWLockShared(&g_pool.lock);
+}

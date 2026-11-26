@@ -68,6 +68,11 @@ u8* mem_physical_ptr(u64 pfn);
 // [i * MEM_CHUNK_PAGES, (i + 1) * MEM_CHUNK_PAGES). Allocations that fit in a chunk get consecutive
 // frames of one chunk where possible, so the GPU can see them as one block.
 u32 mem_physical_chunk_count();
+u32 mem_physical_chunks_created(); // each commits MEM_CHUNK_SIZE of system memory
+// Pages of physical memory bound to system memory (frames read or written so far, see bind_frame); with
+// `va`, only those mapped in [va, va + size) of one placeholder range. Memory reports.
+u64 mem_physical_bound_pages();
+u64 mem_physical_bound_pages_at(const void* va, u64 size);
 void* mem_physical_chunk(u32 index); // section HANDLE
 
 // Where a host pointer into the linear view lies: its chunk and the offset in it. False for any

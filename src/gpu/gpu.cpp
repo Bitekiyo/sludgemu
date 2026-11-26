@@ -10,6 +10,7 @@
 static GpuOptions g_options;
 static ID3D12Device13* g_device = nullptr;
 static IDXGIFactory6* g_factory = nullptr;
+static IDXGIAdapter3* g_adapter = nullptr; // for memory budgets
 static INIT_ONCE g_init_once = INIT_ONCE_STATIC_INIT;
 
 void gpu_set_options(const GpuOptions& options) {
@@ -192,6 +193,7 @@ static BOOL CALLBACK create_device(PINIT_ONCE, void*, void**) {
             if (check_features(device)) {
                 LOG_I("gpu", "adapter: WARP (software)");
                 g_device = device;
+                adapter->QueryInterface(IID_PPV_ARGS(&g_adapter));
             } else {
                 device->Release();
             }
@@ -214,6 +216,7 @@ static BOOL CALLBACK create_device(PINIT_ONCE, void*, void**) {
                 LOG_I("gpu", "adapter: %ls (%llu MiB VRAM)", desc.Description,
                       (u64)desc.DedicatedVideoMemory >> 20);
                 g_device = device;
+                adapter->QueryInterface(IID_PPV_ARGS(&g_adapter));
                 adapter->Release();
                 break;
             }
@@ -243,22 +246,33 @@ IDXGIFactory6* gpu_factory() {
     return g_factory;
 }
 
+bool gpu_video_memory(GpuVideoMemory* out) {
+    DXGI_QUERY_VIDEO_MEMORY_INFO local, shared;
+    if (!g_adapter || FAILED(g_adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local)) ||
+        FAILED(g_adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &shared)))
+        return false;
+    out->local_usage = local.CurrentUsage;
+    out->local_budget = local.Budget;
+    out->shared_usage = shared.CurrentUsage;
+    out->shared_budget = shared.Budget;
+    return true;
+}
+
 // --- submission and deferred release ----------------------------------------------------------------
 //
 // Each queue that runs translated work counts its submissions on a fence. A retired object waits
 // until every queue has finished what it had submitted when the object was retired.
 
-#define GPU_MAX_QUEUES 16
-
 struct GpuQueueSlot {
     ID3D12CommandQueue* queue; // nullptr: free slot
     ID3D12Fence* fence;
     u64 submitted;
+    u32 generation; // counts the queues that held the slot
 };
 
 struct RetiredObject {
     IUnknown* object;
-    u64 after[GPU_MAX_QUEUES]; // per queue: the submission that must complete first
+    GpuRetirePoint point;
 };
 
 static SRWLOCK g_submit_lock = SRWLOCK_INIT;
@@ -279,7 +293,7 @@ static void collect_locked() {
         RetiredObject& r = g_retired[i];
         bool done = true;
         for (u32 q = 0; q < GPU_MAX_QUEUES && done; q++)
-            done = r.after[q] <= completed[q];
+            done = r.point.after[q] <= completed[q];
         if (done)
             r.object->Release();
         else
@@ -298,7 +312,7 @@ u32 gpu_queue_register(ID3D12CommandQueue* queue) {
     u32 slot = GPU_NO_QUEUE;
     for (u32 q = 0; q < GPU_MAX_QUEUES; q++) {
         if (!g_queues[q].queue) {
-            g_queues[q] = {queue, fence, 0};
+            g_queues[q] = {queue, fence, 0, g_queues[q].generation + 1};
             slot = q;
             break;
         }
@@ -317,9 +331,10 @@ void gpu_queue_unregister(u32 slot) {
     AcquireSRWLockExclusive(&g_submit_lock);
     GpuQueueSlot q = g_queues[slot];
     g_queues[slot] = {};
+    g_queues[slot].generation = q.generation;
     // Whatever waited on this queue now only waits for it to drain, which happens below.
     for (u32 i = 0; i < g_retired_count; i++)
-        g_retired[i].after[slot] = 0;
+        g_retired[i].point.after[slot] = 0;
     ReleaseSRWLockExclusive(&g_submit_lock);
     if (q.fence->GetCompletedValue() < q.submitted)
         q.fence->SetEventOnCompletion(q.submitted, nullptr); // blocks until the queue is idle
@@ -399,9 +414,31 @@ void gpu_retire(IUnknown* object) {
     RetiredObject& r = g_retired[g_retired_count++];
     r.object = object;
     for (u32 q = 0; q < GPU_MAX_QUEUES; q++)
-        r.after[q] = g_queues[q].queue ? g_queues[q].submitted : 0;
+        r.point.after[q] = g_queues[q].queue ? g_queues[q].submitted : 0;
     collect_locked();
     ReleaseSRWLockExclusive(&g_submit_lock);
+}
+
+void gpu_retire_point(GpuRetirePoint* out) {
+    AcquireSRWLockShared(&g_submit_lock);
+    for (u32 q = 0; q < GPU_MAX_QUEUES; q++) {
+        out->after[q] = g_queues[q].queue ? g_queues[q].submitted : 0;
+        out->generation[q] = g_queues[q].generation;
+    }
+    ReleaseSRWLockShared(&g_submit_lock);
+}
+
+// A queue that left its slot since drained its work first (gpu_queue_unregister).
+bool gpu_retire_point_reached(const GpuRetirePoint& point) {
+    AcquireSRWLockShared(&g_submit_lock);
+    bool reached = true;
+    for (u32 q = 0; q < GPU_MAX_QUEUES && reached; q++) {
+        const GpuQueueSlot& slot = g_queues[q];
+        reached = !slot.queue || slot.generation != point.generation[q] ||
+                  point.after[q] <= slot.fence->GetCompletedValue();
+    }
+    ReleaseSRWLockShared(&g_submit_lock);
+    return reached;
 }
 
 void gpu_wait_idle() {

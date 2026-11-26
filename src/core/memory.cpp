@@ -105,6 +105,41 @@ u64 mem_physical_used_pages() {
 u32 mem_physical_chunk_count() {
     return g_mem.chunk_count;
 }
+
+u64 mem_physical_bound_pages() {
+    u64 bound = 0;
+    AcquireSRWLockShared(&g_mem.phys_lock);
+    for (u64 w = 0; w < (g_mem.total_pages + 63) / 64; w++)
+        bound += __popcnt64(g_mem.real_bitmap[w]);
+    ReleaseSRWLockShared(&g_mem.phys_lock);
+    return bound;
+}
+
+u64 mem_physical_bound_pages_at(const void* va, u64 size) {
+    u64 bound = 0;
+    AcquireSRWLockShared(&g_mem.range_lock);
+    RangeSlot* s = find_range_locked(va);
+    if (s && (s->info.flags & MEM_RANGE_PLACEHOLDER)) {
+        u64 first = (u64)((const u8*)va - s->info.base) >> MEM_PAGE_SHIFT;
+        u64 last = ((u64)((const u8*)va - s->info.base) + size + MEM_PAGE_SIZE - 1) >> MEM_PAGE_SHIFT;
+        last = last < range_pages(s) ? last : range_pages(s);
+        AcquireSRWLockShared(&g_mem.phys_lock);
+        for (u64 i = first; i < last; i++) {
+            u32 id = frame_at_locked(s, (u32)i);
+            bound += id != MEM_INVALID_PFN && g_mem.id_to_real[id] != MEM_INVALID_PFN;
+        }
+        ReleaseSRWLockShared(&g_mem.phys_lock);
+    }
+    ReleaseSRWLockShared(&g_mem.range_lock);
+    return bound;
+}
+
+u32 mem_physical_chunks_created() {
+    u32 created = 0;
+    for (u32 i = 0; i < g_mem.chunk_count; i++)
+        created += g_mem.chunks[i] != nullptr;
+    return created;
+}
 void* mem_physical_chunk(u32 index) {
     return index < g_mem.chunk_count ? g_mem.chunks[index] : nullptr;
 }
