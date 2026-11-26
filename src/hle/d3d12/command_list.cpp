@@ -350,6 +350,8 @@ static HRESULT begin_segment(ConsoleCommandList* self, u32 index) {
     else
         hr = self->device->CreateCommandList(0, self->type, self->allocator->desktop, nullptr,
                                              IID_PPV_ARGS(&seg.list));
+    if (SUCCEEDED(hr))
+        gpu_set_name(seg.list, "title list %p part %u", (void*)self, index);
     if (FAILED(hr)) {
         LOG_E("d3d12", "cannot start part %u of a command list (0x%08lx)", index, (unsigned long)hr);
         return hr;
@@ -859,6 +861,7 @@ HRESULT console_create_command_list(ConsoleDevice* device, const ConsoleCommandL
     list->type = desc->type;
     list->device = device->desktop;
     list->allocator = allocator;
+    list->submitted_slot = GPU_NO_QUEUE;
     HRESULT hr = begin_segment(list, 0);
     LOG_D("d3d12", "CreateCommandListX(type %d, flags 0x%x, barrier batch %u) -> 0x%08lx", desc->type,
           desc->flags, desc->resource_barrier_batch_size, (unsigned long)hr);

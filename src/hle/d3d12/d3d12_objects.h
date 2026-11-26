@@ -206,6 +206,10 @@ struct ConsoleCommandList {
     ListSegment* segments; // segment_capacity desktop lists, reused across resets
     u32 segment_count;
     u32 segment_capacity;
+    // The queue submission that last ran it (submitted_slot GPU_NO_QUEUE: none): console lists may run
+    // again while still running, desktop lists can't.
+    u32 submitted_slot;
+    u64 submitted_number;
     ConsoleCommandAllocator* allocator; // the allocator of the current recording
     ID3D12Device13* device;
     bool recording;

@@ -51,6 +51,8 @@ static void upload_textures(ConsoleCommandQueue* self) {
         hr = device->CreateCommandAllocator(self->type, IID_PPV_ARGS(&w.allocator));
         if (SUCCEEDED(hr))
             hr = device->CreateCommandList(0, self->type, w.allocator, nullptr, IID_PPV_ARGS(&w.list));
+        if (SUCCEEDED(hr))
+            gpu_set_name(w.list, "texture uploads");
     } else {
         gpu_queue_wait(self->slot, w.submission); // its allocator may still be in use
         hr = w.allocator->Reset();
@@ -123,7 +125,9 @@ static void flush(ID3D12CommandQueue* queue, SubmitBatch* b) {
     b->count = 0;
 }
 
-// Each console list runs its parts in order, with the fence signals and waits between them.
+// Each console list runs its parts in order, with the fence signals and waits between them. A console
+// list can be submitted again while it still runs; desktop lists can't, so that waits for the run
+// before (the same list twice in one call ends the submission there).
 static void WINAPI queue_execute_command_lists(ConsoleCommandQueue* self, UINT count,
                                                ConsoleCommandList* const* lists) {
     upload_textures(self);
@@ -133,6 +137,17 @@ static void WINAPI queue_execute_command_lists(ConsoleCommandQueue* self, UINT c
         ConsoleCommandList* list = lists[i];
         if (!list)
             continue;
+        for (UINT k = 0; k < i; k++) {
+            if (lists[k] != list)
+                continue;
+            flush(self->desktop, &b);
+            list->submitted_slot = self->slot;
+            list->submitted_number = gpu_queue_submitted(self->slot);
+            break;
+        }
+        if (list->submitted_slot != GPU_NO_QUEUE &&
+            gpu_queue_completed(list->submitted_slot) < list->submitted_number)
+            gpu_queue_wait(list->submitted_slot, list->submitted_number);
         for (u32 t = 0; t < list->table_count; t++) {
             const ConsoleCommandList::TableUse& use = list->tables[t];
             console_descriptor_mirror(use.heap, use.first, use.count, use.desktop_first);
@@ -153,6 +168,12 @@ static void WINAPI queue_execute_command_lists(ConsoleCommandQueue* self, UINT c
     }
     flush(self->desktop, &b);
     u64 submission = gpu_queue_submitted(self->slot);
+    for (UINT i = 0; i < count; i++) {
+        if (lists[i]) {
+            lists[i]->submitted_slot = self->slot;
+            lists[i]->submitted_number = submission;
+        }
+    }
     if (gpu_options().serialize)
         gpu_queue_wait(self->slot, submission);
 }
@@ -181,6 +202,8 @@ static void write_fence_value(ConsoleCommandQueue* self, ConsoleFence* fence, u6
         hr = device->CreateCommandAllocator(self->type, IID_PPV_ARGS(&w.allocator));
         if (SUCCEEDED(hr))
             hr = device->CreateCommandList(0, self->type, w.allocator, nullptr, IID_PPV_ARGS(&w.list));
+        if (SUCCEEDED(hr))
+            gpu_set_name(w.list, "fence value writes");
     } else {
         gpu_queue_wait(self->slot, w.submission); // its allocator may still be in use
         hr = w.allocator->Reset();
