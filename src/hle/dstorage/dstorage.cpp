@@ -156,6 +156,7 @@ static const GUID IID_ConsoleQueue2 = {
 #define FORMAT_SWIZZLE_SHIFT 4 // console swizzle mode (1-4) in bits 4-6
 #define FORMAT_SWIZZLE_MASK  0x70
 #define FORMAT_UNSUPPORTED   0xFF // the request can't be expressed; it fails with E_NOTIMPL
+#define FORMAT_COPY          ((u8)DSTORAGE_CUSTOM_COMPRESSION_0) // no operation: our decoder copies
 
 static u8 custom_format(u64 options) {
     u8 format = 0;
@@ -180,6 +181,7 @@ static volatile long g_zlib_count = 0;
 static volatile long g_bcpack_count = 0;
 static volatile long g_swizzle_count = 0;
 static volatile long g_page_count = 0;
+static volatile long g_scattered_count = 0; // page requests through a staging buffer (see Scatter)
 static volatile s64 g_request_bytes = 0;
 
 static void count_request(const ConsoleRequest& r) {
@@ -204,8 +206,11 @@ static void count_request(const ConsoleRequest& r) {
             r.destination, r.intermediate_size, r.name ? r.name : "");
     }
     if ((n & 4095) == 0) {
-        LOG_I("dstorage", "%ld requests (%lld MiB): zlib %ld, bcpack %ld, swizzle %ld, physical pages %ld", n,
-              g_request_bytes >> 20, g_zlib_count, g_bcpack_count, g_swizzle_count, g_page_count);
+        LOG_I(
+            "dstorage",
+            "%ld requests (%lld MiB): zlib %ld, bcpack %ld, swizzle %ld, physical pages %ld (%ld scattered)",
+            n, g_request_bytes >> 20, g_zlib_count, g_bcpack_count, g_swizzle_count, g_page_count,
+            g_scattered_count);
     }
 }
 
@@ -221,6 +226,81 @@ static u8* contiguous_pages(const ULONG_PTR* pages, u16 offset, u32 size) {
             return nullptr;
     }
     return base ? base + offset : nullptr;
+}
+
+// Requests whose page frames don't follow each other in our view of physical memory. Scattered
+// destinations: the desktop request writes a staging buffer of ours, through our decoder (a plain
+// copy for uncompressed data), which spreads it over the pages before the request completes.
+// Scattered sources are gathered into a buffer of ours when the queue is processed, which is when
+// the console reads them. (A request canceled before it reaches the decoder keeps its buffers.)
+struct Scatter {
+    u8* staging;            // the desktop destination (owned)
+    const ULONG_PTR* pages; // the title's page array: valid until the request completes
+    u16 page_offset;
+    u32 size;
+    u8* gathered; // the desktop source, or nullptr (owned)
+};
+
+static struct {
+    Scatter* items;
+    u32 count;
+    u32 capacity;
+    SRWLOCK lock;
+} g_scatter = {nullptr, 0, 0, SRWLOCK_INIT};
+
+static u8* staging_alloc(u64 size) {
+    return (u8*)VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+}
+
+// Copies between a buffer and [offset, offset + size) of the pages; false if a page isn't a frame.
+static bool copy_pages(const ULONG_PTR* pages, u16 offset, u32 size, u8* buffer, bool to_pages) {
+    u64 at = offset, done = 0;
+    while (done < size) {
+        u64 page = at / CONSOLE_PAGE_SIZE, in_page = at % CONSOLE_PAGE_SIZE;
+        u64 n = CONSOLE_PAGE_SIZE - in_page;
+        if (n > size - done)
+            n = size - done;
+        u8* frame = mem_physical_ptr(pages[page]);
+        if (!frame)
+            return false;
+        if (to_pages)
+            memcpy(frame + in_page, buffer + done, n);
+        else
+            memcpy(buffer + done, frame + in_page, n);
+        at += n;
+        done += n;
+    }
+    return true;
+}
+
+static void scatter_add(const Scatter& s) {
+    InterlockedIncrement(&g_scattered_count);
+    AcquireSRWLockExclusive(&g_scatter.lock);
+    if (g_scatter.count == g_scatter.capacity) {
+        u32 capacity = g_scatter.capacity ? g_scatter.capacity * 2 : 64;
+        Scatter* grown = (Scatter*)realloc(g_scatter.items, capacity * sizeof(Scatter));
+        if (!grown)
+            FATAL("out of memory for scattered requests");
+        g_scatter.items = grown;
+        g_scatter.capacity = capacity;
+    }
+    g_scatter.items[g_scatter.count++] = s;
+    ReleaseSRWLockExclusive(&g_scatter.lock);
+}
+
+// The scattered request writing `staging`, removed from the list; false if there is none.
+static bool scatter_take(const void* staging, Scatter* out) {
+    bool found = false;
+    AcquireSRWLockExclusive(&g_scatter.lock);
+    for (u32 i = 0; i < g_scatter.count && !found; i++) {
+        if (g_scatter.items[i].staging != staging)
+            continue;
+        *out = g_scatter.items[i];
+        g_scatter.items[i] = g_scatter.items[--g_scatter.count];
+        found = true;
+    }
+    ReleaseSRWLockExclusive(&g_scatter.lock);
+    return found;
 }
 
 // --- objects -------------------------------------------------------------------------------------
@@ -538,8 +618,16 @@ void ConsoleQueue::send(const ConsoleRequest* r) {
     d.Name = r->name;
 
     void* destination = r->destination;
-    if (r->options & OPT_DESTINATION_PAGES)
+    Scatter scatter = {};
+    if (r->options & OPT_DESTINATION_PAGES) {
         destination = contiguous_pages(r->destination_pages, r->destination_page_offset, r->destination_size);
+        if (!destination) {
+            scatter.pages = r->destination_pages;
+            scatter.staging = staging_alloc(r->destination_size);
+            scatter.page_offset = r->destination_page_offset;
+            scatter.size = r->destination_size;
+        }
+    }
     // DirectStorage may write and read title memory from the kernel, which doesn't fault pages in.
     if (destination && !(r->options & OPT_DESTINATION_PAGES))
         mem_prepare(destination, r->destination_size);
@@ -553,7 +641,7 @@ void ConsoleQueue::send(const ConsoleRequest* r) {
         mem_end_write_watches(destination, r->destination_size);
     if (destination && !(r->options & OPT_DESTINATION_PAGES)) {
         add_write((u64)destination, r->destination_size);
-    } else if (destination) {
+    } else if (destination || scatter.pages) {
         // Page frames, written through our view of physical memory: tracked where the title sees them.
         u64 pages = (r->destination_page_offset + (u64)r->destination_size + CONSOLE_PAGE_SIZE - 1) /
                     CONSOLE_PAGE_SIZE;
@@ -571,6 +659,16 @@ void ConsoleQueue::send(const ConsoleRequest* r) {
         source = (r->options & OPT_SOURCE_PAGES)
                      ? contiguous_pages(r->source_pages, r->source_page_offset, r->source_size)
                      : r->source;
+        if (!source && (r->options & OPT_SOURCE_PAGES)) {
+            scatter.gathered = staging_alloc(r->source_size);
+            if (scatter.gathered &&
+                copy_pages(r->source_pages, r->source_page_offset, r->source_size, scatter.gathered, false)) {
+                source = scatter.gathered;
+            } else if (scatter.gathered) {
+                VirtualFree(scatter.gathered, 0, MEM_RELEASE);
+                scatter.gathered = nullptr;
+            }
+        }
         if (source && !(r->options & OPT_SOURCE_PAGES))
             mem_prepare(source, r->source_size);
         d.Source.Memory.Source = source;
@@ -582,11 +680,26 @@ void ConsoleQueue::send(const ConsoleRequest* r) {
         d.Source.File.Size = r->source_size;
     }
 
-    if (!destination || ((r->options & OPT_SOURCE_MEMORY) && !source)) {
-        // Scattered physical pages: not expressible as one desktop request yet. Keep the request
-        // in the queue (so ordering and status reporting stay intact) but make it fail.
-        LOG_E("dstorage", "request %s: non-contiguous physical pages are not supported yet",
-              r->name ? r->name : "");
+    // Scattered pages go through our decoder (see Scatter).
+    bool ok = (scatter.pages ? scatter.staging != nullptr : destination != nullptr) &&
+              (!(r->options & OPT_SOURCE_MEMORY) || source);
+    if (ok && (scatter.pages || scatter.gathered)) {
+        if (scatter.pages)
+            d.Destination.Memory.Buffer = scatter.staging;
+        else
+            scatter.staging = (u8*)destination; // what the decoder finds the request by
+        if (d.Options.CompressionFormat == DSTORAGE_COMPRESSION_FORMAT_NONE)
+            d.Options.CompressionFormat = (DSTORAGE_COMPRESSION_FORMAT)FORMAT_COPY;
+        scatter_add(scatter);
+    }
+    if (!ok) {
+        // Page numbers that aren't frames, or no memory for a staging buffer. Keep the request in
+        // the queue (so ordering and status reporting stay intact) but make it fail.
+        LOG_E("dstorage", "request %s: its pages can't be read or written", r->name ? r->name : "");
+        if (scatter.pages && scatter.staging)
+            VirtualFree(scatter.staging, 0, MEM_RELEASE);
+        if (scatter.gathered)
+            VirtualFree(scatter.gathered, 0, MEM_RELEASE);
         static u8 dummy[1];
         d.Options.CompressionFormat = (DSTORAGE_COMPRESSION_FORMAT)FORMAT_UNSUPPORTED;
         d.Destination.Memory.Buffer = dummy;
@@ -663,10 +776,16 @@ static HRESULT inflate(libdeflate_decompressor* d, const void* src, u64 src_size
     return S_OK;
 }
 
-static HRESULT decode(libdeflate_decompressor* d, const DSTORAGE_CUSTOM_DECOMPRESSION_REQUEST& req) {
+static HRESULT decode_format(libdeflate_decompressor* d, const DSTORAGE_CUSTOM_DECOMPRESSION_REQUEST& req) {
     u8 format = (u8)req.CompressionFormat;
     if (format == FORMAT_UNSUPPORTED)
         return E_NOTIMPL;
+    if (format == FORMAT_COPY) {
+        if (req.SrcSize != req.DstSize)
+            return E_INVALIDARG;
+        memcpy(req.DstBuffer, req.SrcBuffer, req.DstSize);
+        return S_OK;
+    }
     if (format & (FORMAT_BCPACK_MASK | FORMAT_SWIZZLE_MASK)) {
         static volatile long logged = 0;
         if (InterlockedIncrement(&logged) <= 8)
@@ -676,6 +795,22 @@ static HRESULT decode(libdeflate_decompressor* d, const DSTORAGE_CUSTOM_DECOMPRE
     if (format & FORMAT_ZLIB)
         return inflate(d, req.SrcBuffer, req.SrcSize, req.DstBuffer, req.DstSize);
     return E_NOTIMPL;
+}
+
+// Decodes a request; a scattered one is spread over its pages, before the request completes.
+static HRESULT decode(libdeflate_decompressor* d, const DSTORAGE_CUSTOM_DECOMPRESSION_REQUEST& req) {
+    HRESULT hr = decode_format(d, req);
+    Scatter s;
+    if (!scatter_take(req.DstBuffer, &s))
+        return hr;
+    if (s.pages) {
+        if (SUCCEEDED(hr) && !copy_pages(s.pages, s.page_offset, s.size, s.staging, true))
+            hr = E_INVALIDARG;
+        VirtualFree(s.staging, 0, MEM_RELEASE); // the desktop queue is done with it
+    }
+    if (s.gathered)
+        VirtualFree(s.gathered, 0, MEM_RELEASE);
+    return hr;
 }
 
 static DWORD WINAPI decoder_thread(void*) {
