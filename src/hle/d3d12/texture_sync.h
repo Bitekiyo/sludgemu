@@ -21,6 +21,13 @@
 
 void texture_sync_init();
 
+// Diagnostics: SLUDGE_TRACE_TEXTURES=<width>x<height> logs the life of textures of that size (creation,
+// layout, views, marks, loads and what title memory held then); with SLUDGE_TRACE_TEXTURES_DUMP=<dir>
+// each load also writes the memory it read there. Whether a texture of this description is traced.
+bool texture_sync_traced(const D3D12_RESOURCE_DESC1& desc);
+// Whether a traced texture overlaps [address, address + size); false at once when nothing is traced.
+bool texture_sync_trace_overlaps(u64 address, u64 size);
+
 // Whether a texture with this console description is kept in sync with its title memory.
 bool texture_sync_tracks(const D3D12_RESOURCE_DESC1& desc);
 

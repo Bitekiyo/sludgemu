@@ -1,5 +1,6 @@
 #include "hle/d3d12/texture_sync.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -28,6 +29,87 @@ static struct {
     SRWLOCK lock;
     volatile long dirty; // entries marked and not uploaded yet
 } g_sync = {nullptr, 0, 0, SRWLOCK_INIT, 0};
+
+static ConsoleTextureDesc layout_desc(const D3D12_RESOURCE_DESC1& d);
+
+// Textures traced (SLUDGE_TRACE_TEXTURES=<width>x<height>), or width 0.
+static struct {
+    u64 width;
+    u32 height;
+    char dump_dir[260];
+    volatile long dumps;
+} g_trace;
+
+bool texture_sync_traced(const D3D12_RESOURCE_DESC1& desc) {
+    return g_trace.width && desc.Width == g_trace.width && desc.Height == g_trace.height;
+}
+
+// Titles map the pages of a texture as they stream its data in; the GPU reads the mapped ones. These
+// walk [start, end) in pieces of one page at most, each mapped or not.
+static u64 piece_end(u64 at, u64 end) {
+    u64 next = ALIGN_DOWN(at, MEM_PAGE_SIZE) + MEM_PAGE_SIZE;
+    return next < end ? next : end;
+}
+
+// Mapped bytes of [start, end).
+static u64 mapped_bytes(u64 start, u64 end) {
+    u64 mapped = 0;
+    for (u64 at = start; at < end; at = piece_end(at, end))
+        if (mem_is_mapped((const void*)at, piece_end(at, end) - at))
+            mapped += piece_end(at, end) - at;
+    return mapped;
+}
+
+// Copies [start, end) of title memory to `dst`, with zeros for what isn't mapped.
+static void copy_mapped(u8* dst, u64 start, u64 end) {
+    for (u64 at = start; at < end; at = piece_end(at, end)) {
+        u64 n = piece_end(at, end) - at;
+        if (mem_is_mapped((const void*)at, n)) {
+            mem_prepare((const void*)at, n);
+            memcpy(dst + (at - start), (const void*)at, n);
+        } else {
+            memset(dst + (at - start), 0, n);
+        }
+    }
+}
+
+// Mapped bytes and those of them that aren't zero: tells "no data yet" from "data the upload loses".
+static void trace_contents(const char* what, const SyncEntry& e) {
+    u64 nonzero = 0;
+    for (u64 at = e.start; at < e.end; at = piece_end(at, e.end)) {
+        u64 n = piece_end(at, e.end) - at;
+        if (!mem_is_mapped((const void*)at, n))
+            continue;
+        mem_prepare((const void*)at, n);
+        for (u64 i = 0; i < n; i++)
+            nonzero += ((const u8*)at)[i] != 0;
+    }
+    LOG_I("d3d12", "texture trace: %s %p at 0x%llx-0x%llx: %llu of %llu bytes mapped, %llu non-zero", what,
+          (void*)e.resource, e.start, e.end, mapped_bytes(e.start, e.end), e.end - e.start, nonzero);
+    char unmapped[512];
+    u32 used = 0;
+    unmapped[0] = 0;
+    for (u64 at = e.start; at < e.end && used < sizeof(unmapped) - 32; at = piece_end(at, e.end))
+        if (!mem_is_mapped((const void*)at, piece_end(at, e.end) - at))
+            used += (u32)snprintf(unmapped + used, sizeof(unmapped) - used, " +0x%llx", at - e.start);
+    if (used)
+        LOG_I("d3d12", "texture trace: %p unmapped pieces at%s", (void*)e.resource, unmapped);
+    if (g_trace.dump_dir[0] && InterlockedIncrement(&g_trace.dumps) <= 64) {
+        u64 size = e.end - e.start;
+        u8* copy = (u8*)malloc(size);
+        if (copy) {
+            copy_mapped(copy, e.start, e.end);
+            char path[400];
+            snprintf(path, sizeof(path), "%s/tex_%llx_%03ld.bin", g_trace.dump_dir, e.start, g_trace.dumps);
+            FILE* f = fopen(path, "wb");
+            if (f) {
+                fwrite(copy, 1, size, f);
+                fclose(f);
+            }
+            free(copy);
+        }
+    }
+}
 
 // Detiled data per submission: the rest waits for the next one (a texture larger than this goes
 // alone).
@@ -79,6 +161,28 @@ void texture_sync_add(ConsoleResource* r) {
     // mapping marks it again.
     g_sync.entries[at] = {r->gpu_address, r->gpu_address + info.SizeInBytes, r, true, linear, nullptr};
     g_sync.count++;
+    if (texture_sync_traced(r->desc)) {
+        LOG_I(
+            "d3d12",
+            "texture trace: added %p at 0x%llx-0x%llx (%llux%u, %u mips, format %d, layout 0x%x, flags 0x%x)",
+            (void*)r, r->gpu_address, r->gpu_address + info.SizeInBytes, r->desc.Width, r->desc.Height,
+            r->desc.MipLevels, r->desc.Format, r->desc.Layout, r->desc.Flags);
+        ConsoleTextureLayout layout;
+        if (console_texture_layout(layout_desc(r->desc), &layout)) {
+            const ConsolePlaneLayout& p = layout.planes[0];
+            LOG_I("d3d12", "texture trace: %p layout: plane base 0x%llx, %u standard mips, %u in the tail",
+                  (void*)r, p.base_offset, p.standard_mip_count, p.tail_mip_count);
+            for (u32 m = 0; m < layout.mip_levels; m++)
+                LOG_I(
+                    "d3d12",
+                    "texture trace: %p mip %u: offset 0x%llx size 0x%llx swizzle %u pitch %u, %ux%u elements "
+                    "(padded %ux%u), tail %u at %u,%u",
+                    (void*)r, m, p.mips[m].offset, p.mips[m].size, p.mips[m].swizzle_mode,
+                    p.mips[m].pitch_pixels, p.mips[m].width, p.mips[m].height, p.mips[m].padded_width,
+                    p.mips[m].padded_height, p.mips[m].in_mip_tail, (u32)p.mips[m].tail_x,
+                    (u32)p.mips[m].tail_y);
+        }
+    }
     InterlockedIncrement(&g_sync.dirty);
     ReleaseSRWLockExclusive(&g_sync.lock);
 }
@@ -115,6 +219,9 @@ void texture_sync_mark(u64 address, u64 size) {
                 break; // far before: nothing earlier can reach
             continue;
         }
+        if (texture_sync_traced(e.resource->desc))
+            LOG_I("d3d12", "texture trace: %p marked by 0x%llx+0x%llx%s", (void*)e.resource, address, size,
+                  e.dirty ? " (already marked)" : "");
         if (!e.dirty) {
             e.dirty = true;
             InterlockedIncrement(&g_sync.dirty);
@@ -123,13 +230,92 @@ void texture_sync_mark(u64 address, u64 size) {
     ReleaseSRWLockExclusive(&g_sync.lock);
 }
 
+bool texture_sync_trace_overlaps(u64 address, u64 size) {
+    if (!g_trace.width)
+        return false;
+    bool found = false;
+    AcquireSRWLockShared(&g_sync.lock);
+    for (u32 i = 0; i < g_sync.count && !found; i++) {
+        const SyncEntry& e = g_sync.entries[i];
+        found = e.start < address + size && e.end > address && texture_sync_traced(e.resource->desc);
+    }
+    ReleaseSRWLockShared(&g_sync.lock);
+    return found;
+}
+
+// Traced textures over [base, base + size): which of their pages are mapped now, and to which frames.
+static void trace_mapping(const u8* base, u64 size) {
+    AcquireSRWLockShared(&g_sync.lock);
+    for (u32 i = 0; i < g_sync.count; i++) {
+        const SyncEntry& e = g_sync.entries[i];
+        if (e.start >= (u64)base + size || e.end <= (u64)base || !texture_sync_traced(e.resource->desc))
+            continue;
+        char text[640];
+        u32 used = 0;
+        text[0] = 0;
+        for (u64 at = ALIGN_DOWN(e.start, MEM_PAGE_SIZE); at < e.end && used < sizeof(text) - 40;
+             at += MEM_PAGE_SIZE) {
+            u64 pfn = MEM_INVALID_PFN;
+            mem_frames_at((const void*)at, 1, &pfn);
+            used +=
+                (u32)snprintf(text + used, sizeof(text) - used, " %llx", pfn == MEM_INVALID_PFN ? 0ull : pfn);
+        }
+        LOG_I("d3d12", "texture trace: %p remapped by 0x%llx+0x%llx; frames now%s", (void*)e.resource,
+              (u64)base, size, text);
+    }
+    ReleaseSRWLockShared(&g_sync.lock);
+}
+
 static void on_mapping_changed(const u8* base, u64 size) {
+    if (g_trace.width)
+        trace_mapping(base, size);
     texture_sync_mark((u64)base, size);
 }
 
+// A device finished writing [base, base + size): every texture there has new contents. A CPU write
+// ended the watch over [base, base + size) instead, armed by the textures over exactly that memory
+// (see texture_sync_record): textures overlapping it elsewhere have watches of their own, which the
+// write ended too if it hit their memory; marking them for this one would upload them whenever a
+// neighbour is written.
+static void on_written(u64 base, u64 size, MemWriteKind kind) {
+    if (g_trace.width && texture_sync_trace_overlaps(base, size))
+        LOG_I("d3d12", "texture trace: %s 0x%llx+0x%llx",
+              kind == MEM_DEVICE_WROTE ? "device wrote" : "watch ended", base, size);
+    if (kind == MEM_DEVICE_WROTE) {
+        texture_sync_mark(base, size);
+        return;
+    }
+    AcquireSRWLockExclusive(&g_sync.lock);
+    for (u32 i = lower_bound(base); i < g_sync.count && g_sync.entries[i].start == base; i++) {
+        SyncEntry& e = g_sync.entries[i];
+        if (e.end != base + size)
+            continue;
+        if (texture_sync_traced(e.resource->desc))
+            LOG_I("d3d12", "texture trace: %p marked by its write watch", (void*)e.resource);
+        if (!e.dirty) {
+            e.dirty = true;
+            InterlockedIncrement(&g_sync.dirty);
+        }
+    }
+    ReleaseSRWLockExclusive(&g_sync.lock);
+}
+
 void texture_sync_init() {
+    char trace[32];
+    DWORD n = GetEnvironmentVariableA("SLUDGE_TRACE_TEXTURES", trace, sizeof(trace));
+    if (n && n < sizeof(trace)) {
+        char* x = nullptr;
+        g_trace.width = strtoull(trace, &x, 10);
+        g_trace.height = x && *x == 'x' ? (u32)strtoul(x + 1, nullptr, 10) : 0;
+        if (!g_trace.height)
+            g_trace.width = 0;
+        LOG_I("d3d12", "tracing textures of %llux%u", g_trace.width, g_trace.height);
+        n = GetEnvironmentVariableA("SLUDGE_TRACE_TEXTURES_DUMP", g_trace.dump_dir, sizeof(g_trace.dump_dir));
+        if (n >= sizeof(g_trace.dump_dir))
+            g_trace.dump_dir[0] = 0;
+    }
     mem_add_mapping_listener(on_mapping_changed);
-    mem_set_write_listener(texture_sync_mark);
+    mem_set_write_listener(on_written);
 }
 
 bool texture_sync_pending() {
@@ -389,8 +575,12 @@ bool texture_sync_record(ID3D12GraphicsCommandList8* list, TextureUploadSources*
             continue;
         // Still being written: uploaded once the writes finish (they mark it again). Protecting it now
         // would also fail writes the kernel makes.
-        if (mem_device_writes_pending(e.start, e.end - e.start))
+        bool traced = texture_sync_traced(e.resource->desc);
+        if (mem_device_writes_pending(e.start, e.end - e.start)) {
+            if (traced)
+                LOG_I("d3d12", "texture trace: %p waits for device writes", (void*)e.resource);
             continue;
+        }
         const D3D12_RESOURCE_DESC1& d = e.resource->desc;
         u32 subresources = (d.MipLevels ? d.MipLevels : 1) *
                            (d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : d.DepthOrArraySize);
@@ -398,11 +588,19 @@ bool texture_sync_record(ID3D12GraphicsCommandList8* list, TextureUploadSources*
                     copy_count + subresources > ARRAY_COUNT(s_copies);
         if (full && !e.linear)
             continue;
+        // Partly mapped textures are loaded too: the GPU reads what is mapped, and mapping more pages
+        // marks the texture again.
         bool mapped = mem_is_mapped((const void*)e.start, e.end - e.start);
-        // Watched before it is read: what the CPU writes from now on marks it again.
-        if (mapped)
+        bool any_mapped = mapped || mapped_bytes(e.start, e.end) != 0;
+        // Watched before it is read: what the CPU writes from now on marks it again (watches cover
+        // the mapped pages).
+        if (any_mapped)
             mem_watch_writes((const void*)e.start, e.end - e.start);
+        if (traced)
+            trace_contents(full ? "loading (or deferred)" : "loading", e);
         if (mapped && e.linear && copy_from_title_memory(list, e.resource, e.end - e.start, sources)) {
+            if (traced)
+                LOG_I("d3d12", "texture trace: %p copied from title memory", (void*)e.resource);
             e.dirty = false;
             InterlockedDecrement(&g_sync.dirty);
             copied = true;
@@ -412,19 +610,26 @@ bool texture_sync_record(ID3D12GraphicsCommandList8* list, TextureUploadSources*
             continue;
         e.dirty = false;
         InterlockedDecrement(&g_sync.dirty);
-        if (!mapped)
+        if (!any_mapped)
             continue; // nothing to read yet: pages arrive with a later mapping, which marks it again
         u64 unused;
         ID3D12Resource* texture = console_resource_desktop(e.resource, &unused);
         u32 count = 0;
         u64 offset = total;
         if (!texture || !plan_texture(e.resource, &s_copies[copy_count], ARRAY_COUNT(s_copies) - copy_count,
-                                      &count, &offset))
+                                      &count, &offset)) {
+            if (traced)
+                LOG_I("d3d12", "texture trace: %p can't be loaded (%s)", (void*)e.resource,
+                      texture ? "no upload plan" : "no desktop texture");
             continue;
+        }
         if (!e.addressing)
             e.addressing = make_addressing(e.resource, count);
-        if (!e.addressing)
+        if (!e.addressing) {
+            if (traced)
+                LOG_I("d3d12", "texture trace: %p can't be detiled", (void*)e.resource);
             continue;
+        }
         if (sources->count + 4 >= TEXTURE_UPLOAD_SOURCES) {
             e.dirty = true; // no room left: with the next submission
             InterlockedIncrement(&g_sync.dirty);
@@ -432,6 +637,9 @@ bool texture_sync_record(ID3D12GraphicsCommandList8* list, TextureUploadSources*
         }
         keep_source(sources, texture);
         GpuAddress window = {};
+        if (traced)
+            LOG_I("d3d12", "texture trace: %p detiled on the GPU (%u subresources)", (void*)e.resource,
+                  count);
         if (gpu_translate_contiguous(e.start, e.end - e.start, &window)) {
             keep_source(sources, window.buffer);
             loads[load_count++] = {&e, texture, window.desktop_address, NOT_STAGED, copy_count, count};
@@ -463,8 +671,7 @@ bool texture_sync_record(ID3D12GraphicsCommandList8* list, TextureUploadSources*
             if (ld.staged == NOT_STAGED)
                 continue;
             u64 size = ld.entry->end - ld.entry->start;
-            mem_prepare((const void*)ld.entry->start, size);
-            memcpy(staging->mapped + staged_base + ld.staged, (const void*)ld.entry->start, size);
+            copy_mapped(staging->mapped + staged_base + ld.staged, ld.entry->start, ld.entry->start + size);
             ld.source = staging->address + staged_base + ld.staged;
         }
     }

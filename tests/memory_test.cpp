@@ -384,7 +384,7 @@ static void test_gpu_section_ranges() {
 static u32 g_write_reports = 0;
 static u64 g_write_base = 0, g_write_size = 0;
 
-static void on_write(u64 base, u64 size) {
+static void on_write(u64 base, u64 size, MemWriteKind) {
     g_write_reports++;
     g_write_base = base;
     g_write_size = size;

@@ -278,6 +278,9 @@ static ConsoleResource* new_resource(u64 gpu_address, const D3D12_RESOURCE_DESC1
     InitializeSRWLock(&r->lock);
     if (texture_sync_tracks(r->desc))
         texture_sync_add(r);
+    else if (texture_sync_traced(r->desc))
+        LOG_I("d3d12", "texture trace: %p at 0x%llx isn't synced (flags 0x%x, format %d, layout 0x%x)",
+              (void*)r, gpu_address, r->desc.Flags, r->desc.Format, r->desc.Layout);
     return r;
 }
 

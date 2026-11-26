@@ -9,6 +9,7 @@
 #include "gpu/gpu_window.h"
 #include "hle/d3d12/d3d12_objects.h"
 #include "hle/d3d12/views.h"
+#include "hle/d3d12/texture_sync.h"
 
 // Console slots get a marker naming the desktop descriptor they mirror, which makes a title's own
 // raw copies of descriptor memory recognizable when debugging.
@@ -748,6 +749,12 @@ void WINAPI device_create_placed_raw_srv_x(ConsoleDevice* self, const D3D12_RESO
                        "views of placed textures with a hardware format (%u) read the texture's own format",
                        desc->image_format);
         texture = console_placed_texture(desc->location, console_desc1_from_desc(*resource_desc));
+        if (texture && texture_sync_traced(texture->desc))
+            LOG_I("d3d12",
+                  "texture trace: %p view at 0x%llx: dimension %d, format %d, most detailed mip %u, mips %u, "
+                  "min LOD %.2f, mapping 0x%x",
+                  (void*)texture, desc->location, d.ViewDimension, d.Format, d.Texture2D.MostDetailedMip,
+                  d.Texture2D.MipLevels, d.Texture2D.ResourceMinLODClamp, d.Shader4ComponentMapping);
         if (texture)
             desktop = texture_srv(self, texture, &d);
         else

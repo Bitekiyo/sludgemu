@@ -535,7 +535,7 @@ static void end_watches_reporting_in(u64 start, u64 end, bool traps) {
 
 static void report_writes(const Report* reports, u32 count) {
     for (u32 i = 0; i < count && g_track.write_listener; i++)
-        g_track.write_listener(reports[i].base, reports[i].size);
+        g_track.write_listener(reports[i].base, reports[i].size, MEM_WATCH_ENDED);
 }
 
 static void watch_or_trap(const void* base, u64 size, bool trap) {
@@ -889,7 +889,7 @@ void mem_poll_device_writes() {
             return;
         CloseHandle(finished.done);
         for (u32 k = 0; k < finished.count && g_track.write_listener; k++)
-            g_track.write_listener(finished.spans[k].base, finished.spans[k].size);
+            g_track.write_listener(finished.spans[k].base, finished.spans[k].size, MEM_DEVICE_WROTE);
         free(finished.spans);
     }
 }

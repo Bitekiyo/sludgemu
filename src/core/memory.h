@@ -150,8 +150,8 @@ typedef void (*MemMappingListener)(const u8* base, u64 size);
 void mem_add_mapping_listener(MemMappingListener listener);
 
 // Write watches: the memory under [base, base + size) of tracked title memory becomes read-only until
-// the first write into one of its pages, which ends the watch and reports the range to the write
-// listener. Watches are on memory, not addresses: mapped frames can show at several addresses (the
+// the first write into one of its pages, which ends the watch and reports its range (as armed) to the
+// write listener. Watches are on memory, not addresses: mapped frames can show at several addresses (the
 // console's physical pages), and a write through any address showing a watched page ends the watch,
 // whose pages then become writable at every address (those no other watch or trap needs). Protection
 // is per host page, so a write next to a watched range on one of its pages ends it too. GPU-only and
@@ -160,7 +160,11 @@ void mem_add_mapping_listener(MemMappingListener listener);
 // listeners get that change). Writes through our own views of the memory (for the GPU) and by the
 // kernel aren't seen: kernel I/O into title memory ends the watches first (mem_end_write_watches),
 // since its writes would fail rather than fault. Arming a range that is watched already does nothing.
-typedef void (*MemWriteListener)(u64 base, u64 size); // called without memory locks held
+enum MemWriteKind {
+    MEM_WATCH_ENDED,  // a write ended the watch armed over [base, base + size)
+    MEM_DEVICE_WROTE, // a device finished writing [base, base + size) (see mem_expect_device_writes)
+};
+typedef void (*MemWriteListener)(u64 base, u64 size, MemWriteKind kind); // called without memory locks held
 void mem_set_write_listener(MemWriteListener listener);
 void mem_watch_writes(const void* base, u64 size);
 
@@ -174,7 +178,7 @@ void mem_end_write_watches(const void* base, u64 size);
 // Device writes: title memory that something other than the CPU writes (DirectStorage requests),
 // finishing when `done` is signaled. Until then mem_device_writes_pending reports the memory; once
 // mem_poll_device_writes finds `done` signaled (and closes it), the spans are reported to the write
-// listener like CPU writes. Spans are title addresses.
+// listener (MEM_DEVICE_WROTE). Spans are title addresses.
 struct MemSpan {
     u64 base;
     u64 size;
