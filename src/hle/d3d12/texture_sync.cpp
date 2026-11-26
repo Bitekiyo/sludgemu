@@ -268,7 +268,7 @@ static bool copy_from_title_memory(ID3D12GraphicsCommandList8* list, ConsoleReso
     const ConsolePlaneLayout& p = layout.planes[0];
     bool unrestricted = unrestricted_copy_pitch();
     GpuAddress window;
-    if (!gpu_translate(r->gpu_address, 1, &window) || window.available < size)
+    if (!gpu_translate_contiguous(r->gpu_address, size, &window))
         return false; // not one block of memory for the GPU
     for (u32 m = 0; m < layout.mip_levels; m++) {
         u64 at = window.offset + p.base_offset + p.mips[m].offset;
@@ -432,7 +432,7 @@ bool texture_sync_record(ID3D12GraphicsCommandList8* list, TextureUploadSources*
         }
         keep_source(sources, texture);
         GpuAddress window = {};
-        if (gpu_translate(e.start, 1, &window) && window.available >= e.end - e.start) {
+        if (gpu_translate_contiguous(e.start, e.end - e.start, &window)) {
             keep_source(sources, window.buffer);
             loads[load_count++] = {&e, texture, window.desktop_address, NOT_STAGED, copy_count, count};
         } else {
