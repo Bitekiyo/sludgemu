@@ -124,10 +124,13 @@ ID3D12Fence* console_sync_fence(u64 address) {
     if (fence)
         return fence;
 
-    // The counter's current value starts the fence; GPU-visible memory is mapped and readable.
+    // The counter's current value starts the fence; GPU-visible memory is mapped and readable. The
+    // CPU's stores to it signal the fence too (titles release GPU work by writing a counter): trapped
+    // before the value is read, so none is missed.
     u64 desktop;
     if (!console_translate_gpu_address(address, sizeof(u64), &desktop))
         return nullptr;
+    mem_trap_stores((const void*)address, sizeof(u64));
     AcquireSRWLockExclusive(&g_fence_lock);
     c = find_counter(address);
     if (c && c->address == address) {
@@ -195,7 +198,21 @@ static const ConsoleEntry k_fence_impl[] = {
     CONSOLE_ENTRY(12, fence_get_gpu_address_x),
 };
 
+// A CPU store into a counter GPU work waits on: the counter's fence follows it.
+static void on_counter_store(u64 base, u64) {
+    AcquireSRWLockShared(&g_fence_lock);
+    CounterFence* c = find_counter(base);
+    ID3D12Fence* fence = c && c->address == base ? c->fence : nullptr;
+    ReleaseSRWLockShared(&g_fence_lock);
+    if (!fence)
+        return;
+    u64 value = *(volatile u64*)base;
+    if (value > fence->GetCompletedValue())
+        fence->Signal(value);
+}
+
 void console_fence_init() {
+    mem_set_store_listener(on_counter_store);
     g_fence_table = console_build_table("ID3D12Fence", k_fence_entries, ARRAY_COUNT(k_fence_entries),
                                         k_fence_impl, ARRAY_COUNT(k_fence_impl));
 }
