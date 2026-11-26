@@ -528,11 +528,16 @@ static void note_view_mips(ConsoleResource* r, const D3D12_SHADER_RESOURCE_VIEW_
     } else {
         return;
     }
-    // Racy minimums are fine for a report.
-    if (mip < r->view_first_mip)
-        r->view_first_mip = mip;
+    // Views of one texture are made by one thread at a time in practice; a lost update only leaves a
+    // larger mip without tiles until the next view.
     if (lod < r->view_min_lod)
         r->view_min_lod = lod;
+    if (mip < r->view_first_mip) {
+        bool viewed_before = r->view_first_mip != 0xFFFFFFFFu;
+        r->view_first_mip = mip;
+        if (viewed_before) // larger mips are loaded now: they get tiles and their contents
+            texture_sync_mark(r->gpu_address, r->console_bytes ? r->console_bytes : 1);
+    }
 }
 
 static ID3D12Resource* texture_srv(ConsoleDevice* self, const ConsoleResource* r,

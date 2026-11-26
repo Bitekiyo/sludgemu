@@ -794,9 +794,14 @@ static bool update_tiles(ID3D12CommandQueue* queue, TextureUploadSources* source
                          ID3D12Resource* texture) {
     TextureTiles* t = e.tiles;
     bool any = false, changed = false;
+    // Mips no view reads (more detailed than the first viewed one) get no tiles: their memory is
+    // another texture's while the title streams this one (see ConsoleResource::view_first_mip).
+    u32 first_mip = e.resource->view_first_mip == 0xFFFFFFFFu ? 0 : e.resource->view_first_mip;
     for (u32 i = 0; i < t->group_count; i++) {
         TileGroup& g = t->groups[i];
-        bool want = mem_is_mapped((const void*)(e.start + g.source), g.source_size);
+        bool packed = g.count > 1 || g.at.Subresource % t->mips >= t->standard_mips;
+        bool viewed = packed || g.at.Subresource % t->mips >= first_mip;
+        bool want = viewed && mem_is_mapped((const void*)(e.start + g.source), g.source_size);
         if (want != g.mapped) {
             u32* tiles = &t->tiles[g.first];
             if (want) {
