@@ -515,6 +515,26 @@ static D3D12_UNORDERED_ACCESS_VIEW_DESC whole_buffer_uav(const ConsoleResource* 
 // Failed views leave a null descriptor of the same kind rather than a stale one.
 // The desktop texture a shader resource view of `r` reads, with the view's format made desktop's; or
 // nullptr with `d` made a null view.
+// Notes the mips a view of `r` reads (memory reports). Views of 2D textures only (the common case).
+static void note_view_mips(ConsoleResource* r, const D3D12_SHADER_RESOURCE_VIEW_DESC& d) {
+    u32 mip = 0;
+    f32 lod = 0.0f;
+    if (d.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D) {
+        mip = d.Texture2D.MostDetailedMip;
+        lod = d.Texture2D.ResourceMinLODClamp;
+    } else if (d.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY) {
+        mip = d.Texture2DArray.MostDetailedMip;
+        lod = d.Texture2DArray.ResourceMinLODClamp;
+    } else {
+        return;
+    }
+    // Racy minimums are fine for a report.
+    if (mip < r->view_first_mip)
+        r->view_first_mip = mip;
+    if (lod < r->view_min_lod)
+        r->view_min_lod = lod;
+}
+
 static ID3D12Resource* texture_srv(ConsoleDevice* self, const ConsoleResource* r,
                                    D3D12_SHADER_RESOURCE_VIEW_DESC* d) {
     ID3D12Resource* desktop = texture_view_target(r);
@@ -755,10 +775,12 @@ void WINAPI device_create_placed_raw_srv_x(ConsoleDevice* self, const D3D12_RESO
                   "min LOD %.2f, mapping 0x%x",
                   (void*)texture, desc->location, d.ViewDimension, d.Format, d.Texture2D.MostDetailedMip,
                   d.Texture2D.MipLevels, d.Texture2D.ResourceMinLODClamp, d.Shader4ComponentMapping);
-        if (texture)
+        if (texture) {
+            note_view_mips(texture, d);
             desktop = texture_srv(self, texture, &d);
-        else
+        } else {
             d = null_srv(d.ViewDimension);
+        }
     } else {
         d = null_srv(d.ViewDimension);
     }

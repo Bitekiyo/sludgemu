@@ -297,6 +297,10 @@ struct ConsoleResource {
     u64 console_bytes;
 
     bool placed_view; // made for views of placed memory, never seen by the title (console_placed_texture)
+    // The most detailed mip and the smallest LOD clamp its shader resource views have asked for (memory
+    // reports: titles streaming textures view only the mips they have loaded).
+    volatile u32 view_first_mip; // 0xFFFFFFFF until a view
+    volatile f32 view_min_lod;   // 1e30 until a view
 };
 
 void console_resource_init();

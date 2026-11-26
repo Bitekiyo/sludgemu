@@ -222,6 +222,10 @@ void texture_sync_remove(ConsoleResource* r) {
     mem_unwatch_writes((const void*)start, size); // its memory needn't stay protected
 }
 
+ConsoleTextureDesc texture_layout_desc(const D3D12_RESOURCE_DESC1& desc) {
+    return layout_desc(desc);
+}
+
 static u32 tiles_held(const TextureTiles* t);
 
 u32 texture_sync_tiles_held(u64 start, const ConsoleResource* r) {

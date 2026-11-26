@@ -495,6 +495,8 @@ ConsoleResource* console_placed_texture(u64 gpu_address, const D3D12_RESOURCE_DE
     ConsoleResource* r =
         new_resource(gpu_address, &desc, heap, D3D12_HEAP_FLAG_NONE, D3D12_BARRIER_LAYOUT_COMMON, nullptr);
     r->placed_view = true;
+    r->view_first_mip = 0xFFFFFFFFu;
+    r->view_min_lod = 1e30f;
     memmove(&g_placed.entries[at + 1], &g_placed.entries[at],
             (g_placed.count - at) * sizeof(ConsoleResource*));
     g_placed.entries[at] = r;
@@ -596,6 +598,8 @@ struct TextureSpan {
     TextureKind kind;
     const ConsoleResource* resource; // only compared: it may be gone by the time the report runs
     D3D12_RESOURCE_DESC1 desc;
+    u32 view_first_mip;
+    f32 view_min_lod;
 };
 
 // SLUDGE_TEXTURE_LIST=<path>: each report also writes the live textures there as CSV (diagnostics: how
@@ -613,12 +617,22 @@ static void write_texture_list(const TextureSpan* spans, u32 count) {
     FILE* f = nullptr;
     if (fopen_s(&f, path, "w") != 0 || !f)
         return;
-    fprintf(f, "kind,start,bytes,tiles,dimension,width,height,depth,mips,format,flags\n");
+    fprintf(f, "kind,start,bytes,tiles,dimension,width,height,depth,mips,format,flags,view_mip,view_lod,"
+               "mip_offsets\n");
     for (u32 i = 0; i < count; i++) {
         const TextureSpan& t = spans[i];
-        fprintf(f, "%d,0x%llx,%llu,%u,%d,%llu,%u,%u,%u,%d,0x%x\n", t.kind, t.start, t.end - t.start,
+        fprintf(f, "%d,0x%llx,%llu,%u,%d,%llu,%u,%u,%u,%d,0x%x,%d,%g,", t.kind, t.start, t.end - t.start,
                 texture_sync_tiles_held(t.start, t.resource), t.desc.Dimension, t.desc.Width, t.desc.Height,
-                t.desc.DepthOrArraySize, t.desc.MipLevels, t.desc.Format, t.desc.Flags);
+                t.desc.DepthOrArraySize, t.desc.MipLevels, t.desc.Format, t.desc.Flags, (s32)t.view_first_mip,
+                t.view_min_lod > 1e29f ? -1.0f : t.view_min_lod);
+        // Where each mip's title memory starts and how big it is: offset+size;...
+        ConsoleTextureLayout layout;
+        if (console_texture_layout(texture_layout_desc(t.desc), &layout) && layout.plane_count >= 1) {
+            const ConsolePlaneLayout& p = layout.planes[0];
+            for (u32 m = 0; m < layout.mip_levels && m < CONSOLE_MAX_MIPS; m++)
+                fprintf(f, "%s%llu+%llu", m ? ";" : "", p.base_offset + p.mips[m].offset, p.mips[m].size);
+        }
+        fprintf(f, "\n");
     }
     fclose(f);
 }
@@ -669,7 +683,8 @@ void console_memory_report(const char* why) {
     TextureSpan* spans = (TextureSpan*)malloc((count ? count : 1) * sizeof(TextureSpan));
     for (u32 i = 0; spans && i < count; i++) {
         const ConsoleResource* r = g_textures.live[i];
-        spans[i] = {r->gpu_address, r->gpu_address + r->console_bytes, r->desktop_bytes, texture_kind(r), r, r->desc};
+        spans[i] = {r->gpu_address, r->gpu_address + r->console_bytes, r->desktop_bytes, texture_kind(r), r, r->desc,
+                    r->placed_view ? r->view_first_mip : 0xFFFFFFFFu, r->placed_view ? r->view_min_lod : 1e30f};
     }
     ReleaseSRWLockShared(&g_textures.lock);
 
