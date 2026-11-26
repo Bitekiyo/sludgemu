@@ -2,6 +2,7 @@
 
 #include <windows.h>
 #include <psapi.h>
+#include <stdio.h>
 #include <stdlib.h>
 
 #include "common/log.h"
@@ -594,7 +595,33 @@ struct TextureSpan {
     u64 desktop_bytes;
     TextureKind kind;
     const ConsoleResource* resource; // only compared: it may be gone by the time the report runs
+    D3D12_RESOURCE_DESC1 desc;
 };
+
+// SLUDGE_TEXTURE_LIST=<path>: each report also writes the live textures there as CSV (diagnostics: how
+// textures overlap, what takes tiles).
+static void write_texture_list(const TextureSpan* spans, u32 count) {
+    static char path[MAX_PATH];
+    static volatile long checked = 0;
+    if (log_once_flag(&checked)) {
+        DWORD n = GetEnvironmentVariableA("SLUDGE_TEXTURE_LIST", path, sizeof(path));
+        if (!n || n >= sizeof(path))
+            path[0] = 0;
+    }
+    if (!path[0])
+        return;
+    FILE* f = nullptr;
+    if (fopen_s(&f, path, "w") != 0 || !f)
+        return;
+    fprintf(f, "kind,start,bytes,tiles,dimension,width,height,depth,mips,format,flags\n");
+    for (u32 i = 0; i < count; i++) {
+        const TextureSpan& t = spans[i];
+        fprintf(f, "%d,0x%llx,%llu,%u,%d,%llu,%u,%u,%u,%d,0x%x\n", t.kind, t.start, t.end - t.start,
+                texture_sync_tiles_held(t.start, t.resource), t.desc.Dimension, t.desc.Width, t.desc.Height,
+                t.desc.DepthOrArraySize, t.desc.MipLevels, t.desc.Format, t.desc.Flags);
+    }
+    fclose(f);
+}
 
 // Committed memory of this process by kind, from a walk of its address space: private memory inside and
 // outside title ranges, private write-combined memory (where Windows charges video memory allocations)
@@ -642,7 +669,7 @@ void console_memory_report(const char* why) {
     TextureSpan* spans = (TextureSpan*)malloc((count ? count : 1) * sizeof(TextureSpan));
     for (u32 i = 0; spans && i < count; i++) {
         const ConsoleResource* r = g_textures.live[i];
-        spans[i] = {r->gpu_address, r->gpu_address + r->console_bytes, r->desktop_bytes, texture_kind(r), r};
+        spans[i] = {r->gpu_address, r->gpu_address + r->console_bytes, r->desktop_bytes, texture_kind(r), r, r->desc};
     }
     ReleaseSRWLockShared(&g_textures.lock);
 
@@ -688,6 +715,7 @@ void console_memory_report(const char* why) {
     // Per kind: what the desktop textures take, the title memory they describe, how much of that is
     // distinct (aliased textures share it) and how much the title has mapped.
     qsort(spans, count, sizeof(TextureSpan), compare_spans);
+    write_texture_list(spans, count);
     for (u32 i = 0; i < count;) {
         TextureKind kind = spans[i].kind;
         u32 textures = 0, small_count = 0;
