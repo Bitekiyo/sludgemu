@@ -10,6 +10,8 @@
 // decompression queue. Their failures therefore surface through DirectStorage's own status
 // arrays and error records, in order, like any other failure.
 
+#include <stdlib.h>
+#include <string.h>
 #include <windows.h>
 #include <dstorage.h>
 #include <dstorageerr.h>
@@ -44,9 +46,11 @@ struct ConsoleQueueDesc {
     const char* name;
 };
 
+#define QUEUE_OPTION_NO_AUTO_SUBMIT 1ull
+
 struct ConsoleQueueDesc1 {
     ConsoleQueueDesc base;
-    u64 options; // bit 0: auto-submit disabled
+    u64 options; // QUEUE_OPTION_*
 };
 
 struct ConsoleQueueInfo {
@@ -147,19 +151,21 @@ static const GUID IID_ConsoleQueue2 = {
 
 // Custom compression format byte: DSTORAGE_CUSTOM_COMPRESSION_0 | operations.
 #define FORMAT_ZLIB          0x01
-#define FORMAT_BCPACK        0x02
-#define FORMAT_SWIZZLE_SHIFT 2    // console swizzle mode (1-4) in bits 2-4
+#define FORMAT_BCPACK_SHIFT  1 // BCPack mode (the BCn format, 1-7) in bits 1-3
+#define FORMAT_BCPACK_MASK   0x0E
+#define FORMAT_SWIZZLE_SHIFT 4 // console swizzle mode (1-4) in bits 4-6
+#define FORMAT_SWIZZLE_MASK  0x70
 #define FORMAT_UNSUPPORTED   0xFF // the request can't be expressed; it fails with E_NOTIMPL
 
 static u8 custom_format(u64 options) {
     u8 format = 0;
     if (options & OPT_ZLIB)
         format |= FORMAT_ZLIB;
-    if ((options >> OPT_BCPACK_SHIFT) & OPT_BCPACK_MASK)
-        format |= FORMAT_BCPACK;
+    u64 bcpack = (options >> OPT_BCPACK_SHIFT) & OPT_BCPACK_MASK;
     u64 swizzle = (options >> OPT_SWIZZLE_SHIFT) & OPT_SWIZZLE_MASK;
-    if (swizzle > 7)
+    if (bcpack > 7 || swizzle > 4)
         return FORMAT_UNSUPPORTED;
+    format |= (u8)(bcpack << FORMAT_BCPACK_SHIFT);
     format |= (u8)(swizzle << FORMAT_SWIZZLE_SHIFT);
     return format ? (u8)(DSTORAGE_CUSTOM_COMPRESSION_0 | format) : (u8)DSTORAGE_COMPRESSION_FORMAT_NONE;
 }
@@ -302,14 +308,49 @@ class ConsoleStatusArray : public IUnknown {
 
 static const GUID* const k_queue_iids[] = {&IID_ConsoleQueue, &IID_ConsoleQueue1, &IID_ConsoleQueue2};
 
+// A command waiting for its queue to be processed.
+enum PendingType : u8 {
+    PENDING_REQUEST,
+    PENDING_STATUS,
+    PENDING_EVENT,
+};
+
+struct PendingCommand {
+    PendingType type;
+    bool canceled; // requests: canceled before they were processed
+    union {
+        ConsoleRequest request;
+        struct {
+            IDStorageStatusArray* array;
+            u32 index;
+        } status;
+        HANDLE event;
+    };
+};
+
+// Commands are held until the queue is processed, as on the console: when the title submits it, or
+// when it is half full (unless the title disabled automatic submission; then a full queue stalls the
+// enqueuing thread until another one submits). What a request points at is read then: titles fill in
+// requests' page arrays between enqueueing and submitting them.
 class ConsoleQueue : public IUnknown {
   public:
     REFCOUNTED_IUNKNOWN(k_queue_iids)
 
-    virtual void EnqueueRequest(const ConsoleRequest* request);
+    virtual void EnqueueRequest(const ConsoleRequest* request) {
+        PendingCommand c;
+        c.type = PENDING_REQUEST;
+        c.canceled = false;
+        c.request = *request;
+        enqueue(c);
+    }
 
     virtual void EnqueueStatus(ConsoleStatusArray* array, UINT32 index) {
-        m_desktop->EnqueueStatus(array->m_desktop, index);
+        PendingCommand c;
+        c.type = PENDING_STATUS;
+        c.canceled = false;
+        c.status.array = array->m_desktop;
+        c.status.index = index;
+        enqueue(c);
     }
 
     virtual void EnqueueSignal(ID3D12Fence* fence, UINT64 value) {
@@ -320,44 +361,134 @@ class ConsoleQueue : public IUnknown {
                   value);
     }
 
-    virtual void Submit() { m_desktop->Submit(); }
+    virtual void Submit() {
+        AcquireSRWLockExclusive(&m_lock);
+        process_locked();
+        ReleaseSRWLockExclusive(&m_lock);
+    }
+
+    // Requests being processed are canceled by the desktop queue; waiting ones are dropped.
     virtual void CancelRequestsWithTag(UINT64 mask, UINT64 value) {
+        AcquireSRWLockExclusive(&m_lock);
+        for (u32 i = 0; i < m_pending_count; i++) {
+            PendingCommand& c = m_pending[i];
+            if (c.type == PENDING_REQUEST && (c.request.cancellation_tag & mask) == value)
+                c.canceled = true;
+        }
+        ReleaseSRWLockExclusive(&m_lock);
         m_desktop->CancelRequestsWithTag(mask, value);
     }
-    virtual void Close() { m_desktop->Close(); }
+
+    virtual void Close() {
+        AcquireSRWLockExclusive(&m_lock);
+        m_pending_count = 0; // never submitted
+        WakeAllConditionVariable(&m_drained);
+        ReleaseSRWLockExclusive(&m_lock);
+        m_desktop->Close();
+    }
     virtual HANDLE GetErrorEvent() { return m_desktop->GetErrorEvent(); }
     virtual void RetrieveErrorRecord(ConsoleErrorRecord* record);
 
     virtual void Query(ConsoleQueueInfo* info) {
-        DSTORAGE_QUEUE_INFO d;
-        m_desktop->Query(&d);
         info->desc = m_desc.base;
-        info->empty_slot_count = d.EmptySlotCount;
-        info->requests_until_auto_submit = d.RequestCountUntilAutoSubmit;
+        slot_counts(&info->empty_slot_count, &info->requests_until_auto_submit);
     }
 
     // IDStorageQueueX1
-    virtual void EnqueueSetEvent(HANDLE handle) { m_desktop->EnqueueSetEvent(handle); }
+    virtual void EnqueueSetEvent(HANDLE handle) {
+        PendingCommand c;
+        c.type = PENDING_EVENT;
+        c.canceled = false;
+        c.event = handle;
+        enqueue(c);
+    }
 
     // IDStorageQueueX2
     virtual void Query1(ConsoleQueueInfo1* info) {
-        DSTORAGE_QUEUE_INFO d;
-        m_desktop->Query(&d);
         info->desc = m_desc;
-        info->empty_slot_count = d.EmptySlotCount;
-        info->requests_until_auto_submit = d.RequestCountUntilAutoSubmit;
+        slot_counts(&info->empty_slot_count, &info->requests_until_auto_submit);
     }
 
-    ConsoleQueue(IDStorageQueue1* desktop, const ConsoleQueueDesc1& desc)
-        : m_desktop(desktop), m_desc(desc) {}
-    ~ConsoleQueue() { m_desktop->Release(); }
+    ConsoleQueue(IDStorageQueue1* desktop, const ConsoleQueueDesc1& desc, u16 capacity)
+        : m_desktop(desktop), m_desc(desc), m_capacity(capacity) {}
+    ~ConsoleQueue() {
+        m_desktop->Release();
+        free(m_pending);
+    }
+
+    void enqueue(const PendingCommand& c);
+    void process_locked();
+    void send(const ConsoleRequest* r);
+    bool auto_submit() const { return !(m_desc.options & QUEUE_OPTION_NO_AUTO_SUBMIT); }
+
+    void slot_counts(u16* empty, u16* until_auto_submit) {
+        DSTORAGE_QUEUE_INFO d;
+        m_desktop->Query(&d);
+        AcquireSRWLockShared(&m_lock);
+        u32 pending = m_pending_count;
+        ReleaseSRWLockShared(&m_lock);
+        *empty = (u16)(d.EmptySlotCount > pending ? d.EmptySlotCount - pending : 0);
+        u32 half = m_capacity / 2u;
+        *until_auto_submit = (u16)(auto_submit() && pending < half ? half - pending : 0);
+    }
 
     IDStorageQueue1* m_desktop;
     ConsoleQueueDesc1 m_desc;
+    u16 m_capacity;
+    SRWLOCK m_lock = SRWLOCK_INIT;
+    CONDITION_VARIABLE m_drained = CONDITION_VARIABLE_INIT; // the pending commands were processed
+    PendingCommand* m_pending = nullptr;                    // grown up to m_capacity
+    u32 m_pending_count = 0;
+    u32 m_pending_allocated = 0;
     volatile long m_refs = 1;
 };
 
-void ConsoleQueue::EnqueueRequest(const ConsoleRequest* r) {
+void ConsoleQueue::enqueue(const PendingCommand& c) {
+    AcquireSRWLockExclusive(&m_lock);
+    while (m_pending_count == m_capacity) // only without automatic submission
+        SleepConditionVariableSRW(&m_drained, &m_lock, INFINITE, 0);
+    if (m_pending_count == m_pending_allocated) {
+        u32 grown = m_pending_allocated ? m_pending_allocated * 2 : 64;
+        if (grown > m_capacity)
+            grown = m_capacity;
+        PendingCommand* p = (PendingCommand*)realloc(m_pending, grown * sizeof(PendingCommand));
+        if (!p) {
+            ReleaseSRWLockExclusive(&m_lock);
+            LOG_E("dstorage", "out of memory for queued commands; command dropped");
+            return;
+        }
+        m_pending = p;
+        m_pending_allocated = grown;
+    }
+    m_pending[m_pending_count++] = c;
+    if (auto_submit() && m_pending_count >= m_capacity / 2u)
+        process_locked();
+    ReleaseSRWLockExclusive(&m_lock);
+}
+
+// The pending commands go to the desktop queue, in order, and it is submitted.
+void ConsoleQueue::process_locked() {
+    for (u32 i = 0; i < m_pending_count; i++) {
+        const PendingCommand& c = m_pending[i];
+        switch (c.type) {
+        case PENDING_REQUEST:
+            if (!c.canceled)
+                send(&c.request);
+            break;
+        case PENDING_STATUS:
+            m_desktop->EnqueueStatus(c.status.array, c.status.index);
+            break;
+        case PENDING_EVENT:
+            m_desktop->EnqueueSetEvent(c.event);
+            break;
+        }
+    }
+    m_pending_count = 0;
+    m_desktop->Submit();
+    WakeAllConditionVariable(&m_drained);
+}
+
+void ConsoleQueue::send(const ConsoleRequest* r) {
     count_request(*r);
 
     DSTORAGE_REQUEST d = {};
@@ -484,7 +615,7 @@ static HRESULT decode(libdeflate_decompressor* d, const DSTORAGE_CUSTOM_DECOMPRE
     u8 format = (u8)req.CompressionFormat;
     if (format == FORMAT_UNSUPPORTED)
         return E_NOTIMPL;
-    if (format & (FORMAT_BCPACK | (7 << FORMAT_SWIZZLE_SHIFT))) {
+    if (format & (FORMAT_BCPACK_MASK | FORMAT_SWIZZLE_MASK)) {
         static volatile long logged = 0;
         if (InterlockedIncrement(&logged) <= 8)
             LOG_E("dstorage", "custom format 0x%02x (BCPack/swizzle) is not implemented yet", format);
@@ -605,7 +736,7 @@ class ConsoleFactory : public IUnknown {
               desc->base.priority, (unsigned long)hr);
         if (FAILED(hr))
             return hr;
-        ConsoleQueue* queue = new ConsoleQueue(desktop, *desc);
+        ConsoleQueue* queue = new ConsoleQueue(desktop, *desc, capacity);
         hr = queue->QueryInterface(iid, out);
         queue->Release();
         return hr;
