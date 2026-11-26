@@ -214,6 +214,17 @@ void mem_trap_stores(const void* base, u64 size);
 // Ends the trap armed for exactly [base, base + size).
 void mem_untrap_stores(const void* base, u64 size);
 
+// Pages taken from the CPU: no access at any address showing the same memory until they are given
+// back. For memory another copy of which is newer (written by the GPU in video memory): the first
+// access calls the taken listener with the address (no locks held, on the accessing thread), which
+// brings the page up to date through another view of it (mem_physical_ptr, a section's host view) and
+// gives it back; then the access retries. Pages are host pages; memory the CPU can't access isn't
+// taken. Write watches covering taken pages stay armed: given back, such pages are read-only again.
+typedef void (*MemTakenListener)(const void* addr);
+void mem_set_taken_listener(MemTakenListener listener);
+void mem_take_pages(const void* base, u64 size);
+void mem_give_pages(const void* base, u64 size);
+
 // Changes the host protection used for future mappings in the range containing `addr`.
 void mem_set_range_protect(const void* addr, u32 protect);
 bool mem_is_tracked(const void* addr);

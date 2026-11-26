@@ -1,11 +1,12 @@
-// Write tracking of title memory: watches, store traps and device writes (see memory.h).
+// Access tracking of title memory: watches, store traps, taken pages and device writes (see memory.h).
 //
 // Tracking keys memory by its canonical address, the same for every address showing it: physical
 // memory by frame ID (a frame can show at several addresses), other title memory by its address.
 // Protection is per host page and counted: a page is read-only, at every address showing it, while
 // any watch or trap covers it, and it only changes when a count goes from or to zero. So arming a
 // watch protects only pages nobody protected yet, and ending one releases only pages nobody else
-// needs; a write ends exactly the watches covering the page written.
+// needs; a write ends exactly the watches covering the page written. A taken page allows no access
+// at all whatever its count, until it is given back.
 //
 // Lock order: range lock, then phys lock (briefly, to find frames), then the tracking lock. Listeners
 // are called with no locks held.
@@ -23,6 +24,17 @@
 #define GRANULE_SHIFT    16 // granules of the watch index: one frame, or 64 KiB of other memory
 #define NO_NODE          0xFFFFFFFFu
 #define MAX_REPORTS      16
+
+// A host page's count: the watches and traps covering it, and above them whether it is taken.
+#define TAKEN      0x8000u
+#define COUNT_MASK 0x7FFFu
+
+// What the CPU may do on a page.
+enum Level { LEVEL_WRITE, LEVEL_READ, LEVEL_NONE };
+
+static u32 level_of(u16 count) {
+    return (count & TAKEN) ? LEVEL_NONE : (count & COUNT_MASK) ? LEVEL_READ : LEVEL_WRITE;
+}
 
 // A canonical range, host page aligned.
 struct Span {
@@ -51,9 +63,11 @@ struct Report {
 
 static struct {
     SRWLOCK lock;
-    volatile long live; // watches and traps there are: none means no fault can be ours
+    volatile long live;  // watches and traps there are: none means no fault can be ours
+    volatile long taken; // host pages taken
     MemWriteListener write_listener;
     MemStoreListener store_listener;
+    MemTakenListener taken_listener;
     u16* frame_counts; // per host page of every frame ID: what protects it
     Watch* watches;
     u32 watch_slots, watch_capacity, free_watch;
@@ -97,6 +111,15 @@ void mem_set_write_listener(MemWriteListener listener) {
 
 void mem_set_store_listener(MemStoreListener listener) {
     g_track.store_listener = listener;
+}
+
+void mem_set_taken_listener(MemTakenListener listener) {
+    g_track.taken_listener = listener;
+}
+
+// Whether any fault can be tracking's.
+static bool tracking_active() {
+    return g_track.live || g_track.taken;
 }
 
 // --- canonical addresses -----------------------------------------------------------------------------
@@ -165,7 +188,7 @@ static u16* page_count(u64 key, bool create) {
     return &s->watch_counts[(key - (u64)s->info.base) / HOST_PAGE];
 }
 
-// Title memory the CPU can't write needs no protection: GPU-only memory, and read-only memory.
+// Title memory the CPU can't write needs no write protection: GPU-only memory, and read-only memory.
 static bool protectable(const RangeSlot* s) {
     u32 p = s->info.protect & 0xFF;
     if (p == PAGE_NOACCESS || !p)
@@ -174,13 +197,25 @@ static bool protectable(const RangeSlot* s) {
     return m == PAGE_READWRITE || m == PAGE_EXECUTE_READWRITE;
 }
 
-// Changes the protection of [start, end) in range `s` to read-only or back. Views are separate
-// allocations to VirtualProtect, so placeholder ranges go view by view; other ranges may have pages
-// not committed yet (lazy commits), so they go by what is committed. Range lock held.
-static void protect_va(const RangeSlot* s, u64 start, u64 end, bool read_only) {
+// Memory the CPU can't access isn't taken from it either.
+static bool takeable(const RangeSlot* s) {
+    u32 p = s->info.protect & 0xFF;
+    return p != PAGE_NOACCESS && p != 0;
+}
+
+// Whether `s` takes protection for pages at `level`: taking needs the CPU to have access, write
+// protection to be able to write.
+static bool protects(const RangeSlot* s, u32 level) {
+    return level == LEVEL_NONE ? takeable(s) : protectable(s) || (takeable(s) && level == LEVEL_WRITE);
+}
+
+// Changes the protection of [start, end) in range `s` to `level`. Views are separate allocations to
+// VirtualProtect, so placeholder ranges go view by view; other ranges may have pages not committed yet
+// (lazy commits), so they go by what is committed. Range lock held.
+static void protect_va(const RangeSlot* s, u64 start, u64 end, u32 level) {
     const u32 modifiers = PAGE_WRITECOMBINE | PAGE_NOCACHE;
     u32 writable = mapping_protect(s) & 0xFF;
-    u32 to = read_only ? PAGE_READONLY : writable;
+    u32 to = level == LEVEL_NONE ? PAGE_NOACCESS : level == LEVEL_READ ? PAGE_READONLY : writable;
     DWORD old;
     if (s->info.flags & MEM_RANGE_PLACEHOLDER) {
         for (u64 va = start; va < end;) {
@@ -195,15 +230,16 @@ static void protect_va(const RangeSlot* s, u64 start, u64 end, bool read_only) {
         }
         return;
     }
-    u32 from = read_only ? writable : PAGE_READONLY;
     for (u64 va = start; va < end;) {
         MEMORY_BASIC_INFORMATION mbi;
         if (!VirtualQuery((const void*)va, &mbi, sizeof(mbi)))
             break;
         u64 stop = (u64)mbi.BaseAddress + mbi.RegionSize;
         stop = stop < end ? stop : end;
-        if (mbi.State == MEM_COMMIT && (mbi.Protect & ~modifiers) == from &&
-            !VirtualProtect((void*)va, stop - va, to, &old))
+        // Only protections tracking gives: what the title set itself stays.
+        u32 now = mbi.Protect & ~modifiers;
+        bool ours = now == writable || now == PAGE_READONLY || now == PAGE_NOACCESS;
+        if (mbi.State == MEM_COMMIT && ours && now != to && !VirtualProtect((void*)va, stop - va, to, &old))
             LOG_W_ONCE("memory", "cannot change the protection of %p (+0x%llx) for write tracking (%lu)",
                        (void*)va, stop - va, GetLastError());
         va = stop;
@@ -241,12 +277,12 @@ static const RangeSlot* range_of(u64 va) {
     return last;
 }
 
-// The addresses showing canonical pages [key, key + size), as runs. Range lock held, tracking lock held
-// exclusively.
-static void add_addresses(u64 key, u64 size) {
+// The addresses showing canonical pages [key, key + size), as runs, where ranges protect pages at
+// `level`. Range lock held, tracking lock held exclusively.
+static void add_addresses(u64 key, u64 size, u32 level) {
     if (!(key & CANON_FRAME)) {
         const RangeSlot* s = range_of(key);
-        if (s && protectable(s))
+        if (s && protects(s, level))
             add_run(key, key + size, s);
         return;
     }
@@ -256,12 +292,12 @@ static void add_addresses(u64 key, u64 size) {
     if (!va)
         return; // not mapped anywhere
     const RangeSlot* s = range_of(va);
-    if (s && protectable(s))
+    if (s && protects(s, level))
         add_run(va + offset, va + offset + size, s);
     for (u32 a = alias_lower_bound((u32)frame); a < g_mem.alias_count && g_mem.aliases[a].id == frame; a++) {
         va = g_mem.aliases[a].va;
         s = range_of(va);
-        if (s && protectable(s))
+        if (s && protects(s, level))
             add_run(va + offset, va + offset + size, s);
     }
 }
@@ -271,8 +307,8 @@ static int compare_runs(const void* a, const void* b) {
     return x < y ? -1 : x > y ? 1 : 0;
 }
 
-// Applies the collected runs, merged where they continue each other. Range lock held.
-static void apply_runs(bool read_only) {
+// Applies `level` to the collected runs, merged where they continue each other. Range lock held.
+static void apply_runs(u32 level) {
     if (!g_run_count)
         return;
     qsort(g_runs, g_run_count, sizeof(VaRun), compare_runs);
@@ -282,24 +318,27 @@ static void apply_runs(bool read_only) {
             cur.end = g_runs[i].end > cur.end ? g_runs[i].end : cur.end;
             continue;
         }
-        protect_va(cur.range, cur.start, cur.end, read_only);
+        protect_va(cur.range, cur.start, cur.end, level);
         cur = g_runs[i];
     }
-    protect_va(cur.range, cur.start, cur.end, read_only);
+    protect_va(cur.range, cur.start, cur.end, level);
     g_run_count = 0;
 }
 
 // Adds `delta` (+1 or -1) to the counts of a span's pages; pages whose count leaves or reaches zero
-// are collected as runs. A span lies in one range. Range lock held, tracking lock held exclusively.
+// are collected as runs (taken ones stay as they are). A span lies in one range. Range lock held,
+// tracking lock held exclusively.
 static void count_span(const Span& sp, int delta) {
     u16* counts = page_count(sp.start, true);
     if (!counts)
         return;
+    u32 level = delta > 0 ? LEVEL_READ : LEVEL_WRITE;
     u64 run_start = 0, run_end = 0;
     for (u64 key = sp.start; key < sp.end; key += HOST_PAGE) {
         u16* c = &counts[(key - sp.start) / HOST_PAGE];
-        bool changes = delta > 0 ? (*c)++ == 0 : --(*c) == 0;
-        if (!changes)
+        u16 before = *c;
+        *c = (u16)(delta > 0 ? before + 1 : before - 1);
+        if (level_of(before) == level_of(*c))
             continue;
         // Runs stay within a frame: the next frame can show elsewhere.
         bool continues = run_end == key && ((key & CANON_FRAME) == 0 || (key & (MEM_PAGE_SIZE - 1)) != 0);
@@ -308,12 +347,42 @@ static void count_span(const Span& sp, int delta) {
             continue;
         }
         if (run_end)
-            add_addresses(run_start, run_end - run_start);
+            add_addresses(run_start, run_end - run_start, level);
         run_start = key;
         run_end = key + HOST_PAGE;
     }
     if (run_end)
-        add_addresses(run_start, run_end - run_start);
+        add_addresses(run_start, run_end - run_start, level);
+}
+
+// Takes a span's pages from the CPU or gives them back; pages whose level changes to `level` are
+// collected as runs (giving back collects those going to `level` only: watched pages go back to read
+// only, others to writable). A span lies in one range. Range lock held, tracking lock held exclusively.
+static void take_span(const Span& sp, bool take, u32 level) {
+    u16* counts = page_count(sp.start, true);
+    if (!counts)
+        return;
+    u64 run_start = 0, run_end = 0;
+    for (u64 key = sp.start; key < sp.end; key += HOST_PAGE) {
+        u16* c = &counts[(key - sp.start) / HOST_PAGE];
+        if (((*c & TAKEN) != 0) == take)
+            continue;
+        if (!take && level_of(*c & COUNT_MASK) != level)
+            continue; // the other pass gives it back
+        *c = (u16)(take ? *c | TAKEN : *c & ~TAKEN);
+        take ? InterlockedIncrement(&g_track.taken) : InterlockedDecrement(&g_track.taken);
+        bool continues = run_end == key && ((key & CANON_FRAME) == 0 || (key & (MEM_PAGE_SIZE - 1)) != 0);
+        if (continues) {
+            run_end = key + HOST_PAGE;
+            continue;
+        }
+        if (run_end)
+            add_addresses(run_start, run_end - run_start, level);
+        run_start = key;
+        run_end = key + HOST_PAGE;
+    }
+    if (run_end)
+        add_addresses(run_start, run_end - run_start, level);
 }
 
 // --- the watch index ---------------------------------------------------------------------------------
@@ -465,7 +534,7 @@ static void add_watch(u64 base, u64 size, Span* spans, u32 span_count, bool trap
     index_watch(id, true);
     for (u32 i = 0; i < span_count; i++)
         count_span(spans[i], +1);
-    apply_runs(true);
+    apply_runs(LEVEL_READ);
     InterlockedIncrement(&g_track.live);
 }
 
@@ -476,7 +545,7 @@ static void end_watch(u32 id, Report* reports, u32* report_count) {
     index_watch(id, false);
     for (u32 i = 0; i < w.span_count; i++)
         count_span(w.spans[i], -1);
-    apply_runs(false);
+    apply_runs(LEVEL_WRITE);
     u32 at = by_base_lower_bound(w.base);
     while (g_track.by_base[at] != id)
         at++;
@@ -591,6 +660,46 @@ void mem_untrap_stores(const void* base, u64 size) {
     end_armed(base, size, true);
 }
 
+static void take_or_give(const void* base, u64 size, bool take) {
+    u64 start = (u64)base, end = start + size;
+    if (!size)
+        return;
+    AcquireSRWLockShared(&g_mem.range_lock);
+    const RangeSlot* s = find_range_locked(base);
+    if (!s || (const u8*)end > s->info.base + s->info.size) {
+        ReleaseSRWLockShared(&g_mem.range_lock);
+        LOG_W("memory", "pages at %p (+0x%llx) to %s are outside title memory", base, size,
+              take ? "take" : "give back");
+        return;
+    }
+    Span* spans = nullptr;
+    u32 count = 0, capacity = 0;
+    canonical_spans(s, start, end, &spans, &count, &capacity);
+    AcquireSRWLockExclusive(&g_track.lock);
+    if (take) {
+        for (u32 i = 0; i < count; i++)
+            take_span(spans[i], true, LEVEL_NONE);
+        apply_runs(LEVEL_NONE);
+    } else {
+        for (u32 level = LEVEL_WRITE; level <= LEVEL_READ; level++) {
+            for (u32 i = 0; i < count; i++)
+                take_span(spans[i], false, level);
+            apply_runs(level);
+        }
+    }
+    ReleaseSRWLockExclusive(&g_track.lock);
+    ReleaseSRWLockShared(&g_mem.range_lock);
+    free(spans);
+}
+
+void mem_take_pages(const void* base, u64 size) {
+    take_or_give(base, size, true);
+}
+
+void mem_give_pages(const void* base, u64 size) {
+    take_or_give(base, size, false);
+}
+
 void mem_end_write_watches(const void* base, u64 size) {
     if (!g_track.live || !size)
         return;
@@ -617,17 +726,17 @@ void mem_end_write_watches(const void* base, u64 size) {
 
 // --- hooks from the rest of the memory system --------------------------------------------------------
 
-// Makes [start, end) of a view just mapped read-only. (The range's region list catches up after the
-// mapping, so protect_va can't go by it yet.)
-static void protect_new_view(u64 start, u64 end) {
+// Gives [start, end) of a view just mapped `level` (read-only or no access). (The range's region list
+// catches up after the mapping, so protect_va can't go by it yet.)
+static void protect_new_view(u64 start, u64 end, u32 level) {
     DWORD old;
-    if (!VirtualProtect((void*)start, end - start, PAGE_READONLY, &old))
-        LOG_W_ONCE("memory", "cannot change the protection of %p (+0x%llx) for write tracking (%lu)",
+    if (!VirtualProtect((void*)start, end - start, level == LEVEL_NONE ? PAGE_NOACCESS : PAGE_READONLY, &old))
+        LOG_W_ONCE("memory", "cannot change the protection of %p (+0x%llx) for access tracking (%lu)",
                    (void*)start, end - start, GetLastError());
 }
 
 void tracking_view_mapped(const RangeSlot* s, u32 first_page, u32 count, u32 real) {
-    if (!g_track.live || !protectable(s))
+    if (!tracking_active() || !takeable(s))
         return;
     u32* ids = (u32*)malloc(count * sizeof(u32));
     if (!ids)
@@ -638,48 +747,54 @@ void tracking_view_mapped(const RangeSlot* s, u32 first_page, u32 count, u32 rea
     ReleaseSRWLockShared(&g_mem.phys_lock);
     AcquireSRWLockShared(&g_track.lock);
     u64 run_start = 0, run_end = 0;
+    u32 run_level = LEVEL_WRITE;
     for (u32 i = 0; i < count; i++) {
         const u16* c = &g_track.frame_counts[(u64)ids[i] * FRAME_HOST_PAGES];
         u64 va = (u64)page_va(s, first_page + i);
         for (u32 p = 0; p < FRAME_HOST_PAGES; p++) {
-            if (!c[p])
+            u32 level = level_of(c[p]);
+            if (level == LEVEL_WRITE || !protects(s, level))
                 continue;
             u64 at = va + (u64)p * HOST_PAGE;
-            if (run_end == at) {
+            if (run_end == at && level == run_level) {
                 run_end += HOST_PAGE;
                 continue;
             }
             if (run_end)
-                protect_new_view(run_start, run_end);
+                protect_new_view(run_start, run_end, run_level);
             run_start = at;
             run_end = at + HOST_PAGE;
+            run_level = level;
         }
     }
     if (run_end)
-        protect_new_view(run_start, run_end);
+        protect_new_view(run_start, run_end, run_level);
     ReleaseSRWLockShared(&g_track.lock);
     free(ids);
 }
 
 void tracking_committed(const RangeSlot* s, u64 lo, u64 hi) {
-    if (!g_track.live || !s->watch_counts || !protectable(s))
+    if (!tracking_active() || !s->watch_counts || !takeable(s))
         return;
     AcquireSRWLockShared(&g_track.lock);
     u64 run_start = 0, run_end = 0;
+    u32 run_level = LEVEL_WRITE;
     for (u64 va = lo; va < hi; va += HOST_PAGE) {
-        if (!s->watch_counts[(va - (u64)s->info.base) / HOST_PAGE])
+        u32 level = level_of(s->watch_counts[(va - (u64)s->info.base) / HOST_PAGE]);
+        if (level == LEVEL_WRITE || !protects(s, level))
             continue;
-        if (run_end == va) {
+        if (run_end == va && level == run_level) {
             run_end += HOST_PAGE;
             continue;
         }
         if (run_end)
-            protect_va(s, run_start, run_end, true);
+            protect_va(s, run_start, run_end, run_level);
         run_start = va;
         run_end = va + HOST_PAGE;
+        run_level = level;
     }
     if (run_end)
-        protect_va(s, run_start, run_end, true);
+        protect_va(s, run_start, run_end, run_level);
     ReleaseSRWLockShared(&g_track.lock);
 }
 
@@ -716,23 +831,70 @@ void tracking_range_released(RangeSlot* s) {
         }
         ReleaseSRWLockExclusive(&g_track.lock);
     }
+    if (s->watch_counts) {
+        long taken = 0;
+        for (u64 i = 0; i < s->info.size / HOST_PAGE; i++)
+            taken += (s->watch_counts[i] & TAKEN) != 0;
+        InterlockedAdd(&g_track.taken, -taken);
+    }
     free(s->watch_counts);
     s->watch_counts = nullptr;
 }
 
+void tracking_frame_freed(u32 id) {
+    if (!g_track.taken)
+        return;
+    u16* c = &g_track.frame_counts[(u64)id * FRAME_HOST_PAGES];
+    for (u32 p = 0; p < FRAME_HOST_PAGES; p++) {
+        if (c[p] & TAKEN) {
+            c[p] &= ~TAKEN;
+            InterlockedDecrement(&g_track.taken);
+        }
+    }
+}
+
 // --- faults ------------------------------------------------------------------------------------------
 
-// Whether tracking protects the host page at canonical address `key`. Range lock and tracking lock
-// held.
+// Whether watches or traps protect the host page at canonical address `key`. Range lock and tracking
+// lock held.
 static bool page_protected(u64 key) {
     const u16* c = page_count(key, false);
-    return c && *c;
+    return c && (*c & COUNT_MASK);
+}
+
+static bool page_taken(u64 key) {
+    const u16* c = page_count(key, false);
+    return c && (*c & TAKEN);
+}
+
+bool tracking_access_fault(u64 addr) {
+    if (!g_track.taken)
+        return false;
+    u64 page = addr & ~(u64)(HOST_PAGE - 1);
+    AcquireSRWLockShared(&g_mem.range_lock);
+    const RangeSlot* s = find_range_locked((const void*)addr);
+    u64 key = s ? canonical(s, page, true) : 0;
+    bool taken = false;
+    if (key) {
+        AcquireSRWLockShared(&g_track.lock);
+        taken = page_taken(key);
+        ReleaseSRWLockShared(&g_track.lock);
+    }
+    ReleaseSRWLockShared(&g_mem.range_lock);
+    if (!taken)
+        return false;
+    if (!g_track.taken_listener) {
+        LOG_E("memory", "access to a taken page at %p with nobody to give it back", (void*)addr);
+        return false;
+    }
+    g_track.taken_listener((const void*)addr); // gives the page back; the access is retried
+    return true;
 }
 
 static void finish_trapped_pages(const u64* pages, const u64* keys, Report* reports, u32* report_count);
 
 bool tracking_write_fault(EXCEPTION_POINTERS* ep, u64 addr) {
-    if (!g_track.live)
+    if (!tracking_active())
         return false;
     u64 page = addr & ~(u64)(HOST_PAGE - 1);
     Report reports[MAX_REPORTS];

@@ -563,6 +563,100 @@ static DWORD WINAPI store_thread(void* p) {
 // Store traps: every store into the trapped bytes is reported after it is done, also on pages a watch
 // shares, by stores straddling two trapped pages and by repeated string stores; the pages stay
 // protected throughout, also while another thread stores.
+// The taken listener brings a page up to date through the host view of its memory and gives it back.
+static u32 g_taken_calls = 0;
+static const void* g_taken_addr = nullptr;
+static u8 g_taken_value = 0;
+
+static void on_taken(const void* addr) {
+    g_taken_calls++;
+    g_taken_addr = addr;
+    MemBlock block;
+    if (mem_backing_block(addr, &block)) {
+        u64 page = ALIGN_DOWN((u64)addr - (u64)block.base, PAGE);
+        memset(block.host + page, g_taken_value, PAGE); // the newer copy
+        mem_give_pages(block.base + page, PAGE);
+    }
+}
+
+static bool page_inaccessible(const void* p) {
+    MEMORY_BASIC_INFORMATION mbi;
+    return VirtualQuery(p, &mbi, sizeof(mbi)) && (mbi.Protect & 0xFF) == PAGE_NOACCESS;
+}
+
+// Taken pages: no access at any address showing the frame until the listener gives them back, reads
+// and writes alike; watches stay armed across taking; section memory works the same; freed frames
+// aren't taken any more.
+static void test_taken_pages() {
+    mem_set_taken_listener(on_taken);
+    mem_set_write_listener(on_write);
+    MemAddressLimits limits = {};
+    u8* a = (u8*)mem_reserve_placeholder(2 * PAGE, limits, 0, PAGE_READWRITE, 0);
+    u8* b = (u8*)mem_reserve_placeholder(2 * PAGE, limits, 0, PAGE_READWRITE, 0);
+    u64 frames[2];
+    CHECK(a && b && mem_physical_alloc(2, frames));
+    if (!a || !b)
+        return;
+    CHECK(mem_map_physical(a, 2, frames));
+    CHECK(mem_map_physical(b, 1, &frames[1])); // b shows a's second frame
+    mem_prepare(a, 2 * PAGE);
+    mem_prepare(b, PAGE);
+    volatile u8* pa = a;
+    volatile u8* pb = b;
+
+    g_taken_calls = 0;
+    mem_take_pages(a + PAGE, PAGE);
+    CHECK(page_inaccessible(a + PAGE) && page_inaccessible(b) && !page_inaccessible(a));
+    g_taken_value = 0x5A;
+    CHECK(pb[10] == 0x5A); // a read through the alias brings the page back
+    CHECK(g_taken_calls == 1 && (u64)g_taken_addr == (u64)b + 10);
+    CHECK(page_writable(a + PAGE) && page_writable(b));
+    pa[PAGE + 1] = 7; // given back: no more calls
+    CHECK(g_taken_calls == 1 && pb[1] == 7);
+
+    // Watched and taken: given back, the page is read-only again and the write reports.
+    g_write_reports = 0;
+    mem_watch_writes(a, PAGE);
+    mem_take_pages(a, PAGE);
+    CHECK(page_inaccessible(a));
+    g_taken_value = 3;
+    pa[20] = 4; // a write: given back read-only, then the watch reports
+    CHECK(g_taken_calls == 2 && g_write_reports == 1 && pa[20] == 4 && pa[0] == 3 && pa[PAGE - 1] == 3);
+    CHECK(page_writable(a));
+
+    // A freed frame isn't taken any more.
+    mem_take_pages(a, PAGE);
+    CHECK(mem_release(a) && mem_release(b));
+    mem_physical_free(2, frames);
+    u8* c = (u8*)mem_reserve_placeholder(PAGE, limits, 0, PAGE_READWRITE, 0);
+    u64 again;
+    CHECK(c && mem_physical_alloc(1, &again));
+    if (c) {
+        CHECK(mem_map_physical(c, 1, &again));
+        ((volatile u8*)c)[5] = 1;
+        CHECK(g_taken_calls == 2);
+        CHECK(mem_release(c));
+    }
+    mem_physical_free(1, &again);
+
+    // Section memory.
+    u8* gpu = (u8*)mem_alloc_virtual(nullptr, MiB(32), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE, limits,
+                                     MEM_RANGE_GPU | MEM_RANGE_CPU_ACCESS, 0);
+    CHECK(gpu != nullptr);
+    if (gpu) {
+        gpu[MiB(2)] = 1;
+        mem_take_pages(gpu + MiB(2), PAGE);
+        CHECK(page_inaccessible(gpu + MiB(2)));
+        g_taken_value = 9;
+        CHECK(((volatile u8*)gpu)[MiB(2) + 3] == 9 && gpu[MiB(2)] == 9);
+        CHECK(g_taken_calls == 3);
+        mem_take_pages(gpu + MiB(2), PAGE);
+        CHECK(mem_release(gpu)); // released while taken
+    }
+    mem_set_write_listener(nullptr);
+    mem_set_taken_listener(nullptr);
+}
+
 static void test_store_traps() {
     mem_set_store_listener(on_store);
     mem_set_write_listener(on_write);
@@ -707,6 +801,7 @@ int main() {
     test_write_watches();
     test_watch_counts();
     test_store_traps();
+    test_taken_pages();
     test_device_writes();
     test_xapu_decode();
     test_xapu_convert();

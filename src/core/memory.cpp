@@ -294,6 +294,7 @@ void mem_physical_free(u64 count, const u64* pfns) {
         }
         bit_clear(g_mem.id_bitmap, id);
         g_mem.used_pages--;
+        tracking_frame_freed(id);
         u32 real = g_mem.id_to_real[id];
         if (real != MEM_INVALID_PFN) {
             g_mem.id_to_real[id] = MEM_INVALID_PFN;
@@ -910,6 +911,8 @@ static LONG CALLBACK on_access_fault(EXCEPTION_POINTERS* ep) {
     if (e->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || e->NumberParameters < 2)
         return EXCEPTION_CONTINUE_SEARCH;
     const u8* addr = (const u8*)e->ExceptionInformation[1];
+    if (tracking_access_fault((u64)addr))
+        return EXCEPTION_CONTINUE_EXECUTION;
     if (e->ExceptionInformation[0] == 1 && tracking_write_fault(ep, (u64)addr))
         return EXCEPTION_CONTINUE_EXECUTION;
     AcquireSRWLockExclusive(&g_mem.range_lock);

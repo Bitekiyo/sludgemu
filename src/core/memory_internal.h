@@ -185,9 +185,13 @@ void tracking_committed(const RangeSlot* s, u64 lo, u64 hi);
 void tracking_mapping_changed(const u8* base, u64 size);
 // `s` is being released: its watches and traps go. Range lock held exclusively.
 void tracking_range_released(RangeSlot* s);
+// Frame ID `id` was freed: it is nobody's to take any more. Phys lock held.
+void tracking_frame_freed(u32 id);
 // A write fault on memory tracking protects (watches end; a trapped store gets single-stepped), and
 // the single step after a trapped store. Whether the exception was handled.
 bool tracking_write_fault(EXCEPTION_POINTERS* ep, u64 addr);
+// A fault at `addr` on a taken page: the taken listener gives it back. True if the access can retry.
+bool tracking_access_fault(u64 addr);
 // Logs what the memory system knows about a write fault nothing claimed (diagnostics before a crash).
 void tracking_describe_write_fault(u64 addr);
 bool tracking_single_step(EXCEPTION_POINTERS* ep);
