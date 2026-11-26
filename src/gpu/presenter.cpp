@@ -1,6 +1,7 @@
 #include "gpu/presenter.h"
 
 #include <dxgi1_6.h>
+#include <stdio.h>
 #include <stdlib.h>
 
 #include "common/log.h"
@@ -82,7 +83,10 @@ static void acquire_buffers(Presenter* p) {
     }
 }
 
+static void capture_init();
+
 static bool setup(Presenter* p, ID3D12CommandQueue* queue) {
+    capture_init();
     ID3D12Device13* device = gpu_device();
     IDXGIFactory6* factory = gpu_factory();
     HWND hwnd = window_main();
@@ -323,6 +327,140 @@ static void plane_barriers(ID3D12GraphicsCommandList7* list, const PresentPlane*
     list->Barrier(1, &g);
 }
 
+// --- frame capture (diagnostics) ---------------------------------------------------------------------
+//
+// SLUDGE_CAPTURE_FRAMES=<first>,<count> writes presented frames <first> .. <first + count - 1> as BMP
+// files (to SLUDGE_CAPTURE_DIR, or next to the log): what reaches the window frame by frame, for
+// flicker and other things window screenshots don't show. Captured frames wait for the GPU.
+
+static struct {
+    u64 first, count;
+    char dir[260];
+    u64 presented;
+    ID3D12Resource* readback;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
+    u64 width, height;
+} g_capture;
+
+static void capture_init() {
+    // The CRT's copy of the environment: the title may change the process's own by now.
+    const char* spec = getenv("SLUDGE_CAPTURE_FRAMES");
+    if (!spec)
+        return;
+    char* comma = nullptr;
+    g_capture.first = strtoull(spec, &comma, 10);
+    g_capture.count = comma && *comma == ',' ? strtoull(comma + 1, nullptr, 10) : 1;
+    const char* dir = getenv("SLUDGE_CAPTURE_DIR");
+    strcpy_s(g_capture.dir, dir && strlen(dir) < sizeof(g_capture.dir) ? dir : ".");
+    LOG_I("present", "capturing frames %llu..%llu to %s", g_capture.first, g_capture.first + g_capture.count - 1,
+          g_capture.dir);
+}
+
+// Whether to capture the frame being presented; makes the readback buffer for its size.
+static bool capture_this_frame(ID3D12Resource* buffer) {
+    u64 index = g_capture.presented++;
+    if (!g_capture.count || index < g_capture.first || index >= g_capture.first + g_capture.count)
+        return false;
+    D3D12_RESOURCE_DESC desc = buffer->GetDesc();
+    if (!g_capture.readback || desc.Width != g_capture.width || desc.Height != g_capture.height) {
+        if (g_capture.readback)
+            gpu_retire(g_capture.readback);
+        g_capture.readback = nullptr;
+        u64 bytes = 0;
+        gpu_device()->GetCopyableFootprints(&desc, 0, 1, 0, &g_capture.footprint, nullptr, nullptr, &bytes);
+        D3D12_HEAP_PROPERTIES heap = {D3D12_HEAP_TYPE_READBACK};
+        D3D12_RESOURCE_DESC rd = {};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = bytes;
+        rd.Height = 1;
+        rd.DepthOrArraySize = 1;
+        rd.MipLevels = 1;
+        rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        HRESULT hr = gpu_device()->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &rd,
+                                                           D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                           IID_PPV_ARGS(&g_capture.readback));
+        if (FAILED(hr)) {
+            LOG_E("present", "cannot create the frame capture buffer (0x%08lx)", (unsigned long)hr);
+            g_capture.count = 0;
+            return false;
+        }
+        g_capture.width = desc.Width;
+        g_capture.height = desc.Height;
+    }
+    return true;
+}
+
+static void capture_barrier(ID3D12GraphicsCommandList7* list, ID3D12Resource* buffer, bool before_copy) {
+    D3D12_TEXTURE_BARRIER b = {};
+    b.SyncBefore = before_copy ? D3D12_BARRIER_SYNC_RENDER_TARGET : D3D12_BARRIER_SYNC_COPY;
+    b.SyncAfter = before_copy ? D3D12_BARRIER_SYNC_COPY : D3D12_BARRIER_SYNC_RENDER_TARGET;
+    b.AccessBefore = before_copy ? D3D12_BARRIER_ACCESS_RENDER_TARGET : D3D12_BARRIER_ACCESS_COPY_SOURCE;
+    b.AccessAfter = before_copy ? D3D12_BARRIER_ACCESS_COPY_SOURCE : D3D12_BARRIER_ACCESS_RENDER_TARGET;
+    b.LayoutBefore = before_copy ? D3D12_BARRIER_LAYOUT_RENDER_TARGET : D3D12_BARRIER_LAYOUT_COPY_SOURCE;
+    b.LayoutAfter = before_copy ? D3D12_BARRIER_LAYOUT_COPY_SOURCE : D3D12_BARRIER_LAYOUT_RENDER_TARGET;
+    b.pResource = buffer;
+    b.Subresources.IndexOrFirstMipLevel = 0xffffffff;
+    D3D12_BARRIER_GROUP g = {D3D12_BARRIER_TYPE_TEXTURE, 1};
+    g.pTextureBarriers = &b;
+    list->Barrier(1, &g);
+}
+
+static void capture_record(ID3D12GraphicsCommandList7* list, ID3D12Resource* buffer) {
+    capture_barrier(list, buffer, true);
+    D3D12_TEXTURE_COPY_LOCATION dst = {g_capture.readback, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+    dst.PlacedFootprint = g_capture.footprint;
+    D3D12_TEXTURE_COPY_LOCATION src = {buffer, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+    list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    capture_barrier(list, buffer, false);
+}
+
+// Writes the captured frame (10-bit channels, cut to 8) once the GPU is done with it.
+static void capture_write(u64 index) {
+    u8* data = nullptr;
+    D3D12_RANGE all = {0, (SIZE_T)(g_capture.footprint.Footprint.RowPitch * g_capture.height)};
+    HRESULT hr = g_capture.readback->Map(0, &all, (void**)&data);
+    if (FAILED(hr)) {
+        LOG_E("present", "cannot map the frame capture buffer (0x%08lx)", (unsigned long)hr);
+        return;
+    }
+    char path[320];
+    snprintf(path, sizeof(path), "%s/frame_%06llu.bmp", g_capture.dir, index);
+    FILE* f = nullptr;
+    if (fopen_s(&f, path, "wb") != 0 || !f)
+        LOG_E("present", "cannot write %s", path);
+    if (f) {
+        u32 w = (u32)g_capture.width, h = (u32)g_capture.height, row = w * 3, pad = (4 - row % 4) % 4;
+        u32 image = (row + pad) * h;
+        u8 header[54] = {'B', 'M'};
+        *(u32*)(header + 2) = 54 + image;
+        *(u32*)(header + 10) = 54;
+        *(u32*)(header + 14) = 40;
+        *(s32*)(header + 18) = (s32)w;
+        *(s32*)(header + 22) = -(s32)h; // top down
+        *(u16*)(header + 26) = 1;
+        *(u16*)(header + 28) = 24;
+        *(u32*)(header + 34) = image;
+        fwrite(header, 1, sizeof(header), f);
+        u8* line = (u8*)malloc(row + pad);
+        for (u32 y = 0; line && y < h; y++) {
+            const u32* px = (const u32*)(data + (u64)y * g_capture.footprint.Footprint.RowPitch);
+            for (u32 x = 0; x < w; x++) {
+                u32 v = px[x];
+                line[x * 3 + 0] = (u8)(((v >> 20) & 0x3ff) >> 2); // B
+                line[x * 3 + 1] = (u8)(((v >> 10) & 0x3ff) >> 2); // G
+                line[x * 3 + 2] = (u8)((v & 0x3ff) >> 2);         // R
+            }
+            memset(line + row, 0, pad);
+            fwrite(line, 1, row + pad, f);
+        }
+        free(line);
+        fclose(f);
+    }
+    D3D12_RANGE none = {0, 0};
+    g_capture.readback->Unmap(0, &none);
+}
+
 u64 presenter_completed() {
     // Created once with the swap chain and kept, so it can be read without the lock.
     ID3D12Fence* fence = g_presenter.fence;
@@ -376,6 +514,10 @@ u64 presenter_present(ID3D12CommandQueue* queue, const PresentPlane* planes, u32
     for (u32 i = 0; i < count && i < PRESENT_MAX_PLANES; i++)
         if (planes[i].texture)
             draw_plane(p, frame, i, planes[i], display);
+    u64 capture_index = g_capture.presented;
+    bool capture = capture_this_frame(buffer);
+    if (capture)
+        capture_record(p->list, buffer);
 
     plane_barriers(p->list, planes, count, false);
     buffer_barrier(p->list, buffer, false);
@@ -393,6 +535,10 @@ u64 presenter_present(ID3D12CommandQueue* queue, const PresentPlane* planes, u32
     queue->Signal(p->fence, ++p->fence_value);
     p->frame_fence[frame] = p->fence_value;
     u64 value = p->fence_value;
+    if (capture) {
+        wait_frame(p, value);
+        capture_write(capture_index);
+    }
     ReleaseSRWLockExclusive(&p->lock);
     return value;
 }
