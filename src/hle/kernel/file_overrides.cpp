@@ -109,30 +109,61 @@ static BOOL WINAPI hk_MoveFileExW(LPCWSTR from, LPCWSTR to, DWORD flags) {
     return MoveFileExW(host_path(from, from_buf), host_path(to, to_buf), flags);
 }
 
+// Whether reads on `file` complete before ReadFile returns: handles opened without
+// FILE_FLAG_OVERLAPPED, also when the caller passes an OVERLAPPED just for the file offset.
+static bool synchronous_handle(HANDLE file) {
+    struct IoStatus {
+        LONG_PTR status;
+        ULONG_PTR information;
+    };
+    typedef LONG(WINAPI * QueryFn)(HANDLE, IoStatus*, void*, ULONG, int);
+    const int FILE_MODE_INFORMATION_CLASS = 16;
+    const ULONG SYNCHRONOUS_IO = 0x00000010 | 0x00000020; // FILE_SYNCHRONOUS_IO_ALERT, _NONALERT
+    static QueryFn query = (QueryFn)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationFile");
+    IoStatus io;
+    ULONG mode = 0;
+    return query && query(file, &io, &mode, sizeof(mode), FILE_MODE_INFORMATION_CLASS) >= 0 &&
+           (mode & SYNCHRONOUS_IO);
+}
+
 // The kernel reads and writes title buffers without faulting them in, so their pages are backed
-// first (see mem_prepare). Title memory may also be write-protected (see mem_watch_writes), which the
-// kernel's writes would fail on rather than fault: reads go through a buffer of ours and are copied
-// in, faulting as usual. Overlapped reads complete later, so their memory is unprotected instead.
+// first (see mem_prepare). Title memory may also be write-protected (write watches, store traps),
+// which the kernel's writes fail on rather than fault: reads that complete right away go through a
+// buffer of ours and are copied in, faulting as usual. Asynchronous reads complete later, so their
+// memory is unprotected instead.
 static BOOL WINAPI hk_ReadFile(HANDLE file, LPVOID buffer, DWORD size, LPDWORD read,
                                LPOVERLAPPED overlapped) {
-    if (!overlapped && size && mem_is_tracked(buffer)) {
+    BOOL ok = FALSE;
+    bool done = false;
+    if (size && mem_is_tracked(buffer) && (!overlapped || synchronous_handle(file))) {
         // Page aligned, as unbuffered reads need sector-aligned buffers.
         void* bounce = VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
         if (bounce) {
             DWORD got = 0;
-            BOOL ok = ReadFile(file, bounce, size, &got, nullptr);
+            ok = ReadFile(file, bounce, size, &got, overlapped); // the offset, if any, comes along
             DWORD error = GetLastError();
             memcpy(buffer, bounce, got);
             VirtualFree(bounce, 0, MEM_RELEASE);
             if (read)
                 *read = got;
             SetLastError(error);
-            return ok;
+            done = true;
         }
     }
-    mem_end_write_watches(buffer, size);
-    mem_prepare(buffer, size);
-    return ReadFile(file, buffer, size, read, overlapped);
+    if (!done) {
+        mem_end_write_watches(buffer, size);
+        mem_prepare(buffer, size);
+        ok = ReadFile(file, buffer, size, read, overlapped);
+    }
+    DWORD error = GetLastError();
+    if (!ok && error != ERROR_IO_PENDING && error != ERROR_HANDLE_EOF) {
+        static volatile long logged = 0;
+        if (InterlockedIncrement(&logged) <= 16)
+            LOG_W("file", "ReadFile(%p, %u bytes into %p%s) failed (%lu)", file, size, buffer,
+                  overlapped ? ", overlapped" : "", error);
+        SetLastError(error);
+    }
+    return ok;
 }
 
 static BOOL WINAPI hk_WriteFile(HANDLE file, LPCVOID buffer, DWORD size, LPDWORD written,
