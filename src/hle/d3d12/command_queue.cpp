@@ -31,8 +31,10 @@ static void queue_destroy(void* object) {
         gpu_retire(queue->writers[i].list);
         gpu_retire(queue->writers[i].allocator);
     }
-    gpu_retire(queue->uploader.list);
-    gpu_retire(queue->uploader.allocator);
+    for (u32 i = 0; i < QUEUE_UPLOADERS; i++) {
+        gpu_retire(queue->uploaders[i].list);
+        gpu_retire(queue->uploaders[i].allocator);
+    }
 }
 
 // Texture contents waiting for upload from title memory go first, from a list of the queue's own.
@@ -40,7 +42,7 @@ static void upload_textures(ConsoleCommandQueue* self) {
     if (self->type == D3D12_COMMAND_LIST_TYPE_COPY || !texture_sync_pending())
         return;
     AcquireSRWLockExclusive(&self->writer_lock); // titles may submit to a queue from several threads
-    QueueSignalWriter& w = self->uploader;
+    QueueSignalWriter& w = self->uploaders[self->next_uploader];
     HRESULT hr;
     if (!w.list) {
         ID3D12Device13* device = gpu_device();
@@ -65,6 +67,7 @@ static void upload_textures(ConsoleCommandQueue* self) {
         ID3D12CommandList* list = w.list;
         self->desktop->ExecuteCommandLists(1, &list);
         w.submission = gpu_queue_submitted(self->slot);
+        self->next_uploader = (self->next_uploader + 1) % QUEUE_UPLOADERS; // this one is in flight
     }
     ReleaseSRWLockExclusive(&self->writer_lock);
     for (u32 i = 0; i < sources.count; i++)

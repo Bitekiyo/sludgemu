@@ -34,8 +34,11 @@ struct ConsoleDevice {
     ID3D12Device13* desktop;
 };
 
-// Small desktop lists that write fence values to memory when the queue signals a fence.
+// Small desktop lists that write fence values to memory when the queue signals a fence, and that
+// upload texture contents before a submission: several, so recording one doesn't wait for the GPU
+// to finish the last.
 #define QUEUE_SIGNAL_WRITERS 4
+#define QUEUE_UPLOADERS      4
 
 struct QueueSignalWriter {
     ID3D12CommandAllocator* allocator;
@@ -52,7 +55,9 @@ struct ConsoleCommandQueue {
     SRWLOCK writer_lock;
     u32 next_writer;
     QueueSignalWriter writers[QUEUE_SIGNAL_WRITERS];
-    QueueSignalWriter uploader; // texture uploads (texture_sync.h); writer_lock guards it too
+    u32 next_uploader;
+    QueueSignalWriter
+        uploaders[QUEUE_UPLOADERS]; // texture uploads (texture_sync.h); writer_lock guards them too
 };
 
 // Console fences also have a GPU address holding their value, which command lists write to signal
