@@ -46,7 +46,8 @@ struct Watch {
     u64 base, size; // what is reported; size 0: a free slot
     Span* spans;    // sorted, disjoint
     u32 span_count;
-    bool trap; // a store trap: stays, and reports every store
+    bool trap;  // a store trap: stays, and reports every store
+    u32 client; // who armed it
     u32 next_free;
 };
 
@@ -227,13 +228,21 @@ static bool protects(const RangeSlot* s, u32 level) {
     return level == LEVEL_NONE ? takeable(s) : protectable(s) || (takeable(s) && level == LEVEL_WRITE);
 }
 
+// Read-only protection for range `s` (executable memory stays executable).
+static u32 read_only(const RangeSlot* s) {
+    return (mapping_protect(s) & 0xFF) == PAGE_EXECUTE_READWRITE ? PAGE_EXECUTE_READ : PAGE_READONLY;
+}
+
 // Changes the protection of [start, end) in range `s` to `level`. Views are separate allocations to
 // VirtualProtect, so placeholder ranges go view by view; other ranges may have pages not committed yet
-// (lazy commits), so they go by what is committed. Range lock held.
+// (lazy commits), so they go by what is committed. Ranges the CPU can't write keep their own protection
+// at LEVEL_READ (a page given back there). Range lock held.
 static void protect_va(const RangeSlot* s, u64 start, u64 end, u32 level) {
     const u32 modifiers = PAGE_WRITECOMBINE | PAGE_NOCACHE;
     u32 writable = mapping_protect(s) & 0xFF;
-    u32 to = level == LEVEL_NONE ? PAGE_NOACCESS : level == LEVEL_READ ? PAGE_READONLY : writable;
+    u32 to = level == LEVEL_NONE                       ? PAGE_NOACCESS
+             : level == LEVEL_READ && protectable(s) ? read_only(s)
+                                                     : writable;
     DWORD old;
     if (s->info.flags & MEM_RANGE_PLACEHOLDER) {
         for (u64 va = start; va < end;) {
@@ -256,7 +265,7 @@ static void protect_va(const RangeSlot* s, u64 start, u64 end, u32 level) {
         stop = stop < end ? stop : end;
         // Only protections tracking gives: what the title set itself stays.
         u32 now = mbi.Protect & ~modifiers;
-        bool ours = now == writable || now == PAGE_READONLY || now == PAGE_NOACCESS;
+        bool ours = now == writable || now == read_only(s) || now == PAGE_NOACCESS;
         if (mbi.State == MEM_COMMIT && ours && now != to && !VirtualProtect((void*)va, stop - va, to, &old))
             LOG_W_ONCE("memory", "cannot change the protection of %p (+0x%llx) for write tracking (%lu)",
                        (void*)va, stop - va, GetLastError());
@@ -296,11 +305,12 @@ static const RangeSlot* range_of(u64 va) {
 }
 
 // The addresses showing canonical pages [key, key + size), as runs, where ranges protect pages at
-// `level`. Range lock held, tracking lock held exclusively.
-static void add_addresses(u64 key, u64 size, u32 level) {
+// `level`; giving pages back (`give`), every range that took them. Range lock held, tracking lock held
+// exclusively.
+static void add_addresses(u64 key, u64 size, u32 level, bool give) {
     if (!(key & CANON_FRAME)) {
         const RangeSlot* s = range_of(key);
-        if (s && protects(s, level))
+        if (s && (give ? takeable(s) : protects(s, level)))
             add_run(key, key + size, s);
         return;
     }
@@ -310,12 +320,12 @@ static void add_addresses(u64 key, u64 size, u32 level) {
     if (!va)
         return; // not mapped anywhere
     const RangeSlot* s = range_of(va);
-    if (s && protects(s, level))
+    if (s && (give ? takeable(s) : protects(s, level)))
         add_run(va + offset, va + offset + size, s);
     for (u32 a = alias_lower_bound((u32)frame); a < g_mem.alias_count && g_mem.aliases[a].id == frame; a++) {
         va = g_mem.aliases[a].va;
         s = range_of(va);
-        if (s && protects(s, level))
+        if (s && (give ? takeable(s) : protects(s, level)))
             add_run(va + offset, va + offset + size, s);
     }
 }
@@ -365,12 +375,12 @@ static void count_span(const Span& sp, int delta) {
             continue;
         }
         if (run_end)
-            add_addresses(run_start, run_end - run_start, level);
+            add_addresses(run_start, run_end - run_start, level, false);
         run_start = key;
         run_end = key + HOST_PAGE;
     }
     if (run_end)
-        add_addresses(run_start, run_end - run_start, level);
+        add_addresses(run_start, run_end - run_start, level, false);
 }
 
 // Takes a span's pages from the CPU or gives them back; pages whose level changes to `level` are
@@ -395,12 +405,12 @@ static void take_span(const Span& sp, bool take, u32 level) {
             continue;
         }
         if (run_end)
-            add_addresses(run_start, run_end - run_start, level);
+            add_addresses(run_start, run_end - run_start, level, !take);
         run_start = key;
         run_end = key + HOST_PAGE;
     }
     if (run_end)
-        add_addresses(run_start, run_end - run_start, level);
+        add_addresses(run_start, run_end - run_start, level, !take);
 }
 
 // --- the watch index ---------------------------------------------------------------------------------
@@ -511,13 +521,14 @@ static u32 by_base_lower_bound(u64 base) {
     return lo;
 }
 
-// The live watch reporting exactly [base, base + size) (a trap, or not), or NO_NODE. Tracking lock held.
-static u32 find_watch(u64 base, u64 size, bool trap) {
+// The client's live watch reporting exactly [base, base + size) (a trap, or not), or NO_NODE. Tracking
+// lock held.
+static u32 find_watch(u64 base, u64 size, bool trap, u32 client) {
     for (u32 i = by_base_lower_bound(base); i < g_track.by_base_count; i++) {
         const Watch& w = g_track.watches[g_track.by_base[i]];
         if (w.base != base)
             break;
-        if (w.size == size && w.trap == trap)
+        if (w.size == size && w.trap == trap && w.client == client)
             return g_track.by_base[i];
     }
     return NO_NODE;
@@ -525,7 +536,7 @@ static u32 find_watch(u64 base, u64 size, bool trap) {
 
 // Makes a watch over `spans` (taken over) and protects what it covers. Range lock held, tracking lock
 // held exclusively.
-static void add_watch(u64 base, u64 size, Span* spans, u32 span_count, bool trap) {
+static void add_watch(u64 base, u64 size, Span* spans, u32 span_count, bool trap, u32 client) {
     u32 id = g_track.free_watch;
     if (id != NO_NODE) {
         g_track.free_watch = g_track.watches[id].next_free;
@@ -543,7 +554,9 @@ static void add_watch(u64 base, u64 size, Span* spans, u32 span_count, bool trap
         }
         id = g_track.watch_slots++;
     }
-    g_track.watches[id] = {base, size, spans, span_count, trap, NO_NODE};
+    // Counted live before anything is protected: a fault on its pages is tracking's from then on.
+    InterlockedIncrement(&g_track.live);
+    g_track.watches[id] = {base, size, spans, span_count, trap, client, NO_NODE};
     u32 at = by_base_lower_bound(base);
     memmove(&g_track.by_base[at + 1], &g_track.by_base[at], (g_track.by_base_count - at) * sizeof(u32));
     g_track.by_base[at] = id;
@@ -553,7 +566,6 @@ static void add_watch(u64 base, u64 size, Span* spans, u32 span_count, bool trap
     for (u32 i = 0; i < span_count; i++)
         count_span(spans[i], +1);
     apply_runs(LEVEL_READ);
-    InterlockedIncrement(&g_track.live);
 }
 
 // Ends watch `id`, releasing what only it protected, and adds it to `reports` unless it is null.
@@ -603,8 +615,28 @@ static void end_watches_at(u64 key, Report* reports, u32* report_count) {
     }
 }
 
-// Ends the watches (traps too, with `traps`) reporting into [start, end), unreported. Range lock held,
-// tracking lock held exclusively.
+// Watches ended without a write, reported as dropped once no lock is held (tracking lock held to add).
+static struct {
+    Report* items;
+    u32 count, capacity;
+} g_dropped;
+
+static void note_dropped(const Watch& w) {
+    if (w.trap)
+        return; // traps' owners follow mappings themselves
+    if (g_dropped.count == g_dropped.capacity) {
+        u32 capacity = g_dropped.capacity ? g_dropped.capacity * 2 : 64;
+        Report* grown = (Report*)realloc(g_dropped.items, capacity * sizeof(Report));
+        if (!grown)
+            FATAL("out of memory for write tracking");
+        g_dropped.items = grown;
+        g_dropped.capacity = capacity;
+    }
+    g_dropped.items[g_dropped.count++] = {w.base, w.size};
+}
+
+// Ends the watches (traps too, with `traps`) reporting into [start, end), noted as dropped. Range lock
+// held, tracking lock held exclusively.
 static void end_watches_reporting_in(u64 start, u64 end, bool traps) {
     u64 from = start > g_track.max_size ? start - g_track.max_size : 0;
     for (u32 i = by_base_lower_bound(from); i < g_track.by_base_count;) {
@@ -613,6 +645,7 @@ static void end_watches_reporting_in(u64 start, u64 end, bool traps) {
         if (w.base >= end)
             break;
         if (w.base + w.size > start && (traps || !w.trap)) {
+            note_dropped(w);
             end_watch(id, nullptr, nullptr);
             continue; // the next one moved here
         }
@@ -620,12 +653,26 @@ static void end_watches_reporting_in(u64 start, u64 end, bool traps) {
     }
 }
 
+// Reports the dropped watches noted so far. No locks held.
+static void report_dropped() {
+    if (!g_dropped.count)
+        return;
+    AcquireSRWLockExclusive(&g_track.lock);
+    Report* items = g_dropped.items;
+    u32 count = g_dropped.count;
+    g_dropped = {};
+    ReleaseSRWLockExclusive(&g_track.lock);
+    for (u32 i = 0; i < count; i++)
+        notify_write(items[i].base, items[i].size, MEM_WATCH_DROPPED);
+    free(items);
+}
+
 static void report_writes(const Report* reports, u32 count) {
     for (u32 i = 0; i < count; i++)
         notify_write(reports[i].base, reports[i].size, MEM_WATCH_ENDED);
 }
 
-static void watch_or_trap(const void* base, u64 size, bool trap) {
+static void watch_or_trap(const void* base, u64 size, bool trap, u32 client) {
     u64 start = (u64)base, end = start + size;
     if (!size)
         return;
@@ -642,40 +689,40 @@ static void watch_or_trap(const void* base, u64 size, bool trap) {
     u32 count = 0, capacity = 0;
     canonical_spans(s, start, end, &spans, &count, &capacity);
     AcquireSRWLockExclusive(&g_track.lock);
-    if (find_watch(start, size, trap) == NO_NODE && count)
-        add_watch(start, size, spans, count, trap);
+    if (find_watch(start, size, trap, client) == NO_NODE && count)
+        add_watch(start, size, spans, count, trap, client);
     else
         free(spans);
     ReleaseSRWLockExclusive(&g_track.lock);
     ReleaseSRWLockShared(&g_mem.range_lock);
 }
 
-void mem_watch_writes(const void* base, u64 size) {
-    watch_or_trap(base, size, false);
+void mem_watch_writes(const void* base, u64 size, u32 client) {
+    watch_or_trap(base, size, false, client);
 }
 
 void mem_trap_stores(const void* base, u64 size) {
-    watch_or_trap(base, size, true);
+    watch_or_trap(base, size, true, 0);
 }
 
-static void end_armed(const void* base, u64 size, bool trap) {
+static void end_armed(const void* base, u64 size, bool trap, u32 client) {
     if (!g_track.live)
         return;
     AcquireSRWLockShared(&g_mem.range_lock);
     AcquireSRWLockExclusive(&g_track.lock);
-    u32 id = find_watch((u64)base, size, trap);
+    u32 id = find_watch((u64)base, size, trap, client);
     if (id != NO_NODE)
         end_watch(id, nullptr, nullptr);
     ReleaseSRWLockExclusive(&g_track.lock);
     ReleaseSRWLockShared(&g_mem.range_lock);
 }
 
-void mem_unwatch_writes(const void* base, u64 size) {
-    end_armed(base, size, false);
+void mem_unwatch_writes(const void* base, u64 size, u32 client) {
+    end_armed(base, size, false, client);
 }
 
 void mem_untrap_stores(const void* base, u64 size) {
-    end_armed(base, size, true);
+    end_armed(base, size, true, 0);
 }
 
 static void take_or_give(const void* base, u64 size, bool take) {
@@ -718,12 +765,17 @@ void mem_give_pages(const void* base, u64 size) {
     take_or_give(base, size, false);
 }
 
+static bool page_taken(u64 key);
+
 void mem_end_write_watches(const void* base, u64 size) {
-    if (!g_track.live || !size)
+    if (!tracking_active() || !size)
         return;
     Report reports[MAX_REPORTS];
     u32 report_count = 0;
     u64 start = (u64)base & ~(u64)(HOST_PAGE - 1), end = (u64)base + size;
+    // Taken pages there (by title address, a host page each) are given back before the kernel writes.
+    u64* taken = nullptr;
+    u32 taken_count = 0;
     AcquireSRWLockShared(&g_mem.range_lock);
     const RangeSlot* s = find_range_locked(base);
     if (s) {
@@ -735,20 +787,33 @@ void mem_end_write_watches(const void* base, u64 size) {
         for (u32 i = 0; i < count; i++)
             for (u64 key = spans[i].start; key < spans[i].end; key += HOST_PAGE)
                 end_watches_at(key, reports, &report_count);
+        if (g_track.taken) {
+            for (u64 va = start; va < end; va += HOST_PAGE) {
+                u64 key = canonical(s, va, true);
+                if (!key || !page_taken(key))
+                    continue;
+                if (!taken && !(taken = (u64*)malloc(((end - start) / HOST_PAGE + 1) * sizeof(u64))))
+                    FATAL("out of memory for write tracking");
+                taken[taken_count++] = va;
+            }
+        }
         ReleaseSRWLockExclusive(&g_track.lock);
         free(spans);
     }
     ReleaseSRWLockShared(&g_mem.range_lock);
     report_writes(reports, report_count);
+    for (u32 i = 0; i < taken_count && g_track.taken_listener; i++)
+        g_track.taken_listener((const void*)taken[i]);
+    free(taken);
 }
 
 // --- hooks from the rest of the memory system --------------------------------------------------------
 
 // Gives [start, end) of a view just mapped `level` (read-only or no access). (The range's region list
 // catches up after the mapping, so protect_va can't go by it yet.)
-static void protect_new_view(u64 start, u64 end, u32 level) {
+static void protect_new_view(const RangeSlot* s, u64 start, u64 end, u32 level) {
     DWORD old;
-    if (!VirtualProtect((void*)start, end - start, level == LEVEL_NONE ? PAGE_NOACCESS : PAGE_READONLY, &old))
+    if (!VirtualProtect((void*)start, end - start, level == LEVEL_NONE ? PAGE_NOACCESS : read_only(s), &old))
         LOG_W_ONCE("memory", "cannot change the protection of %p (+0x%llx) for access tracking (%lu)",
                    (void*)start, end - start, GetLastError());
 }
@@ -779,14 +844,14 @@ void tracking_view_mapped(const RangeSlot* s, u32 first_page, u32 count, u32 rea
                 continue;
             }
             if (run_end)
-                protect_new_view(run_start, run_end, run_level);
+                protect_new_view(s, run_start, run_end, run_level);
             run_start = at;
             run_end = at + HOST_PAGE;
             run_level = level;
         }
     }
     if (run_end)
-        protect_new_view(run_start, run_end, run_level);
+        protect_new_view(s, run_start, run_end, run_level);
     ReleaseSRWLockShared(&g_track.lock);
     free(ids);
 }
@@ -817,13 +882,14 @@ void tracking_committed(const RangeSlot* s, u64 lo, u64 hi) {
 }
 
 void tracking_mapping_changed(const u8* base, u64 size) {
-    if (!g_track.live)
-        return;
-    AcquireSRWLockShared(&g_mem.range_lock);
-    AcquireSRWLockExclusive(&g_track.lock);
-    end_watches_reporting_in((u64)base, (u64)base + size, false);
-    ReleaseSRWLockExclusive(&g_track.lock);
-    ReleaseSRWLockShared(&g_mem.range_lock);
+    if (g_track.live) {
+        AcquireSRWLockShared(&g_mem.range_lock);
+        AcquireSRWLockExclusive(&g_track.lock);
+        end_watches_reporting_in((u64)base, (u64)base + size, false);
+        ReleaseSRWLockExclusive(&g_track.lock);
+        ReleaseSRWLockShared(&g_mem.range_lock);
+    }
+    report_dropped(); // these, and those of a range just released
 }
 
 void tracking_range_released(RangeSlot* s) {
@@ -909,7 +975,17 @@ bool tracking_access_fault(u64 addr) {
     return true;
 }
 
-static void finish_trapped_pages(const u64* pages, const u64* keys, Report* reports, u32* report_count);
+static void finish_trapped_pages(const u64* pages, const u64* keys, const u64* now, Report* reports,
+                                 u32* report_count);
+
+// What trapped pages a store stepped over show now (their canonical addresses). Range lock held, tracking
+// lock not held (the phys lock comes before it).
+static void step_pages_now(const u64* pages, u64* now) {
+    for (u32 k = 0; k < 2; k++) {
+        const RangeSlot* s = pages[k] ? find_range_locked((const void*)pages[k]) : nullptr;
+        now[k] = s ? canonical(s, pages[k], true) : 0;
+    }
+}
 
 bool tracking_write_fault(EXCEPTION_POINTERS* ep, u64 addr) {
     if (!tracking_active())
@@ -918,20 +994,28 @@ bool tracking_write_fault(EXCEPTION_POINTERS* ep, u64 addr) {
     Report reports[MAX_REPORTS];
     u32 report_count = 0;
     bool handled = false, trapped = false;
+    Report stores[MAX_REPORTS];
+    u32 store_count = 0;
     AcquireSRWLockShared(&g_mem.range_lock);
     const RangeSlot* s = find_range_locked((const void*)addr);
     u64 key = s ? canonical(s, page, true) : 0;
-    if (key) {
+    u64 stepped[2] = {g_step_page[0].get(), g_step_page[1].get()}, stepped_now[2];
+    step_pages_now(stepped, stepped_now);
+    // Protection changes with the range lock held exclusively, or shared together with the tracking lock
+    // held exclusively: under both, the page's protection is settled while the decision is made.
+    if (key)
         AcquireSRWLockExclusive(&g_track.lock);
-        if (page_protected(key)) {
-            end_watches_at(key, reports, &report_count);
-            handled = true;
-            trapped = page_protected(key); // only traps left
-        }
-        ReleaseSRWLockExclusive(&g_track.lock);
+    if (key && page_protected(key)) {
+        end_watches_at(key, reports, &report_count);
+        handled = true;
+        // Only traps left: the store runs alone with the page writable. A taken page is given back first:
+        // the retried store asks for it.
+        trapped = page_protected(key) && !page_taken(key);
+    } else if (key) {
+        // Another thread changed the page since it faulted (released it, gave it back, or protected it
+        // again): a store the page allows now, or one a taken page needs given back first, is retried.
+        handled = page_taken(key) || access_allowed((const void*)addr, 1);
     }
-    Report stores[MAX_REPORTS];
-    u32 store_count = 0;
     if (trapped) {
         // The store runs alone with the page writable (single-stepped); tracking_single_step
         // protects it again and reports.
@@ -947,9 +1031,7 @@ bool tracking_write_fault(EXCEPTION_POINTERS* ep, u64 addr) {
                     g_step_page[k].set(0);
                     g_step_key[k].set(0);
                 }
-                AcquireSRWLockShared(&g_track.lock);
-                finish_trapped_pages(done, done_keys, stores, &store_count);
-                ReleaseSRWLockShared(&g_track.lock);
+                finish_trapped_pages(done, done_keys, stepped_now, stores, &store_count);
                 first = 0;
             } else {
                 LOG_E("memory", "a store at %p reaches a third trapped page", (void*)ep->ContextRecord->Rip);
@@ -959,6 +1041,7 @@ bool tracking_write_fault(EXCEPTION_POINTERS* ep, u64 addr) {
         if (handled) {
             DWORD old;
             if (!VirtualProtect((void*)page, HOST_PAGE, mapping_protect(s) & 0xFF, &old)) {
+                LOG_E("memory", "cannot let a trapped store to %p through (%lu)", (void*)page, GetLastError());
                 handled = false;
             } else if (!known) {
                 u32 k = first ? 1 : 0;
@@ -969,15 +1052,25 @@ bool tracking_write_fault(EXCEPTION_POINTERS* ep, u64 addr) {
             }
             ep->ContextRecord->EFlags |= TRAP_FLAG;
         }
-    } else if (!handled && s) {
-        // Another thread may have just released the page; a write it allows now is retried.
-        handled = access_allowed((const void*)addr, 1) && key;
     }
+    if (key)
+        ReleaseSRWLockExclusive(&g_track.lock);
     ReleaseSRWLockShared(&g_mem.range_lock);
     report_writes(reports, report_count);
     for (u32 i = 0; i < store_count && g_track.store_listener; i++)
         g_track.store_listener(stores[i].base, stores[i].size);
     return handled;
+}
+
+bool tracking_protects_access(const RangeSlot* s, u64 addr, bool write) {
+    u64 key = canonical(s, addr & ~(u64)(HOST_PAGE - 1), true);
+    if (!key)
+        return false;
+    AcquireSRWLockShared(&g_track.lock);
+    const u16* c = page_count(key, false);
+    bool claims = c && ((*c & TAKEN) || (write && (*c & COUNT_MASK)));
+    ReleaseSRWLockShared(&g_track.lock);
+    return claims;
 }
 
 void tracking_describe_write_fault(u64 addr) {
@@ -1015,14 +1108,16 @@ void tracking_describe_write_fault(u64 addr) {
     ReleaseSRWLockShared(&g_mem.range_lock);
 }
 
-// Protects trapped pages a store has finished with again (those still trapped), noting the traps over
-// them for the store listener. Range lock and tracking lock held shared.
-static void finish_trapped_pages(const u64* pages, const u64* keys, Report* reports, u32* report_count) {
+// Protects trapped pages a store has finished with again (those still trapped and still showing the
+// memory trapped: the title may have mapped other memory there meanwhile), noting the traps over them
+// for the store listener. Range lock and tracking lock held.
+static void finish_trapped_pages(const u64* pages, const u64* keys, const u64* now, Report* reports,
+                                 u32* report_count) {
     for (u32 k = 0; k < 2 && pages[k]; k++) {
         const RangeSlot* s = find_range_locked((const void*)pages[k]);
-        if (!s || !page_protected(keys[k]))
+        if (!s || now[k] != keys[k] || !page_protected(keys[k]))
             continue;
-        protect_va(s, pages[k], pages[k] + HOST_PAGE, true);
+        protect_va(s, pages[k], pages[k] + HOST_PAGE, level_of(*page_count(keys[k], false)));
         u64 granule = keys[k] >> GRANULE_SHIFT;
         for (u32 n = g_track.buckets[granule_hash(granule)]; n != NO_NODE; n = g_track.nodes[n].next) {
             const GranuleNode& node = g_track.nodes[n];
@@ -1053,8 +1148,10 @@ bool tracking_single_step(EXCEPTION_POINTERS* ep) {
     Report reports[MAX_REPORTS];
     u32 report_count = 0;
     AcquireSRWLockShared(&g_mem.range_lock);
+    u64 now[2];
+    step_pages_now(pages, now);
     AcquireSRWLockShared(&g_track.lock);
-    finish_trapped_pages(pages, keys, reports, &report_count);
+    finish_trapped_pages(pages, keys, now, reports, &report_count);
     ReleaseSRWLockShared(&g_track.lock);
     ReleaseSRWLockShared(&g_mem.range_lock);
     for (u32 i = 0; i < report_count && g_track.store_listener; i++)

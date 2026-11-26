@@ -4,11 +4,14 @@
 #include <stdlib.h>
 
 #include "common/log.h"
+#include "common/thread_slot.h"
 #include "core/memory_internal.h"
 
 MemoryState g_mem;
 
 static LONG CALLBACK on_access_fault(EXCEPTION_POINTERS* ep);
+static ThreadSlot g_retry_address;
+static ThreadSlot g_retry_count;
 
 static inline bool bit_get(const u64* bm, u64 i) {
     return (bm[i >> 6] >> (i & 63)) & 1;
@@ -80,6 +83,8 @@ bool mem_init(u64 physical_bytes) {
     g_mem.gpu_highest = (1ull << 40) - 1;
 
     tracking_init();
+    g_retry_address.init();
+    g_retry_count.init();
 
     // First in line: faults on pending pages are ours, not crashes.
     if (!AddVectoredExceptionHandler(1, on_access_fault)) {
@@ -157,8 +162,25 @@ static u8* real_ptr(u32 real) {
     return g_mem.linear + ((u64)real << MEM_PAGE_SHIFT);
 }
 
+bool mem_commit_available(u64 bytes) {
+    MEMORYSTATUSEX m = {sizeof(m)};
+    return !GlobalMemoryStatusEx(&m) || m.ullAvailPageFile >= bytes + MEM_COMMIT_RESERVE;
+}
+
+// Stops the title rather than take the system's last commit for title memory.
+static void require_commit(u64 bytes) {
+    if (mem_commit_available(bytes))
+        return;
+    MEMORYSTATUSEX m = {sizeof(m)};
+    GlobalMemoryStatusEx(&m);
+    FATAL("the system is nearly out of commit (%llu MiB of %llu MiB left); stopping instead of committing %llu "
+          "MiB more of title memory",
+          m.ullAvailPageFile >> 20, m.ullTotalPageFile >> 20, bytes >> 20);
+}
+
 // Creates the section for a chunk and maps it into its slot of the linear view. phys_lock held.
 static void create_chunk(u32 index) {
+    require_commit(MEM_CHUNK_SIZE);
     HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_COMMIT,
                                         (DWORD)(MEM_CHUNK_SIZE >> 32), (DWORD)MEM_CHUNK_SIZE, nullptr);
     if (!section)
@@ -298,7 +320,8 @@ bool mem_physical_alloc(u64 count, u64* pfns) {
     return true;
 }
 
-void mem_physical_free(u64 count, const u64* pfns) {
+// Frees frames without telling the listener (the caller does, with no locks held).
+static void physical_free(u64 count, const u64* pfns) {
     AcquireSRWLockExclusive(&g_mem.phys_lock);
     for (u64 k = 0; k < count; k++) {
         u32 id = frame_of_locked(pfns[k]);
@@ -306,6 +329,9 @@ void mem_physical_free(u64 count, const u64* pfns) {
             LOG_W("memory", "freeing invalid/unallocated page frame 0x%llx", pfns[k]);
             continue;
         }
+        if (g_mem.frame_va[id])
+            LOG_W_ONCE("memory", "frame 0x%x freed while still mapped at 0x%llx; that address goes on showing "
+                       "memory given to others", id, g_mem.frame_va[id]);
         bit_clear(g_mem.id_bitmap, id);
         g_mem.used_pages--;
         tracking_frame_freed(id);
@@ -319,6 +345,10 @@ void mem_physical_free(u64 count, const u64* pfns) {
         }
     }
     ReleaseSRWLockExclusive(&g_mem.phys_lock);
+}
+
+void mem_physical_free(u64 count, const u64* pfns) {
+    physical_free(count, pfns);
     if (g_frames_freed_listener)
         g_frames_freed_listener(count, pfns);
 }
@@ -593,8 +623,12 @@ bool mem_is_tracked(const void* addr) {
 
 void mem_set_range_protect(const void* addr, u32 protect) {
     AcquireSRWLockExclusive(&g_mem.range_lock);
-    if (RangeSlot* s = find_range_locked(addr))
+    if (RangeSlot* s = find_range_locked(addr)) {
         s->info.protect = protect;
+        // A range reserved without access and given some later is the CPU's too from now on.
+        if ((protect & 0xFF) != PAGE_NOACCESS && (protect & 0xFF) != 0)
+            s->info.flags |= MEM_RANGE_CPU_ACCESS;
+    }
     ReleaseSRWLockExclusive(&g_mem.range_lock);
 }
 
@@ -877,6 +911,20 @@ static bool commit_lazy_locked(const RangeSlot* s, const u8* addr, u64 size) {
     u8* hi = (u8*)ALIGN_UP((uptr)(addr + size), LAZY_COMMIT_GRANULE);
     lo = lo > s->info.base ? lo : s->info.base;
     hi = hi < range_end ? hi : (u8*)range_end;
+    u64 reserved = 0; // what committing charges: the pages not committed yet
+    for (const u8* p = lo; p < hi;) {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (!VirtualQuery(p, &mbi, sizeof(mbi)))
+            break;
+        const u8* stop = (const u8*)mbi.BaseAddress + mbi.RegionSize;
+        stop = stop < hi ? stop : hi;
+        if (mbi.State == MEM_RESERVE)
+            reserved += (u64)(stop - p);
+        p = stop;
+    }
+    if (!reserved)
+        return true;
+    require_commit(reserved);
     if (VirtualAlloc(lo, (u64)(hi - lo), MEM_COMMIT, mapping_protect(s))) {
         tracking_committed(s, (u64)lo, (u64)hi); // committing pages already there resets their protection
         return true;
@@ -916,38 +964,73 @@ bool access_allowed(const void* addr, ULONG_PTR access) {
     return access == 1 ? (p & writable) != 0 : access == 8 ? (p & executable) != 0 : (p & readable) != 0;
 }
 
+// Retries in a row of one address that tracking protects against but doesn't claim, per thread: an
+// access retried again and again is one nobody claims (a fault that would otherwise loop forever).
+#define MAX_RETRIES 64
+
+static bool retry_allowed(u64 addr) {
+    if (g_retry_address.get() != addr) {
+        g_retry_address.set(addr);
+        g_retry_count.set(0);
+    }
+    u64 n = g_retry_count.get() + 1;
+    g_retry_count.set(n);
+    if (n <= MAX_RETRIES)
+        return true;
+    LOG_E("memory", "an access to %p keeps faulting and nothing claims it", (void*)addr);
+    return false;
+}
+
 // CPU access to title memory we haven't backed yet: back it and retry the access. Remapping a
 // placeholder range can also leave a page briefly unmapped (a view is split by unmapping it and
 // mapping its pieces again) while other threads use it; holding the range lock waits that out, and
 // the access is retried if the page is there now.
-static LONG CALLBACK on_access_fault(EXCEPTION_POINTERS* ep) {
+static LONG access_fault(EXCEPTION_POINTERS* ep) {
     const EXCEPTION_RECORD* e = ep->ExceptionRecord;
     if (e->ExceptionCode == EXCEPTION_SINGLE_STEP)
         return tracking_single_step(ep) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
     if (e->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || e->NumberParameters < 2)
         return EXCEPTION_CONTINUE_SEARCH;
     const u8* addr = (const u8*)e->ExceptionInformation[1];
-    if (tracking_access_fault((u64)addr))
+    if (tracking_access_fault((u64)addr) ||
+        (e->ExceptionInformation[0] == 1 && tracking_write_fault(ep, (u64)addr))) {
+        g_retry_address.set(0); // claimed: retries start over
         return EXCEPTION_CONTINUE_EXECUTION;
-    if (e->ExceptionInformation[0] == 1 && tracking_write_fault(ep, (u64)addr))
-        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    ULONG_PTR access = e->ExceptionInformation[0];
     AcquireSRWLockExclusive(&g_mem.range_lock);
     RangeSlot* s = find_range_locked(addr);
     bool backed = false;
     if (s && (s->info.flags & MEM_RANGE_PLACEHOLDER)) {
-        backed = back_range_locked(s, addr, 1) || access_allowed(addr, e->ExceptionInformation[0]);
+        backed = back_range_locked(s, addr, 1);
     } else if (s && (s->info.flags & MEM_RANGE_LAZY)) {
-        // Only reserved pages are ours to commit. Another thread may have committed the page since
-        // this one faulted; a fault on memory that allows the access now is simply retried.
+        // Only reserved pages are ours to commit.
         MEMORY_BASIC_INFORMATION mbi;
-        backed = (VirtualQuery(addr, &mbi, sizeof(mbi)) && mbi.State == MEM_RESERVE &&
-                  commit_lazy_locked(s, addr, 1)) ||
-                 access_allowed(addr, e->ExceptionInformation[0]);
+        backed = VirtualQuery(addr, &mbi, sizeof(mbi)) && mbi.State == MEM_RESERVE && commit_lazy_locked(s, addr, 1);
     }
+    // Other threads may have changed the page since this one faulted (backed or committed it, protected
+    // it for tracking, released it). With the range lock held exclusively its protection is settled: an
+    // access it allows now is retried, and so is one tracking protects against (claimed when it faults
+    // again). A few retries in a row on one address mean nobody claims it.
+    bool allowed = !backed && s && access_allowed(addr, access);
+    bool tracked = !backed && !allowed && s && tracking_protects_access(s, (u64)addr, access == 1);
     ReleaseSRWLockExclusive(&g_mem.range_lock);
-    if (!backed && s && e->ExceptionInformation[0] == 1)
+    // A retry the page allows can't fault again by itself; one tracking protects against faults again
+    // and is claimed then, unless tracking keeps declining it: only those count.
+    bool retry = backed || allowed || (tracked && retry_allowed((u64)addr));
+    if (backed || allowed)
+        g_retry_address.set(0);
+    if (!retry && s && access == 1)
         tracking_describe_write_fault((u64)addr);
-    return backed ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
+    return retry ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
+}
+
+// The faulting thread's last error is the title's: whatever handling the fault takes, it stays.
+static LONG CALLBACK on_access_fault(EXCEPTION_POINTERS* ep) {
+    DWORD error = GetLastError();
+    LONG result = access_fault(ep);
+    SetLastError(error);
+    return result;
 }
 
 // The frame a page mapping entry names, or MEM_INVALID_PFN. Titles release slots by mapping page
@@ -1109,6 +1192,15 @@ bool mem_release(void* base) {
         return false;
     }
     tracking_range_released(s);
+    // Frames the range owned, told to the listener once no lock is held (listeners take their own locks,
+    // then ours).
+    u64* freed = nullptr;
+    u64 freed_count = 0;
+    if ((s->info.flags & MEM_RANGE_PLACEHOLDER) && (s->info.flags & MEM_RANGE_OWNS_PAGES)) {
+        freed = (u64*)malloc((u64)range_pages(s) * sizeof(u64));
+        if (!freed)
+            FATAL("out of memory releasing title memory");
+    }
     if (s->info.flags & MEM_RANGE_PLACEHOLDER) {
         AcquireSRWLockShared(&g_mem.phys_lock);
         for (u32 p = 0; p < range_pages(s); p++) {
@@ -1129,10 +1221,8 @@ bool mem_release(void* base) {
             } else {
                 ok = g_mem.unmap_view2(GetCurrentProcess(), va, 0) != FALSE;
                 if (owns) {
-                    for (u32 p = 0; p < region_end(s, i) - r.first_page; p++) {
-                        u64 pfn = (u64)g_mem.real_to_id[r.pfn + p] << MEM_PAGE_NUMBER_SHIFT;
-                        mem_physical_free(1, &pfn);
-                    }
+                    for (u32 p = 0; p < region_end(s, i) - r.first_page; p++)
+                        freed[freed_count++] = (u64)g_mem.real_to_id[r.pfn + p] << MEM_PAGE_NUMBER_SHIFT;
                 }
             }
             if (!ok)
@@ -1140,10 +1230,8 @@ bool mem_release(void* base) {
         }
         // Frames that were never touched are owned too.
         for (u32 p = 0; owns && s->pending && p < range_pages(s); p++) {
-            if (s->pending[p] != MEM_INVALID_PFN) {
-                u64 pfn = (u64)s->pending[p] << MEM_PAGE_NUMBER_SHIFT;
-                mem_physical_free(1, &pfn);
-            }
+            if (s->pending[p] != MEM_INVALID_PFN)
+                freed[freed_count++] = (u64)s->pending[p] << MEM_PAGE_NUMBER_SHIFT;
         }
         free(s->pending);
         free(s->regions);
@@ -1162,6 +1250,12 @@ bool mem_release(void* base) {
     *s = g_mem.ranges[--g_mem.range_count];
     ReleaseSRWLockExclusive(&g_mem.range_lock);
     notify_mapping_changed((const u8*)base, size);
+    // Nothing shows the owned frames any more; they're free for others once the listener let go of them.
+    if (freed_count && g_frames_freed_listener)
+        g_frames_freed_listener(freed_count, freed);
+    if (freed_count)
+        physical_free(freed_count, freed);
+    free(freed);
     return true;
 }
 

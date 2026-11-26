@@ -384,7 +384,13 @@ static void test_gpu_section_ranges() {
 static u32 g_write_reports = 0;
 static u64 g_write_base = 0, g_write_size = 0;
 
-static void on_write(u64 base, u64 size, MemWriteKind) {
+static u32 g_dropped_reports; // watches ended by other memory mapped where they were
+
+static void on_write(u64 base, u64 size, MemWriteKind kind) {
+    if (kind == MEM_WATCH_DROPPED) {
+        g_dropped_reports++;
+        return;
+    }
     g_write_reports++;
     g_write_base = base;
     g_write_size = size;
@@ -439,8 +445,9 @@ static void test_write_watches() {
     CHECK(mem_map_physical(a + PAGE, 1, &frames[2])); // splits a's view next to the watch
     CHECK(g_write_reports == 0);
     CHECK(!page_writable(a));
+    g_dropped_reports = 0;
     CHECK(mem_map_physical(a, 1, &frames[2]));
-    CHECK(g_write_reports == 0 && page_writable(b + PAGE)); // ended unreported; frame 0 released at b
+    CHECK(g_write_reports == 0 && g_dropped_reports == 1 && page_writable(b + PAGE)); // dropped; frame 0 free at b
     CHECK(mem_release(a));
     CHECK(mem_release(b));
     mem_physical_free(3, frames);
@@ -507,6 +514,8 @@ static void test_watch_counts() {
     mem_watch_writes(gpu, 3 * 4096);        // watch A: pages 0-2
     mem_watch_writes(gpu + 2 * 4096, 8192); // watch B: pages 2-3 (shares page 2)
     mem_watch_writes(gpu, 3 * 4096);        // armed already: nothing changes
+    mem_watch_writes(gpu, 3 * 4096, 1);     // another client's watch over the same range
+    mem_unwatch_writes(gpu, 3 * 4096, 1);   // that client lets go: watch A stays
     CHECK(!page_writable(gpu) && !page_writable(gpu + 3 * 4096));
     gpu[3 * 4096] = 1; // B's own page: B ends, A's pages stay protected
     CHECK(g_write_reports == 1 && g_write_base == (u64)gpu + 2 * 4096);

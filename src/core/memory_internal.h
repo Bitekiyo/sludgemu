@@ -192,6 +192,9 @@ void tracking_frame_freed(u32 id);
 bool tracking_write_fault(EXCEPTION_POINTERS* ep, u64 addr);
 // A fault at `addr` on a taken page: the taken listener gives it back. True if the access can retry.
 bool tracking_access_fault(u64 addr);
+// Whether tracking protects the page at `addr` against this access (taken, or watched for a write): a
+// retried access is then tracking's to claim. Range lock held exclusively (protection settled).
+bool tracking_protects_access(const RangeSlot* s, u64 addr, bool write);
 // Logs what the memory system knows about a write fault nothing claimed (diagnostics before a crash).
 void tracking_describe_write_fault(u64 addr);
 bool tracking_single_step(EXCEPTION_POINTERS* ep);

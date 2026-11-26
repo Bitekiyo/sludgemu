@@ -50,6 +50,13 @@ struct MemRange {
 
 bool mem_init(u64 physical_bytes);
 
+// Whether the system can still commit `bytes` and keep MEM_COMMIT_RESERVE for everything else. Commit
+// (RAM and pagefile) is shared with every process, and Windows charges video memory allocations to it
+// too; title memory that takes the last of it makes the whole system fail, so growing title memory
+// stops the title first (a title's crash handler reading all of its memory gets there).
+#define MEM_COMMIT_RESERVE GiB(2)
+bool mem_commit_available(u64 bytes);
+
 // Physical page frames ------------------------------------------------------------------------
 
 u64 mem_physical_total_pages();
@@ -172,18 +179,22 @@ void mem_add_mapping_listener(MemMappingListener listener);
 // over the same frames; they end unreported when other frames are mapped at their range (mapping
 // listeners get that change). Writes through our own views of the memory (for the GPU) and by the
 // kernel aren't seen: kernel I/O into title memory ends the watches first (mem_end_write_watches),
-// since its writes would fail rather than fault. Arming a range that is watched already does nothing.
+// since its writes would fail rather than fault, and gives taken pages there back first. Watches belong
+// to a client (any number naming the caller): arming a range the same client watches already does
+// nothing, and unwatching ends that client's watch only.
 enum MemWriteKind {
     MEM_WATCH_ENDED,  // a write ended the watch armed over [base, base + size)
     MEM_DEVICE_WROTE, // a device finished writing [base, base + size) (see mem_expect_device_writes)
+    MEM_WATCH_DROPPED, // other memory was mapped where the watch over [base, base + size) was: it ended
+                       // without a write (the memory it watched may be written unseen from now on)
 };
 typedef void (*MemWriteListener)(u64 base, u64 size, MemWriteKind kind); // called without memory locks held
 void mem_add_write_listener(MemWriteListener listener);
 void mem_remove_write_listener(MemWriteListener listener);
-void mem_watch_writes(const void* base, u64 size);
+void mem_watch_writes(const void* base, u64 size, u32 client = 0);
 
 // Ends the watch armed for exactly [base, base + size), unreported (its user is gone).
-void mem_unwatch_writes(const void* base, u64 size);
+void mem_unwatch_writes(const void* base, u64 size, u32 client = 0);
 
 // The memory under [base, base + size) is about to be written without faults (kernel I/O): the
 // watches on its pages end and are reported.
@@ -234,7 +245,8 @@ void mem_set_taken_listener(MemTakenListener listener);
 void mem_take_pages(const void* base, u64 size);
 void mem_give_pages(const void* base, u64 size);
 
-// Changes the host protection used for future mappings in the range containing `addr`.
+// Changes the host protection used for future mappings in the range containing `addr`. A range given
+// CPU access this way is CPU-accessible from then on (MEM_RANGE_CPU_ACCESS).
 void mem_set_range_protect(const void* addr, u32 protect);
 bool mem_is_tracked(const void* addr);
 
