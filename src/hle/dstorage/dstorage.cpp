@@ -414,11 +414,14 @@ class ConsoleQueue : public IUnknown {
     ~ConsoleQueue() {
         m_desktop->Release();
         free(m_pending);
+        free(m_writes);
     }
 
     void enqueue(const PendingCommand& c);
     void process_locked();
     void send(const ConsoleRequest* r);
+    void add_write(u64 base, u64 size);
+    void finish_writes();
     bool auto_submit() const { return !(m_desc.options & QUEUE_OPTION_NO_AUTO_SUBMIT); }
 
     void slot_counts(u16* empty, u16* until_auto_submit) {
@@ -440,6 +443,9 @@ class ConsoleQueue : public IUnknown {
     PendingCommand* m_pending = nullptr;                    // grown up to m_capacity
     u32 m_pending_count = 0;
     u32 m_pending_allocated = 0;
+    MemSpan* m_writes = nullptr; // what the requests passed on since the last completion command write
+    u32 m_write_count = 0;
+    u32 m_write_capacity = 0;
     volatile long m_refs = 1;
 };
 
@@ -476,16 +482,49 @@ void ConsoleQueue::process_locked() {
                 send(&c.request);
             break;
         case PENDING_STATUS:
+            finish_writes();
             m_desktop->EnqueueStatus(c.status.array, c.status.index);
             break;
         case PENDING_EVENT:
+            finish_writes();
             m_desktop->EnqueueSetEvent(c.event);
             break;
         }
     }
+    finish_writes();
     m_pending_count = 0;
     m_desktop->Submit();
     WakeAllConditionVariable(&m_drained);
+}
+
+void ConsoleQueue::add_write(u64 base, u64 size) {
+    if (m_write_count == m_write_capacity) {
+        u32 capacity = m_write_capacity ? m_write_capacity * 2 : 256;
+        MemSpan* grown = (MemSpan*)realloc(m_writes, capacity * sizeof(MemSpan));
+        if (!grown)
+            FATAL("out of memory for request destinations");
+        m_writes = grown;
+        m_write_capacity = capacity;
+    }
+    m_writes[m_write_count++] = {base, size};
+}
+
+// Memory the requests passed on write is the memory system's device writes until an event queued
+// after them is set (see mem_expect_device_writes): GPU copies of it wait for the data, and get it once
+// written. Queued before the title's own completion commands, which complete in order after it.
+void ConsoleQueue::finish_writes() {
+    if (!m_write_count)
+        return;
+    HANDLE done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!done) {
+        LOG_E("dstorage", "cannot create an event (%lu); request destinations aren't tracked",
+              GetLastError());
+        m_write_count = 0;
+        return;
+    }
+    mem_expect_device_writes(done, m_writes, m_write_count);
+    m_desktop->EnqueueSetEvent(done);
+    m_write_count = 0;
 }
 
 void ConsoleQueue::send(const ConsoleRequest* r) {
@@ -512,6 +551,19 @@ void ConsoleQueue::send(const ConsoleRequest* r) {
     // textures over it, so that has not been seen.
     if (destination)
         mem_end_write_watches(destination, r->destination_size);
+    if (destination && !(r->options & OPT_DESTINATION_PAGES)) {
+        add_write((u64)destination, r->destination_size);
+    } else if (destination) {
+        // Page frames, written through our view of physical memory: tracked where the title sees them.
+        u64 pages = (r->destination_page_offset + (u64)r->destination_size + CONSOLE_PAGE_SIZE - 1) /
+                    CONSOLE_PAGE_SIZE;
+        for (u64 i = 0; i < pages; i++) {
+            u64 vas[8];
+            u32 n = mem_frame_addresses(r->destination_pages[i], vas, ARRAY_COUNT(vas));
+            for (u32 k = 0; k < n && k < ARRAY_COUNT(vas); k++)
+                add_write(vas[k], CONSOLE_PAGE_SIZE);
+        }
+    }
 
     const void* source = nullptr;
     if (r->options & OPT_SOURCE_MEMORY) {

@@ -128,7 +128,7 @@ void texture_sync_init() {
 }
 
 bool texture_sync_pending() {
-    return g_sync.dirty != 0;
+    return g_sync.dirty != 0 || mem_device_writes_outstanding();
 }
 
 // --- uploads -----------------------------------------------------------------------------------------
@@ -301,7 +301,8 @@ static bool copy_from_title_memory(ID3D12GraphicsCommandList8* list, ConsoleReso
 
 bool texture_sync_record(ID3D12GraphicsCommandList8* list, TextureUploadSources* sources) {
     sources->count = 0;
-    if (!texture_sync_pending())
+    mem_poll_device_writes(); // finished ones mark their textures
+    if (!g_sync.dirty)
         return false;
     static SubresourceCopy s_copies[MAX_UPLOADS][MAX_SUBRESOURCES]; // under g_sync.lock
     ConsoleResource* uploads[MAX_UPLOADS];
@@ -316,6 +317,10 @@ bool texture_sync_record(ID3D12GraphicsCommandList8* list, TextureUploadSources*
     for (u32 i = 0; i < g_sync.count; i++) {
         SyncEntry& e = g_sync.entries[i];
         if (!e.dirty)
+            continue;
+        // Still being written: uploaded once the writes finish (they mark it again). Protecting it now
+        // would also fail writes the kernel makes.
+        if (mem_device_writes_pending(e.start, e.end - e.start))
             continue;
         bool mapped = mem_is_mapped((const void*)e.start, e.end - e.start);
         // Watched before it is read: what the CPU writes from now on marks it again.

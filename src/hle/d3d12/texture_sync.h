@@ -11,7 +11,9 @@
 // (physical page mappings, GPU page mapping copies), and when the CPU writes it (glyph caches, video
 // frames). Uploading a texture write-protects its memory (see mem_watch_writes): the first write after
 // that marks it again, so the next submission uploads what the CPU wrote before it, as the console's
-// GPU would read it. Linear textures are copied by the GPU straight from title memory.
+// GPU would read it. Memory devices write (DirectStorage requests, see mem_expect_device_writes) isn't
+// uploaded while they write it; their finished writes mark it like CPU writes. Linear textures are
+// copied by the GPU straight from title memory.
 //
 // On desktop such textures stay in the common layout: title barriers keep their synchronization but
 // change no layouts, so uploads can run between any two submissions.
