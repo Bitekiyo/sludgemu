@@ -18,6 +18,12 @@
 //
 // On desktop such textures stay in the common layout: title barriers keep their synchronization but
 // change no layouts, so uploads can run between any two submissions.
+//
+// Titles map memory into textures page by page as they stream them in, and views only reach the mips
+// streamed in so far. Desktop textures of such memory are reserved resources: their tiles get VRAM
+// (gpu/tile_pool.h) while the title memory their texels come from is mapped, and give it back when the
+// title unmaps it, so they take what the console's take. Linear textures (written by the CPU, copied
+// whole) are ordinary ones.
 
 void texture_sync_init();
 
@@ -30,6 +36,9 @@ bool texture_sync_trace_overlaps(u64 address, u64 size);
 
 // Whether a texture with this console description is kept in sync with its title memory.
 bool texture_sync_tracks(const D3D12_RESOURCE_DESC1& desc);
+// Whether such a texture's desktop texture should be reserved, its tiles following the title's mappings
+// (where desktop D3D12 allows reserved textures of its kind; see ConsoleResource::reserved).
+bool texture_sync_tiles(const D3D12_RESOURCE_DESC1& desc);
 
 void texture_sync_add(ConsoleResource* r);
 void texture_sync_remove(ConsoleResource* r);
@@ -50,9 +59,11 @@ struct TextureUploadSources {
     u32 count;
 };
 
-// Records the waiting uploads into `list` (a direct or compute list), detiled on the GPU into the
-// queue's `scratch` ring; textures whose memory isn't one block for the GPU are copied into its
-// `staging` ring (an upload ring) first. Both rings get gpu_ring_submitted once the list is submitted.
-// Returns whether anything was recorded.
-bool texture_sync_record(ID3D12GraphicsCommandList8* list, TextureUploadSources* sources, GpuRing* scratch,
-                         GpuRing* staging);
+// Records the waiting uploads into `list` (a direct or compute list for `queue`), detiled on the GPU
+// into the queue's `scratch` ring; textures whose memory isn't one block for the GPU are copied into
+// its `staging` ring (an upload ring) first. Both rings get gpu_ring_submitted once the list is
+// submitted. Tile mappings of reserved textures change on `queue` right away, so the list must be the
+// queue's next, and the queue must count a submission after them even if nothing was recorded (their
+// textures are in `sources` then). Returns whether anything was recorded.
+bool texture_sync_record(ID3D12CommandQueue* queue, ID3D12GraphicsCommandList8* list,
+                         TextureUploadSources* sources, GpuRing* scratch, GpuRing* staging);

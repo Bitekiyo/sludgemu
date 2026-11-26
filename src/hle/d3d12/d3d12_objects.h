@@ -289,6 +289,12 @@ struct ConsoleResource {
 
     SRWLOCK lock;            // guards creating the desktop texture
     ID3D12Resource* texture; // textures only
+    bool reserved;           // the desktop texture is reserved, its tiles mapped by texture_sync
+    // The desktop texture in the memory accounting (console_memory_report).
+    bool texture_counted;
+    u32 texture_index;
+    u64 desktop_bytes;
+    u64 console_bytes;
 
     bool placed_view; // made for views of placed memory, never seen by the title (console_placed_texture)
 };
@@ -321,6 +327,12 @@ ConsoleResource* console_placed_texture(u64 gpu_address, const D3D12_RESOURCE_DE
 // The desktop resource backing `resource` (created on first use) and the offset of the title
 // resource's first byte in it. nullptr if it can't be created.
 ID3D12Resource* console_resource_desktop(ConsoleResource* resource, u64* offset);
+
+// Logs the memory desktop textures take, by what they back, next to the adapter's memory budget and
+// the title's memory. Also logged when one can't be created for lack of memory, and by
+// console_memory_check as what they take (with reserved textures' tiles) reaches each new 256 MiB high.
+void console_memory_report(const char* why);
+void console_memory_check();
 
 // The texture can't keep UAV access on desktop (depth textures that are also UAVs on the console).
 bool console_texture_loses_uav(const D3D12_RESOURCE_DESC1& desc);

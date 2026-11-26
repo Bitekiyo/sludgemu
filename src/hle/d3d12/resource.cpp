@@ -1,12 +1,19 @@
 // Console ID3D12Resource / ID3D12Resource1 / ID3D12Resource2.
 
+#include <windows.h>
+#include <psapi.h>
+#include <stdlib.h>
+
 #include "common/log.h"
+#include "core/memory.h"
 #include "hle/d3d12/barriers.h"
 #include "hle/d3d12/d3d12_objects.h"
 #include "hle/d3d12/texture_sync.h"
 #include "hle/d3d12/d3d12_tables.h"
 #include "gpu/console_layout.h"
 #include "gpu/formats.h"
+#include "gpu/gpu_window.h"
+#include "gpu/tile_pool.h"
 #include "hle/xmem/xmem.h"
 
 static const GUID* const k_resource_iids[] = {&__uuidof(ID3D12Object),    &__uuidof(ID3D12DeviceChild),
@@ -15,6 +22,9 @@ static const GUID* const k_resource_iids[] = {&__uuidof(ID3D12Object),    &__uui
 
 static void resource_destroy(void* object);
 static void forget_placed_texture(ConsoleResource* r);
+static void count_texture(ConsoleResource* r, const D3D12_RESOURCE_DESC1& desktop_desc);
+static void uncount_texture(ConsoleResource* r);
+static D3D12_RESOURCE_DESC desc0_from_desc1(const D3D12_RESOURCE_DESC1& d);
 
 static const ConsoleClass k_resource_class = {"ID3D12Resource", k_resource_iids, ARRAY_COUNT(k_resource_iids),
                                               resource_destroy};
@@ -67,6 +77,56 @@ static D3D12_RESOURCE_DESC1 desktop_texture_desc(const D3D12_RESOURCE_DESC1& con
     return desc;
 }
 
+// Whether desktop D3D12 makes reserved textures of this description (with its features, which are
+// asked once).
+static bool reserved_texture_supported(const D3D12_RESOURCE_DESC1& desc) {
+    static volatile long tier = -1;
+    static volatile u8 tiled_formats[256]; // 0: not asked yet, 1: tiled, 2: not
+    if (tier < 0) {
+        D3D12_FEATURE_DATA_D3D12_OPTIONS o = {};
+        gpu_device()->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &o, sizeof(o));
+        tier = o.TiledResourcesTier;
+    }
+    // Tier 2 reads zeros from tiles without memory and drops writes to them, which uploads rely on.
+    if (tier < D3D12_TILED_RESOURCES_TIER_2 || desc.SampleDesc.Count != 1 || (u32)desc.Format >= 256)
+        return false;
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+        (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D || tier < D3D12_TILED_RESOURCES_TIER_3))
+        return false;
+    if (!tiled_formats[desc.Format]) {
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT f = {desc.Format};
+        bool tiled =
+            SUCCEEDED(gpu_device()->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &f, sizeof(f))) &&
+            (f.Support2 & D3D12_FORMAT_SUPPORT2_TILED);
+        tiled_formats[desc.Format] = tiled ? 1 : 2;
+    }
+    return tiled_formats[desc.Format] == 1;
+}
+
+// Textures following the title's mappings get reserved desktop textures (see texture_sync): their
+// tiles get VRAM only where the title mapped memory. nullptr where that can't be.
+static ID3D12Resource* create_reserved_texture(ConsoleResource* r, const D3D12_RESOURCE_DESC1& desc,
+                                               D3D12_BARRIER_LAYOUT layout) {
+    if (!texture_sync_tiles(r->desc) || !reserved_texture_supported(desc))
+        return nullptr;
+    D3D12_RESOURCE_DESC reserved = desc0_from_desc1(desc);
+    reserved.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+    ID3D12Resource* texture = nullptr;
+    HRESULT hr = gpu_device()->CreateReservedResource2(&reserved, layout, nullptr, nullptr, 0, nullptr,
+                                                       IID_PPV_ARGS(&texture));
+    if (FAILED(hr)) {
+        if (!gpu_device_lost(hr))
+            LOG_W("d3d12",
+                  "cannot create a reserved texture for 0x%llx (dim %d, %llux%ux%u, mips %u, format %d): "
+                  "0x%08lx; making a whole one",
+                  r->gpu_address, r->desc.Dimension, r->desc.Width, r->desc.Height, r->desc.DepthOrArraySize,
+                  r->desc.MipLevels, r->desc.Format, (unsigned long)hr);
+        return nullptr;
+    }
+    r->reserved = true;
+    return texture;
+}
+
 static ID3D12Resource* create_texture(ConsoleResource* r) {
     D3D12_RESOURCE_DESC1 desc = desktop_texture_desc(r->desc);
     if (desc.Format == DXGI_FORMAT_UNKNOWN) {
@@ -87,6 +147,14 @@ static ID3D12Resource* create_texture(ConsoleResource* r) {
     D3D12_BARRIER_LAYOUT layout = console_texture_layout(
         r, r->initial_layout == D3D12_BARRIER_LAYOUT_UNDEFINED ? D3D12_BARRIER_LAYOUT_COMMON
                                                                : r->initial_layout);
+    texture = create_reserved_texture(r, desc, layout);
+    if (texture) {
+        gpu_set_name(texture, "reserved texture at 0x%llx (dim %d, %llux%ux%u, format %d)", r->gpu_address,
+                     r->desc.Dimension, r->desc.Width, r->desc.Height, r->desc.DepthOrArraySize,
+                     r->desc.Format);
+        count_texture(r, desc);
+        return texture;
+    }
     HRESULT hr = gpu_device()->CreateCommittedResource3(&heap, D3D12_HEAP_FLAG_NONE, &desc, layout, clear,
                                                         nullptr, 0, nullptr, IID_PPV_ARGS(&texture));
     if (hr == E_INVALIDARG && clear) {
@@ -104,8 +172,13 @@ static ID3D12Resource* create_texture(ConsoleResource* r) {
               "flags 0x%x): 0x%08lx",
               r->gpu_address, r->desc.Dimension, r->desc.Width, r->desc.Height, r->desc.DepthOrArraySize,
               r->desc.MipLevels, r->desc.Format, r->desc.Flags, (unsigned long)hr);
+        static volatile long reported = 0;
+        if (hr == E_OUTOFMEMORY && log_once_flag(&reported))
+            console_memory_report("out of memory");
         return nullptr;
     }
+    count_texture(r, desc);
+    console_memory_check();
     gpu_set_name(texture, "%s at 0x%llx (dim %d, %llux%ux%u, format %d)",
                  r->placed_view ? "texture of placed memory" : "texture", r->gpu_address, r->desc.Dimension,
                  r->desc.Width, r->desc.Height, r->desc.DepthOrArraySize, r->desc.Format);
@@ -163,6 +236,7 @@ static void resource_destroy(void* object) {
         forget_placed_texture(r);
     if (texture_sync_tracks(r->desc))
         texture_sync_remove(r);
+    uncount_texture(r);
     gpu_retire(r->texture);
     if (r->owned_memory)
         xmem_free(r->owned_memory, r->owned_attributes);
@@ -416,4 +490,187 @@ ConsoleResource* console_placed_texture(u64 gpu_address, const D3D12_RESOURCE_DE
     g_placed.count++;
     ReleaseSRWLockExclusive(&g_placed.lock);
     return r;
+}
+
+// --- memory accounting -------------------------------------------------------------------------------
+//
+// Desktop textures are memory on top of the title's own, which holds the same contents in console
+// layout. Each is counted by what it backs; reports compare that to the title memory the textures
+// describe (aliased textures share it) and to how much of it the title has mapped.
+
+#define TEXTURE_REPORT_STEP MiB(256)
+
+enum TextureKind { TEXTURE_WRITTEN, TEXTURE_SAMPLED, TEXTURE_PLACED_VIEW, TEXTURE_KIND_COUNT };
+
+static const char* const k_texture_kind_names[TEXTURE_KIND_COUNT] = {
+    "render target, depth and UAV textures", "sampled textures", "textures of placed views"};
+
+static struct {
+    ConsoleResource** live; // resources with a desktop texture (ConsoleResource::texture_index)
+    u32 count;
+    u32 capacity;
+    u64 bytes;       // their desktop size (reserved ones' tiles are the tile pool's)
+    u64 next_report; // the next high of `bytes` and tiles that logs a report
+    SRWLOCK lock;
+} g_textures = {nullptr, 0, 0, 0, TEXTURE_REPORT_STEP, SRWLOCK_INIT};
+
+static TextureKind texture_kind(const ConsoleResource* r) {
+    const u32 written = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+                        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    if (r->placed_view)
+        return TEXTURE_PLACED_VIEW;
+    return (r->desc.Flags & written) ? TEXTURE_WRITTEN : TEXTURE_SAMPLED;
+}
+
+// Counts the desktop texture just created for `r`.
+static void count_texture(ConsoleResource* r, const D3D12_RESOURCE_DESC1& desktop_desc) {
+    // Reserved textures take tiles, which the tile pool counts.
+    D3D12_RESOURCE_ALLOCATION_INFO desktop = {};
+    if (!r->reserved)
+        desktop = gpu_device()->GetResourceAllocationInfo2(0, 1, &desktop_desc, nullptr);
+    D3D12_RESOURCE_ALLOCATION_INFO console = console_resource_allocation_info(r->desc);
+    AcquireSRWLockExclusive(&g_textures.lock);
+    if (g_textures.count == g_textures.capacity) {
+        u32 capacity = g_textures.capacity ? g_textures.capacity * 2 : 1024;
+        ConsoleResource** grown =
+            (ConsoleResource**)realloc(g_textures.live, capacity * sizeof(ConsoleResource*));
+        if (!grown) {
+            ReleaseSRWLockExclusive(&g_textures.lock);
+            return; // left out of the reports
+        }
+        g_textures.live = grown;
+        g_textures.capacity = capacity;
+    }
+    r->texture_counted = true;
+    r->texture_index = g_textures.count;
+    r->desktop_bytes = desktop.SizeInBytes;
+    r->console_bytes = console.SizeInBytes;
+    g_textures.live[g_textures.count++] = r;
+    g_textures.bytes += desktop.SizeInBytes;
+    ReleaseSRWLockExclusive(&g_textures.lock);
+}
+
+void console_memory_check() {
+    u64 tiles = 0, tile_heaps = 0;
+    gpu_tile_usage(&tiles, &tile_heaps);
+    AcquireSRWLockExclusive(&g_textures.lock);
+    u64 total = g_textures.bytes + tiles;
+    bool report = total >= g_textures.next_report;
+    if (report)
+        g_textures.next_report = ALIGN_DOWN(total, TEXTURE_REPORT_STEP) + TEXTURE_REPORT_STEP;
+    ReleaseSRWLockExclusive(&g_textures.lock);
+    if (report)
+        console_memory_report("new high");
+}
+
+static void uncount_texture(ConsoleResource* r) {
+    if (!r->texture_counted)
+        return;
+    AcquireSRWLockExclusive(&g_textures.lock);
+    ConsoleResource* last = g_textures.live[--g_textures.count];
+    g_textures.live[r->texture_index] = last;
+    last->texture_index = r->texture_index;
+    g_textures.bytes -= r->desktop_bytes;
+    ReleaseSRWLockExclusive(&g_textures.lock);
+}
+
+struct TextureSpan {
+    u64 start;
+    u64 end;
+    u64 desktop_bytes;
+    TextureKind kind;
+};
+
+static int compare_spans(const void* a, const void* b) {
+    const TextureSpan* x = (const TextureSpan*)a;
+    const TextureSpan* y = (const TextureSpan*)b;
+    if (x->kind != y->kind)
+        return x->kind < y->kind ? -1 : 1;
+    return x->start < y->start ? -1 : x->start > y->start ? 1 : 0;
+}
+
+// Mapped bytes of [start, end), in 64 KiB steps (titles map texture memory in 64 KiB pages).
+static u64 mapped_bytes(u64 start, u64 end) {
+    u64 mapped = 0;
+    for (u64 at = start; at < end;) {
+        u64 next = ALIGN_DOWN(at, KiB(64)) + KiB(64);
+        u64 piece_end = next < end ? next : end;
+        if (mem_is_mapped((const void*)at, piece_end - at))
+            mapped += piece_end - at;
+        at = piece_end;
+    }
+    return mapped;
+}
+
+void console_memory_report(const char* why) {
+    AcquireSRWLockShared(&g_textures.lock);
+    u32 count = g_textures.count;
+    u64 total = g_textures.bytes;
+    TextureSpan* spans = (TextureSpan*)malloc((count ? count : 1) * sizeof(TextureSpan));
+    for (u32 i = 0; spans && i < count; i++) {
+        const ConsoleResource* r = g_textures.live[i];
+        spans[i] = {r->gpu_address, r->gpu_address + r->console_bytes, r->desktop_bytes, texture_kind(r)};
+    }
+    ReleaseSRWLockShared(&g_textures.lock);
+
+    GpuVideoMemory video = {};
+    gpu_video_memory(&video);
+    u64 tiles = 0, tile_heaps = 0;
+    gpu_tile_usage(&tiles, &tile_heaps);
+    PROCESS_MEMORY_COUNTERS_EX process = {};
+    K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&process, sizeof(process));
+    PERFORMANCE_INFORMATION system = {};
+    K32GetPerformanceInfo(&system, sizeof(system));
+    u64 chunk_windows = 0, block_windows = 0, replaced_windows = 0;
+    gpu_window_usage(&chunk_windows, &block_windows, &replaced_windows);
+    LOG_I("d3d12",
+          "memory (%s): whole desktop textures %llu MiB, tiles %llu MiB (heaps %llu MiB); VRAM %llu of %llu "
+          "MiB, shared %llu of %llu MiB; title physical memory %llu of %llu MiB used; commit %llu MiB",
+          why, total >> 20, tiles >> 20, tile_heaps >> 20, video.local_usage >> 20, video.local_budget >> 20,
+          video.shared_usage >> 20, video.shared_budget >> 20,
+          (mem_physical_used_pages() << MEM_PAGE_SHIFT) >> 20,
+          (mem_physical_total_pages() << MEM_PAGE_SHIFT) >> 20, (u64)process.PrivateUsage >> 20);
+    LOG_I(
+        "d3d12",
+        "memory:   system: commit %llu of %llu MiB, %llu MiB RAM free; this process: private %llu MiB "
+        "(VRAM is charged here too), working set %llu MiB; physical memory chunks %llu MiB (%llu MiB bound); "
+        "GPU windows over chunks %llu MiB, over other memory %llu MiB (+%llu MiB replaced)",
+        (u64)system.CommitTotal * system.PageSize >> 20, (u64)system.CommitLimit * system.PageSize >> 20,
+        (u64)system.PhysicalAvailable * system.PageSize >> 20, (u64)process.PrivateUsage >> 20,
+        (u64)process.WorkingSetSize >> 20, ((u64)mem_physical_chunks_created() * MEM_CHUNK_SIZE) >> 20,
+        (mem_physical_bound_pages() << MEM_PAGE_SHIFT) >> 20, chunk_windows >> 20, block_windows >> 20,
+        replaced_windows >> 20);
+    if (!spans)
+        return;
+
+    // Per kind: what the desktop textures take, the title memory they describe, how much of that is
+    // distinct (aliased textures share it) and how much the title has mapped.
+    qsort(spans, count, sizeof(TextureSpan), compare_spans);
+    for (u32 i = 0; i < count;) {
+        TextureKind kind = spans[i].kind;
+        u32 textures = 0;
+        u64 desktop = 0, console = 0, distinct = 0, mapped = 0, bound = 0;
+        u64 run_start = spans[i].start, run_end = spans[i].start;
+        for (; i < count && spans[i].kind == kind; i++) {
+            textures++;
+            desktop += spans[i].desktop_bytes;
+            console += spans[i].end - spans[i].start;
+            if (spans[i].start > run_end) {
+                distinct += run_end - run_start;
+                mapped += mapped_bytes(run_start, run_end);
+                bound += mem_physical_bound_pages_at((const void*)run_start, run_end - run_start);
+                run_start = spans[i].start;
+            }
+            run_end = spans[i].end > run_end ? spans[i].end : run_end;
+        }
+        distinct += run_end - run_start;
+        mapped += mapped_bytes(run_start, run_end);
+        bound += mem_physical_bound_pages_at((const void*)run_start, run_end - run_start);
+        LOG_I("d3d12",
+              "memory:   %s: %u, %llu MiB as whole desktop textures; %llu MiB of title memory, %llu MiB "
+              "distinct, %llu MiB mapped (%llu MiB bound to system memory)",
+              k_texture_kind_names[kind], textures, desktop >> 20, console >> 20, distinct >> 20,
+              mapped >> 20, (bound << MEM_PAGE_SHIFT) >> 20);
+    }
+    free(spans);
 }

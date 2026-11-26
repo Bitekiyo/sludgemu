@@ -68,7 +68,7 @@ static void upload_textures(ConsoleCommandQueue* self) {
     TextureUploadSources sources;
     self->scratch.slot = self->staging.slot = self->slot;
     self->staging.upload = true;
-    bool recorded = texture_sync_record(w.list, &sources, &self->scratch, &self->staging);
+    bool recorded = texture_sync_record(self->desktop, w.list, &sources, &self->scratch, &self->staging);
     if (SUCCEEDED(w.list->Close()) && recorded) {
         ID3D12CommandList* list = w.list;
         self->desktop->ExecuteCommandLists(1, &list);
@@ -76,6 +76,8 @@ static void upload_textures(ConsoleCommandQueue* self) {
         gpu_ring_submitted(&self->scratch, w.submission);
         gpu_ring_submitted(&self->staging, w.submission);
         self->next_uploader = (self->next_uploader + 1) % QUEUE_UPLOADERS; // this one is in flight
+    } else if (sources.count) {
+        gpu_queue_submitted(self->slot); // tile mapping changes alone: counted so their textures stay
     }
     ReleaseSRWLockExclusive(&self->writer_lock);
     for (u32 i = 0; i < sources.count; i++)
