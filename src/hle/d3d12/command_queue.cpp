@@ -164,7 +164,8 @@ static void WINAPI queue_execute_command_lists(ConsoleCommandQueue* self, UINT c
             const ListSegment& seg = list->segments[s];
             if (b.count == SUBMIT_BATCH)
                 last = flush(self, &b, last);
-            b.lists[b.count++] = seg.list;
+            if (seg.closed) // a part that didn't close would remove the device (logged at Close)
+                b.lists[b.count++] = seg.list;
             if (s + 1 == list->segment_count)
                 break;
             last = flush(self, &b, last);

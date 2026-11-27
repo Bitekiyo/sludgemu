@@ -373,6 +373,7 @@ static HRESULT begin_segment(ConsoleCommandList* self, u32 index) {
         return hr;
     }
     seg.fence = nullptr;
+    seg.closed = false;
     self->desktop = seg.list;
     self->segment_count = index + 1;
     return S_OK;
@@ -386,11 +387,26 @@ static void release_segment_fences(ConsoleCommandList* self) {
     }
 }
 
+// Closes the part being recorded. A part that doesn't close holds an invalid command: it is left out of
+// submissions (see ListSegment::closed), logged with what desktop D3D12 said.
+static void close_segment(ConsoleCommandList* self) {
+    ListSegment& seg = self->segments[self->segment_count - 1];
+    HRESULT hr = self->desktop->Close();
+    seg.closed = SUCCEEDED(hr);
+    if (FAILED(hr) && !gpu_device_lost(hr)) {
+        static volatile long logged = 0;
+        if (log_once_flag(&logged))
+            LOG_E("d3d12", "part %u of a command list doesn't close (0x%08lx): it recorded an invalid command; "
+                  "parts like it are left out of submissions (run with --gpu-debug to see which command)",
+                  self->segment_count - 1, (unsigned long)hr);
+    }
+}
+
 bool list_split(ConsoleCommandList* self, ListSyncKind sync, ID3D12Fence* fence, u64 value, u64 counter) {
     if (!self->recording)
         return false;
     fence->AddRef();
-    self->desktop->Close();
+    close_segment(self);
     ListSegment& seg = self->segments[self->segment_count - 1];
     seg.sync = sync;
     seg.fence = fence;
@@ -430,10 +446,8 @@ static HRESULT WINAPI list_close(ConsoleCommandList* self) {
     if (!self->recording)
         return E_FAIL;
     self->recording = false;
-    HRESULT hr = self->desktop->Close();
-    if (FAILED(hr))
-        LOG_E("d3d12", "command list Close failed (0x%08lx)", (unsigned long)hr);
-    return hr;
+    close_segment(self);
+    return S_OK; // a part that didn't close is left out of submissions; the title's list stays usable
 }
 
 static HRESULT WINAPI list_reset_x(ConsoleCommandList* self, ConsoleCommandAllocator* allocator,

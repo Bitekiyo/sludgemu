@@ -193,6 +193,7 @@ struct ListSegment {
     ID3D12Fence* fence; // referenced
     u64 value;
     u64 counter; // waits: the title counter the fence follows, or 0
+    bool closed; // closed successfully: executing a list whose Close failed removes the device
 };
 
 struct ConsoleCommandList {
