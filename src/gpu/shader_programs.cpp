@@ -80,7 +80,8 @@ static const wchar_t* profile_of(ShaderStage stage) {
     }
 }
 
-// Programs (code and HLSL, with the error for failures) are written to SLUDGE_SHADER_DUMP=<directory>.
+// Programs (code, what the translator was told about them, and HLSL with the error for failures) are
+// written to SLUDGE_SHADER_DUMP=<directory>; shader_tool retranslate translates them again.
 static void dump(const ShaderProgram* p, const char* hlsl, const char* reason) {
     char dir[MAX_PATH];
     if (!GetEnvironmentVariableA("SLUDGE_SHADER_DUMP", dir, sizeof(dir)))
@@ -90,6 +91,12 @@ static void dump(const ShaderProgram* p, const char* hlsl, const char* reason) {
     FILE* f = fopen(path, "wb");
     if (f) {
         fwrite(p->code, 1, p->code_size, f);
+        fclose(f);
+    }
+    snprintf(path, sizeof(path), "%s\\%016llx.info", dir, (unsigned long long)p->key);
+    f = fopen(path, "wb");
+    if (f) {
+        fwrite(&p->info, sizeof(p->info), 1, f);
         fclose(f);
     }
     snprintf(path, sizeof(path), "%s\\%016llx.hlsl", dir, (unsigned long long)p->key);
