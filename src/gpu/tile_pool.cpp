@@ -218,6 +218,115 @@ u32 gpu_tile_heap_serial(u32 tile) {
     return h.heap ? h.serial : 0;
 }
 
+// --- slots ---------------------------------------------------------------------------------------------
+
+struct SlotTile {
+    u32 tile;
+    u16 used; // a bit per slot
+};
+
+struct FreedSlots {
+    GpuSlots slots;
+    GpuRetirePoint point;
+};
+
+static struct {
+    SRWLOCK lock;
+    SlotTile* tiles; // tiles with slots handed out
+    u32 count, capacity;
+    FreedSlots* freed; // oldest first
+    u32 freed_count, freed_capacity;
+} g_slots = {SRWLOCK_INIT};
+
+static u16 slot_mask(const GpuSlots& s) {
+    return (u16)(((1u << s.count) - 1) << s.first);
+}
+
+// Takes back slots the GPU is done with; tiles left without any go back to the pool. Slots lock held.
+static void reclaim_slots_locked() {
+    u32 done = 0;
+    while (done < g_slots.freed_count && gpu_retire_point_reached(g_slots.freed[done].point))
+        done++;
+    for (u32 i = 0; i < done; i++) {
+        const GpuSlots& s = g_slots.freed[i].slots;
+        for (u32 t = 0; t < g_slots.count; t++) {
+            SlotTile& st = g_slots.tiles[t];
+            if (st.tile != s.tile)
+                continue;
+            st.used &= (u16)~slot_mask(s);
+            if (!st.used) {
+                gpu_tiles_free(1, &st.tile);
+                st = g_slots.tiles[--g_slots.count];
+            }
+            break;
+        }
+    }
+    memmove(g_slots.freed, g_slots.freed + done, (g_slots.freed_count - done) * sizeof(FreedSlots));
+    g_slots.freed_count -= done;
+}
+
+bool gpu_slots_alloc(u64 size, GpuSlots* out) {
+    u32 count = (u32)((size + GPU_SLOT_SIZE - 1) / GPU_SLOT_SIZE);
+    if (!count || count > GPU_TILE_SLOTS)
+        return false;
+    u16 want = (u16)((1u << count) - 1);
+    AcquireSRWLockExclusive(&g_slots.lock);
+    reclaim_slots_locked();
+    // First fit over the tiles holding slots (a few thousand at most).
+    for (u32 t = 0; t < g_slots.count; t++) {
+        SlotTile& st = g_slots.tiles[t];
+        for (u32 first = 0; first + count <= GPU_TILE_SLOTS; first++) {
+            if (st.used & (u16)(want << first))
+                continue;
+            st.used |= (u16)(want << first);
+            *out = {st.tile, (u16)first, (u16)count};
+            ReleaseSRWLockExclusive(&g_slots.lock);
+            return true;
+        }
+    }
+    if (g_slots.count == g_slots.capacity) {
+        u32 capacity = g_slots.capacity ? g_slots.capacity * 2 : 256;
+        SlotTile* grown = (SlotTile*)realloc(g_slots.tiles, capacity * sizeof(SlotTile));
+        if (!grown) {
+            ReleaseSRWLockExclusive(&g_slots.lock);
+            return false;
+        }
+        g_slots.tiles = grown;
+        g_slots.capacity = capacity;
+    }
+    u32 tile = GPU_NO_TILE;
+    if (!gpu_tiles_alloc(1, &tile)) {
+        ReleaseSRWLockExclusive(&g_slots.lock);
+        return false;
+    }
+    g_slots.tiles[g_slots.count++] = {tile, want};
+    *out = {tile, 0, (u16)count};
+    ReleaseSRWLockExclusive(&g_slots.lock);
+    return true;
+}
+
+void gpu_slots_free(const GpuSlots& slots) {
+    if (!slots.count)
+        return;
+    AcquireSRWLockExclusive(&g_slots.lock);
+    if (g_slots.freed_count == g_slots.freed_capacity) {
+        u32 capacity = g_slots.freed_capacity ? g_slots.freed_capacity * 2 : 256;
+        FreedSlots* grown = (FreedSlots*)realloc(g_slots.freed, capacity * sizeof(FreedSlots));
+        if (!grown) {
+            // Out of memory: these slots are lost rather than handed out while the GPU may use them.
+            ReleaseSRWLockExclusive(&g_slots.lock);
+            LOG_E("gpu", "freed slot list full; 4 KiB slots of VRAM are lost");
+            return;
+        }
+        g_slots.freed = grown;
+        g_slots.freed_capacity = capacity;
+    }
+    FreedSlots& f = g_slots.freed[g_slots.freed_count++];
+    f.slots = slots;
+    gpu_retire_point(&f.point);
+    ReleaseSRWLockExclusive(&g_slots.lock);
+}
+
 void gpu_tile_usage(u64* used, u64* reserved) {
     AcquireSRWLockShared(&g_pool.lock);
     *used = (u64)g_pool.taken * GPU_TILE_SIZE;

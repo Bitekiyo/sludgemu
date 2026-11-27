@@ -6,6 +6,7 @@
 
 #include "gpu/gpu_ring.h"
 #include "gpu/gpu_window.h"
+#include "gpu/tile_pool.h"
 #include "hle/d3d12/console_object.h"
 
 // Console D3D12 object types and their creation functions (one source file per type).
@@ -290,6 +291,10 @@ struct ConsoleResource {
     SRWLOCK lock;            // guards creating the desktop texture
     ID3D12Resource* texture; // textures only
     bool reserved;           // the desktop texture is reserved, its tiles mapped by texture_sync
+    GpuSlots slots;          // the desktop texture is small, placed in these slots of the tile pool
+    // The console mip the desktop texture's first mip is (textures of placed memory only): titles
+    // streaming textures view only the mips they have loaded, and the desktop texture holds just those.
+    u32 first_mip;
     // The desktop texture in the memory accounting (console_memory_report).
     bool texture_counted;
     u32 texture_index;
@@ -327,7 +332,7 @@ HRESULT console_create_committed_resource(ConsoleDevice* device, const D3D12_HEA
 // shared by every view of the same memory and description, which the descriptor slots holding those
 // views keep alive (console_descriptor_keep). Returns it with a reference for the caller; its
 // contents are uploaded from the memory again, as a view is made once the memory holds them.
-ConsoleResource* console_placed_texture(u64 gpu_address, const D3D12_RESOURCE_DESC1& desc);
+ConsoleResource* console_placed_texture(u64 gpu_address, const D3D12_RESOURCE_DESC1& desc, u32 first_mip);
 
 // The desktop resource backing `resource` (created on first use) and the offset of the title
 // resource's first byte in it; `access` says whether the GPU work at hand may write a buffer. nullptr

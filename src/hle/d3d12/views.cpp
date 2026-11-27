@@ -542,6 +542,12 @@ static void note_view_mips(ConsoleResource* r, const D3D12_SHADER_RESOURCE_VIEW_
 
 static ID3D12Resource* texture_srv(ConsoleDevice* self, const ConsoleResource* r,
                                    D3D12_SHADER_RESOURCE_VIEW_DESC* d) {
+    if (r && r->first_mip && d->ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D) {
+        // The desktop texture starts at that console mip.
+        d->Texture2D.MostDetailedMip -= r->first_mip;
+        f32 clamp = d->Texture2D.ResourceMinLODClamp - (f32)r->first_mip;
+        d->Texture2D.ResourceMinLODClamp = clamp > 0.0f ? clamp : 0.0f;
+    }
     ID3D12Resource* desktop = texture_view_target(r);
     if (desktop && !texture_plane_ok(self->desktop, r, desktop, srv_plane(*d), d->Format))
         desktop = nullptr;
@@ -773,7 +779,9 @@ void WINAPI device_create_placed_raw_srv_x(ConsoleDevice* self, const D3D12_RESO
             LOG_W_ONCE("d3d12",
                        "views of placed textures with a hardware format (%u) read the texture's own format",
                        desc->image_format);
-        texture = console_placed_texture(desc->location, console_desc1_from_desc(*resource_desc));
+        // Its desktop texture holds the mips the view reads (titles stream textures in by mip).
+        u32 first_mip = d.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D ? d.Texture2D.MostDetailedMip : 0;
+        texture = console_placed_texture(desc->location, console_desc1_from_desc(*resource_desc), first_mip);
         if (texture && texture_sync_traced(texture->desc))
             LOG_I("d3d12",
                   "texture trace: %p view at 0x%llx: dimension %d, format %d, most detailed mip %u, mips %u, "

@@ -33,3 +33,25 @@ inline u32 gpu_tile_offset(u32 tile) {
 
 // Bytes of tiles in use and of the heaps holding them (memory reports).
 void gpu_tile_usage(u64* used, u64* reserved);
+
+// Small resources (a tile or less) placed 4 KiB apart inside tiles: desktop D3D12 lets textures whose
+// most detailed mip is that small use 4 KiB placement, where a tile of their own would mostly be
+// padding.
+#define GPU_SLOT_SIZE  KiB(4)
+#define GPU_TILE_SLOTS (GPU_TILE_SIZE / GPU_SLOT_SIZE)
+
+struct GpuSlots {
+    u32 tile;
+    u16 first; // slot in the tile
+    u16 count; // 0: none
+};
+
+// Consecutive slots for `size` bytes (at most a tile). False if VRAM runs out (the pool logged it).
+bool gpu_slots_alloc(u64 size, GpuSlots* out);
+// Slots a resource stopped using; handed out again once the GPU finished the work submitted before
+// this call.
+void gpu_slots_free(const GpuSlots& slots);
+// Where slots are: their heap and the offset in it.
+inline u64 gpu_slots_offset(const GpuSlots& s) {
+    return (u64)gpu_tile_offset(s.tile) * GPU_TILE_SIZE + (u64)s.first * GPU_SLOT_SIZE;
+}

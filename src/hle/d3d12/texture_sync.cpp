@@ -137,6 +137,31 @@ bool texture_sync_tiles(const D3D12_RESOURCE_DESC1& desc) {
     return texture_sync_tracks(desc) && !linear_layout(desc);
 }
 
+// The desktop texture's mips: the console texture's from ConsoleResource::first_mip on.
+static u32 desktop_mips(const ConsoleResource* r) {
+    return (r->desc.MipLevels ? r->desc.MipLevels : 1u) - r->first_mip;
+}
+
+// Where a texture's contents end in title memory: its whole layout, or for one holding mips from a
+// first one on (see ConsoleResource::first_mip), where those end (console layouts put small mips first).
+static u64 contents_end(const ConsoleResource* r, u64 size) {
+    if (!r->first_mip)
+        return r->gpu_address + size;
+    ConsoleTextureLayout layout;
+    if (!console_texture_layout(layout_desc(r->desc), &layout) || layout.plane_count != 1)
+        return r->gpu_address + size;
+    const ConsolePlaneLayout& p = layout.planes[0];
+    u32 slices = r->desc.DepthOrArraySize ? r->desc.DepthOrArraySize : 1u;
+    u64 end = 0;
+    for (u32 s = 0; s < slices; s++) {
+        for (u32 m = r->first_mip; m < layout.mip_levels; m++) {
+            u64 at = p.base_offset + (u64)s * p.slice_size + p.mips[m].offset + p.mips[m].size;
+            end = at > end ? at : end;
+        }
+    }
+    return r->gpu_address + end;
+}
+
 static u32 lower_bound(u64 start) {
     u32 lo = 0, hi = g_sync.count;
     while (lo < hi) {
@@ -171,7 +196,7 @@ void texture_sync_add(ConsoleResource* r) {
     // Its memory may hold the contents already; if it isn't mapped yet, the upload is skipped and the
     // mapping marks it again.
     g_sync.entries[at] = {
-        r->gpu_address, r->gpu_address + info.SizeInBytes, r, true, linear_layout(r->desc), nullptr, nullptr};
+        r->gpu_address, contents_end(r, info.SizeInBytes), r, true, linear_layout(r->desc), nullptr, nullptr};
     g_sync.count++;
     if (texture_sync_traced(r->desc)) {
         LOG_I(
@@ -384,7 +409,7 @@ static bool plan_texture(const ConsoleResource* r, const u32* mapped, Subresourc
                    d.Format);
         return false;
     }
-    u32 mips = d.MipLevels ? d.MipLevels : 1;
+    u32 mips = desktop_mips(r), first = r->first_mip; // desktop mip m is console mip first + m
     u32 slices = d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : d.DepthOrArraySize;
     *count = 0;
     for (u32 s = 0; s < slices; s++) {
@@ -394,8 +419,9 @@ static bool plan_texture(const ConsoleResource* r, const u32* mapped, Subresourc
             if (*count == capacity)
                 return false;
             SubresourceCopy& c = copies[(*count)++];
-            u32 w = (u32)(d.Width >> m), h = d.Height >> m;
-            u32 depth = d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? d.DepthOrArraySize >> m : 1;
+            u32 w = (u32)(d.Width >> (first + m)), h = d.Height >> (first + m);
+            u32 depth =
+                d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? d.DepthOrArraySize >> (first + m) : 1;
             w = w ? w : 1;
             h = h ? h : 1;
             depth = depth ? depth : 1;
@@ -494,7 +520,7 @@ static bool copy_from_title_memory(ID3D12GraphicsCommandList8* list, ConsoleReso
     GpuAddress window;
     if (!gpu_translate_current(r->gpu_address, size, &window))
         return false; // not one block of memory for the GPU
-    for (u32 m = 0; m < layout.mip_levels; m++) {
+    for (u32 m = r->first_mip; m < layout.mip_levels; m++) {
         u64 at = window.offset + p.base_offset + p.mips[m].offset;
         if (p.mips[m].swizzle_mode != 0 ||
             (!unrestricted && (at % D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT ||
@@ -508,13 +534,13 @@ static bool copy_from_title_memory(ID3D12GraphicsCommandList8* list, ConsoleReso
     keep_source(sources, window.buffer);
     keep_source(sources, texture);
     texture_barrier(list, texture, true);
-    for (u32 m = 0; m < layout.mip_levels; m++) {
+    for (u32 m = r->first_mip; m < layout.mip_levels; m++) {
         const ConsoleMipLayout& mip = p.mips[m];
         u32 w = (u32)(d.Width >> m), h = d.Height >> m;
         u32 bw = ((w ? w : 1) + console.block_width - 1) / console.block_width;
         u32 bh = ((h ? h : 1) + console.block_height - 1) / console.block_height;
         D3D12_TEXTURE_COPY_LOCATION dst = {texture, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
-        dst.SubresourceIndex = m;
+        dst.SubresourceIndex = m - r->first_mip;
         D3D12_TEXTURE_COPY_LOCATION src = {window.buffer, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
         src.PlacedFootprint.Offset = window.offset + p.base_offset + mip.offset;
         src.PlacedFootprint.Footprint = {format_desktop_resource(d.Format), bw * console.block_width,
@@ -554,11 +580,11 @@ static ConsoleSubresourceAddressing* make_addressing(const ConsoleResource* r, u
     u64 h = desc_hash(t);
     u32 slot = (u32)(h >> 40) % CHECKED_LAYOUTS;
     bool checked = g_checked[slot] == h;
-    u32 mips = layout.mip_levels;
+    u32 first = r->first_mip, mips = layout.mip_levels - first; // per desktop subresource
     for (u32 i = 0; i < count; i++) {
         // Each mip of the first slice is checked once per kind of texture.
         bool check = !checked && i < mips;
-        if (!console_subresource_addressing(t, layout, 0, i % mips, i / mips, &a[i], check)) {
+        if (!console_subresource_addressing(t, layout, 0, first + i % mips, i / mips, &a[i], check)) {
             LOG_W_ONCE("d3d12", "textures of format %d in layout 0x%x can't be detiled; they get no contents",
                        t.format, t.layout);
             free(a);
@@ -619,7 +645,7 @@ static void subresource_memory(const ConsolePlaneLayout& p, u32 mip, u32 slice, 
 // The tile groups of a reserved texture, none mapped yet; nullptr (logged) if it can't have any.
 static TextureTiles* make_tiles(const SyncEntry& e, ID3D12Resource* texture) {
     const D3D12_RESOURCE_DESC1& d = e.resource->desc;
-    u32 mips = d.MipLevels ? d.MipLevels : 1;
+    u32 mips = desktop_mips(e.resource), base_mip = e.resource->first_mip; // desktop mip m: console base_mip + m
     u32 slices = d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : d.DepthOrArraySize;
     u32 subresources = mips * slices;
     ConsoleTextureLayout layout;
@@ -673,9 +699,9 @@ static TextureTiles* make_tiles(const SyncEntry& e, ID3D12Resource* texture) {
             const ConsoleSubresourceAddressing& a = e.addressing[sub];
             bool paged = !a.linear && a.block_bytes_shift == 16 && (1u << a.block_shift[0]) == tw &&
                          (1u << a.block_shift[1]) == th && (1u << a.block_shift[2]) == td &&
-                         !p.mips[m].in_mip_tail;
+                         !p.mips[base_mip + m].in_mip_tail;
             u64 whole_start, whole_end;
-            subresource_memory(p, m, s, &whole_start, &whole_end);
+            subresource_memory(p, base_mip + m, s, &whole_start, &whole_end);
             for (u32 z = 0; z < st.DepthInTiles; z++) {
                 for (u32 y = 0; y < st.HeightInTiles; y++) {
                     for (u32 x = 0; x < st.WidthInTiles; x++) {
@@ -700,7 +726,7 @@ static TextureTiles* make_tiles(const SyncEntry& e, ID3D12Resource* texture) {
             u64 lo = ~0ull, hi = 0;
             for (u32 m = standard; m < mips; m++) {
                 u64 start, end;
-                subresource_memory(p, m, s, &start, &end);
+                subresource_memory(p, base_mip + m, s, &start, &end);
                 lo = start < lo ? start : lo;
                 hi = end > hi ? end : hi;
             }
@@ -800,7 +826,7 @@ static bool update_tiles(ID3D12CommandQueue* queue, TextureUploadSources* source
     for (u32 i = 0; i < t->group_count; i++) {
         TileGroup& g = t->groups[i];
         bool packed = g.count > 1 || g.at.Subresource % t->mips >= t->standard_mips;
-        bool viewed = packed || g.at.Subresource % t->mips >= first_mip;
+        bool viewed = packed || e.resource->first_mip + g.at.Subresource % t->mips >= first_mip;
         bool want = viewed && mem_is_mapped((const void*)(e.start + g.source), g.source_size);
         if (want != g.mapped) {
             u32* tiles = &t->tiles[g.first];
@@ -878,7 +904,7 @@ bool texture_sync_record(ID3D12CommandQueue* queue, ID3D12GraphicsCommandList8* 
             continue;
         }
         const D3D12_RESOURCE_DESC1& d = e.resource->desc;
-        u32 subresources = (d.MipLevels ? d.MipLevels : 1) *
+        u32 subresources = desktop_mips(e.resource) *
                            (d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : d.DepthOrArraySize);
         bool full = load_count == MAX_UPLOADS || (load_count && total >= UPLOAD_BUDGET) ||
                     copy_count + subresources > ARRAY_COUNT(s_copies);
@@ -993,7 +1019,7 @@ bool texture_sync_record(ID3D12CommandQueue* queue, ID3D12GraphicsCommandList8* 
                     D3D12_BARRIER_SYNC_COMPUTE_SHADING, D3D12_BARRIER_ACCESS_UNORDERED_ACCESS);
     for (u32 l = 0; l < load_count; l++) {
         const Load& ld = loads[l];
-        u32 mips = ld.entry->resource->desc.MipLevels ? ld.entry->resource->desc.MipLevels : 1;
+        u32 mips = desktop_mips(ld.entry->resource);
         for (u32 k = 0; k < ld.count; k++) {
             const SubresourceCopy& c = s_copies[ld.first + k];
             gpu_untile(list, ld.source, ld.entry->addressing[c.slice * mips + c.mip],
@@ -1006,7 +1032,7 @@ bool texture_sync_record(ID3D12CommandQueue* queue, ID3D12GraphicsCommandList8* 
     for (u32 l = 0; l < load_count; l++) {
         const Load& ld = loads[l];
         const D3D12_RESOURCE_DESC1& d = ld.entry->resource->desc;
-        u32 mips = d.MipLevels ? d.MipLevels : 1;
+        u32 mips = desktop_mips(ld.entry->resource);
         texture_barrier(list, ld.texture, true);
         for (u32 k = 0; k < ld.count; k++) {
             const SubresourceCopy& c = s_copies[ld.first + k];

@@ -75,9 +75,14 @@ bool console_texture_loses_uav(const D3D12_RESOURCE_DESC1& desc) {
 }
 
 // The desktop description of a console texture.
-static D3D12_RESOURCE_DESC1 desktop_texture_desc(const D3D12_RESOURCE_DESC1& console) {
+static D3D12_RESOURCE_DESC1 desktop_texture_desc(const D3D12_RESOURCE_DESC1& console, u32 first_mip) {
     D3D12_RESOURCE_DESC1 desc = console;
     desc.Alignment = 0;
+    if (first_mip) { // from that mip on (see ConsoleResource::first_mip; 2D textures only)
+        desc.Width = desc.Width >> first_mip ? desc.Width >> first_mip : 1;
+        desc.Height = desc.Height >> first_mip ? desc.Height >> first_mip : 1;
+        desc.MipLevels = (u16)(desc.MipLevels - first_mip);
+    }
     desc.Format = format_desktop_resource(console.Format);
     desc.Layout = desktop_texture_layout(desc.Layout);
     desc.Flags = (D3D12_RESOURCE_FLAGS)(desc.Flags & k_desktop_resource_flags);
@@ -139,8 +144,36 @@ static ID3D12Resource* create_reserved_texture(ConsoleResource* r, const D3D12_R
     return texture;
 }
 
+// Textures the GPU only reads whose most detailed mip is small take 4 KiB slots of the tile pool, not a
+// 64 KiB tile or more. nullptr where that can't be.
+static ID3D12Resource* create_small_texture(ConsoleResource* r, const D3D12_RESOURCE_DESC1& desc,
+                                            D3D12_BARRIER_LAYOUT layout) {
+    if (!texture_sync_tracks(r->desc))
+        return nullptr;
+    D3D12_RESOURCE_DESC1 placed = desc;
+    placed.Alignment = D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT;
+    D3D12_RESOURCE_ALLOCATION_INFO info = gpu_device()->GetResourceAllocationInfo2(0, 1, &placed, nullptr);
+    if (info.Alignment != D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT || info.SizeInBytes > GPU_TILE_SIZE)
+        return nullptr;
+    GpuSlots slots;
+    if (!gpu_slots_alloc(info.SizeInBytes, &slots))
+        return nullptr;
+    ID3D12Resource* texture = nullptr;
+    HRESULT hr = gpu_device()->CreatePlacedResource2(gpu_tile_heap(slots.tile), gpu_slots_offset(slots), &placed,
+                                                     layout, nullptr, 0, nullptr, IID_PPV_ARGS(&texture));
+    if (FAILED(hr)) {
+        gpu_slots_free(slots);
+        if (!gpu_device_lost(hr))
+            LOG_W_ONCE("d3d12", "cannot place a placed texture (0x%08lx); making it the usual way",
+                       (unsigned long)hr);
+        return nullptr;
+    }
+    r->slots = slots;
+    return texture;
+}
+
 static ID3D12Resource* create_texture(ConsoleResource* r) {
-    D3D12_RESOURCE_DESC1 desc = desktop_texture_desc(r->desc);
+    D3D12_RESOURCE_DESC1 desc = desktop_texture_desc(r->desc, r->first_mip);
     if (desc.Format == DXGI_FORMAT_UNKNOWN) {
         LOG_E("d3d12", "texture at 0x%llx has format %d, which desktop D3D12 has no equivalent for",
               r->gpu_address, r->desc.Format);
@@ -159,11 +192,13 @@ static ID3D12Resource* create_texture(ConsoleResource* r) {
     D3D12_BARRIER_LAYOUT layout = console_texture_layout(
         r, r->initial_layout == D3D12_BARRIER_LAYOUT_UNDEFINED ? D3D12_BARRIER_LAYOUT_COMMON
                                                                : r->initial_layout);
-    texture = create_reserved_texture(r, desc, layout);
+    texture = create_small_texture(r, desc, layout);
+    if (!texture)
+        texture = create_reserved_texture(r, desc, layout);
     if (texture) {
-        gpu_set_name(texture, "reserved texture at 0x%llx (dim %d, %llux%ux%u, format %d)", r->gpu_address,
-                     r->desc.Dimension, r->desc.Width, r->desc.Height, r->desc.DepthOrArraySize,
-                     r->desc.Format);
+        gpu_set_name(texture, "%s texture at 0x%llx (dim %d, %llux%ux%u, format %d, from mip %u)",
+                     r->reserved ? "reserved" : "small", r->gpu_address, r->desc.Dimension, r->desc.Width,
+                     r->desc.Height, r->desc.DepthOrArraySize, r->desc.Format, r->first_mip);
         count_texture(r, desc);
         return texture;
     }
@@ -249,6 +284,7 @@ static void resource_destroy(void* object) {
         texture_sync_remove(r);
     uncount_texture(r);
     gpu_retire(r->texture);
+    gpu_slots_free(r->slots); // handed out again once the GPU is done with the texture
     if (r->owned_memory)
         xmem_free(r->owned_memory, r->owned_attributes);
 }
@@ -348,7 +384,8 @@ void console_resource_init() {
 // Creates the object for a resource at `gpu_address`; the caller hands it to the title.
 static ConsoleResource* new_resource(u64 gpu_address, const D3D12_RESOURCE_DESC1* desc,
                                      const D3D12_HEAP_PROPERTIES& heap, D3D12_HEAP_FLAGS heap_flags,
-                                     D3D12_BARRIER_LAYOUT initial_layout, const D3D12_CLEAR_VALUE* clear) {
+                                     D3D12_BARRIER_LAYOUT initial_layout, const D3D12_CLEAR_VALUE* clear,
+                                     u32 first_mip = 0) {
     ConsoleResource* r = (ConsoleResource*)console_alloc(sizeof(ConsoleResource), &k_resource_class,
                                                          g_resource_table, nullptr);
     r->desc = *desc;
@@ -361,6 +398,7 @@ static ConsoleResource* new_resource(u64 gpu_address, const D3D12_RESOURCE_DESC1
         r->clear_value = *clear;
     }
     InitializeSRWLock(&r->lock);
+    r->first_mip = first_mip;
     if (texture_sync_tracks(r->desc))
         texture_sync_add(r);
     else if (texture_sync_traced(r->desc))
@@ -463,16 +501,34 @@ static void forget_placed_texture(ConsoleResource* r) {
     ReleaseSRWLockExclusive(&g_placed.lock);
 }
 
-ConsoleResource* console_placed_texture(u64 gpu_address, const D3D12_RESOURCE_DESC1& desc) {
+// The first mip a desktop texture of `desc` can start at, at most `wanted`: 2D textures only, and the
+// smaller texture must be a valid desktop one (block compressed formats need whole blocks).
+static u32 placed_first_mip(const D3D12_RESOURCE_DESC1& desc, u32 wanted) {
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || !desc.MipLevels)
+        return 0;
+    FormatInfo f = format_info(format_desktop_resource(desc.Format));
+    u32 bw = f.block_width ? f.block_width : 1, bh = f.block_height ? f.block_height : 1;
+    u32 k = wanted < desc.MipLevels ? wanted : desc.MipLevels - 1u;
+    for (; k > 0; k--) {
+        u64 w = desc.Width >> k;
+        u32 h = desc.Height >> k;
+        if (w && h && w % bw == 0 && h % bh == 0)
+            break;
+    }
+    return k;
+}
+
+ConsoleResource* console_placed_texture(u64 gpu_address, const D3D12_RESOURCE_DESC1& desc, u32 wanted_first_mip) {
     D3D12_RESOURCE_ALLOCATION_INFO info = console_resource_allocation_info(desc);
     if (!gpu_address || info.SizeInBytes == UINT64_MAX)
         return nullptr;
+    u32 first_mip = placed_first_mip(desc, wanted_first_mip);
     AcquireSRWLockExclusive(&g_placed.lock);
     u32 at = placed_lower_bound(gpu_address);
     for (u32 i = at; i < g_placed.count && g_placed.entries[i]->gpu_address == gpu_address; i++) {
         ConsoleResource* r = g_placed.entries[i];
         // One being destroyed (its last slot was just rewritten) is left to go.
-        if (same_texture(r->desc, desc) && console_try_add_ref(r)) {
+        if (same_texture(r->desc, desc) && r->first_mip == first_mip && console_try_add_ref(r)) {
             ReleaseSRWLockExclusive(&g_placed.lock);
             texture_sync_mark(gpu_address, info.SizeInBytes);
             return r;
@@ -492,8 +548,8 @@ ConsoleResource* console_placed_texture(u64 gpu_address, const D3D12_RESOURCE_DE
     }
     D3D12_HEAP_PROPERTIES heap = {D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
                                   D3D12_MEMORY_POOL_UNKNOWN, 1, 1};
-    ConsoleResource* r =
-        new_resource(gpu_address, &desc, heap, D3D12_HEAP_FLAG_NONE, D3D12_BARRIER_LAYOUT_COMMON, nullptr);
+    ConsoleResource* r = new_resource(gpu_address, &desc, heap, D3D12_HEAP_FLAG_NONE, D3D12_BARRIER_LAYOUT_COMMON,
+                                      nullptr, first_mip);
     r->placed_view = true;
     r->view_first_mip = 0xFFFFFFFFu;
     r->view_min_lod = 1e30f;
@@ -539,7 +595,9 @@ static TextureKind texture_kind(const ConsoleResource* r) {
 static void count_texture(ConsoleResource* r, const D3D12_RESOURCE_DESC1& desktop_desc) {
     // Reserved textures take tiles, which the tile pool counts.
     D3D12_RESOURCE_ALLOCATION_INFO desktop = {};
-    if (!r->reserved)
+    if (r->slots.count)
+        desktop.SizeInBytes = (u64)r->slots.count * GPU_SLOT_SIZE;
+    else if (!r->reserved)
         desktop = gpu_device()->GetResourceAllocationInfo2(0, 1, &desktop_desc, nullptr);
     D3D12_RESOURCE_ALLOCATION_INFO console = console_resource_allocation_info(r->desc);
     AcquireSRWLockExclusive(&g_textures.lock);
