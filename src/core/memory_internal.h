@@ -34,6 +34,7 @@ struct RangeSlot {
 // Placeholder ranges lay their frames out in regions of real memory, one per slice of this many
 // pages (see preferred_real). Chunks hold several regions.
 #define REGION_PAGES 512u
+#define HOST_PAGE    4096u // the host page size, the grain of protection
 #define MAX_REGIONS  (MAX_CHUNKS * (MEM_CHUNK_PAGES / REGION_PAGES))
 
 // Title commits at least this large are committed lazily, this much at a time.

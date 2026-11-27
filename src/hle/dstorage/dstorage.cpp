@@ -652,6 +652,10 @@ void ConsoleQueue::send(const ConsoleRequest* r) {
         for (u64 i = 0; i < pages; i++) {
             u64 vas[8];
             u32 n = mem_frame_addresses(r->destination_pages[i], vas, ARRAY_COUNT(vas));
+            // Frames the GPU holds the newer copy of (taken pages) come back before our view writes
+            // part of them; one address showing a frame does that for all of them.
+            if (n)
+                mem_end_write_watches((const void*)vas[0], CONSOLE_PAGE_SIZE);
             for (u32 k = 0; k < n && k < ARRAY_COUNT(vas); k++)
                 add_write(vas[k], CONSOLE_PAGE_SIZE);
         }

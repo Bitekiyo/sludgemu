@@ -19,7 +19,6 @@
 #include "core/memory_internal.h"
 
 #define CANON_FRAME      (1ull << 62) // canonical addresses of physical memory: frame ID and offset
-#define HOST_PAGE        4096u
 #define FRAME_HOST_PAGES (MEM_PAGE_SIZE / HOST_PAGE)
 #define GRANULE_SHIFT    16 // granules of the watch index: one frame, or 64 KiB of other memory
 #define NO_NODE          0xFFFFFFFFu

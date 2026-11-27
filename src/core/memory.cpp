@@ -201,14 +201,13 @@ static bool chunks_have_room() {
     return capacity - g_mem.bound_real > capacity / 8;
 }
 
-// Claims a region that has no real frame bound and no range slice preferring it, for a slice: in
-// chunks that exist already, or in a new chunk once those are nearly full (slices often use little
-// of their region, so holes in claimed regions are filled first; see find_free_real). Returns its
-// first real frame, or MEM_INVALID_PFN. phys_lock held.
+// Claims a region that has no real frame bound and no range slice preferring it, for a slice: first
+// in chunks that exist already, which keeps commit charge close to what is used. Returns its first
+// real frame, or MEM_INVALID_PFN. phys_lock held.
 static u32 claim_free_region() {
     const u32 regions = (u32)(g_mem.total_pages / REGION_PAGES);
     const u32 per_chunk = (u32)(MEM_CHUNK_PAGES / REGION_PAGES);
-    for (int pass = 0; pass < (chunks_have_room() ? 1 : 2); pass++) {
+    for (int pass = 0; pass < 2; pass++) {
         for (u32 r = 0; r < regions; r++) {
             bool created = g_mem.chunks[r / per_chunk] != nullptr;
             if (g_mem.region_claimed[r] || created != (pass == 0))
@@ -785,7 +784,17 @@ void* mem_alloc_virtual(void* base, u64 size, u32 alloc_type, u32 protect, const
         MemRange r;
         if (mem_query_range(base, &r) && (r.flags & MEM_RANGE_SECTION))
             protect = r.protect;
+        // Committing pages already committed resets their protection: tracking protects them again,
+        // under the range lock so that no access sees them in between.
+        AcquireSRWLockExclusive(&g_mem.range_lock);
         p = VirtualAlloc(base, size, alloc_type, protect);
+        RangeSlot* s = p && (alloc_type & MEM_COMMIT) ? find_range_locked(base) : nullptr;
+        if (s && !(s->info.flags & MEM_RANGE_PLACEHOLDER)) {
+            u64 lo = ALIGN_DOWN((u64)base, (u64)HOST_PAGE), hi = ALIGN_UP((u64)base + size, (u64)HOST_PAGE);
+            u64 end = (u64)s->info.base + s->info.size;
+            tracking_committed(s, lo, hi < end ? hi : end);
+        }
+        ReleaseSRWLockExclusive(&g_mem.range_lock);
     } else {
         MEM_ADDRESS_REQUIREMENTS req;
         fill_address_requirements(limits, &req);
@@ -819,6 +828,11 @@ static bool frame_allocated(u64 pfn) {
 // blocks across them. Without a region to claim, a page follows its predecessor. Range lock and
 // phys_lock held.
 static u32 preferred_real(RangeSlot* s, u32 page, u32 previous) {
+    // Only memory the GPU reads in place needs this: a window over title memory is one block of real
+    // memory (GPU-visible memory the CPU can access; the page tables serve the rest, and CPU-only
+    // views don't need it). Other frames fill holes in the chunks there are (find_free_real).
+    if ((s->info.flags & (MEM_RANGE_GPU | MEM_RANGE_CPU_ACCESS)) != (MEM_RANGE_GPU | MEM_RANGE_CPU_ACCESS))
+        return MEM_INVALID_PFN;
     u32 slice = page / REGION_PAGES;
     if (s->anchors[slice] == MEM_INVALID_PFN)
         s->anchors[slice] = claim_free_region();
