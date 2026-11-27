@@ -552,7 +552,6 @@ ConsoleResource* console_placed_texture(u64 gpu_address, const D3D12_RESOURCE_DE
                                       nullptr, first_mip);
     r->placed_view = true;
     r->view_first_mip = 0xFFFFFFFFu;
-    r->view_min_lod = 1e30f;
     memmove(&g_placed.entries[at + 1], &g_placed.entries[at],
             (g_placed.count - at) * sizeof(ConsoleResource*));
     g_placed.entries[at] = r;
@@ -654,64 +653,7 @@ struct TextureSpan {
     u64 end;
     u64 desktop_bytes;
     TextureKind kind;
-    const ConsoleResource* resource; // only compared: it may be gone by the time the report runs
-    D3D12_RESOURCE_DESC1 desc;
-    u32 view_first_mip;
-    f32 view_min_lod;
 };
-
-// SLUDGE_TEXTURE_LIST=<path>: each report also writes the live textures there as CSV (diagnostics: how
-// textures overlap, what takes tiles).
-static void write_texture_list(const TextureSpan* spans, u32 count) {
-    static char path[MAX_PATH];
-    static volatile long checked = 0;
-    if (log_once_flag(&checked)) {
-        DWORD n = GetEnvironmentVariableA("SLUDGE_TEXTURE_LIST", path, sizeof(path));
-        if (!n || n >= sizeof(path))
-            path[0] = 0;
-    }
-    if (!path[0])
-        return;
-    FILE* f = nullptr;
-    if (fopen_s(&f, path, "w") != 0 || !f)
-        return;
-    fprintf(f, "kind,start,bytes,tiles,dimension,width,height,depth,mips,format,flags,view_mip,view_lod,"
-               "mip_offsets\n");
-    for (u32 i = 0; i < count; i++) {
-        const TextureSpan& t = spans[i];
-        fprintf(f, "%d,0x%llx,%llu,%u,%d,%llu,%u,%u,%u,%d,0x%x,%d,%g,", t.kind, t.start, t.end - t.start,
-                texture_sync_tiles_held(t.start, t.resource), t.desc.Dimension, t.desc.Width, t.desc.Height,
-                t.desc.DepthOrArraySize, t.desc.MipLevels, t.desc.Format, t.desc.Flags, (s32)t.view_first_mip,
-                t.view_min_lod > 1e29f ? -1.0f : t.view_min_lod);
-        // Where each mip's title memory starts and how big it is: offset+size;...
-        ConsoleTextureLayout layout;
-        if (console_texture_layout(texture_layout_desc(t.desc), &layout) && layout.plane_count >= 1) {
-            const ConsolePlaneLayout& p = layout.planes[0];
-            for (u32 m = 0; m < layout.mip_levels && m < CONSOLE_MAX_MIPS; m++)
-                fprintf(f, "%s%llu+%llu", m ? ";" : "", p.base_offset + p.mips[m].offset, p.mips[m].size);
-        }
-        fprintf(f, "\n");
-    }
-    fclose(f);
-}
-
-// Committed memory of this process by kind, from a walk of its address space: private memory inside and
-// outside title ranges, private write-combined memory (where Windows charges video memory allocations)
-// and mapped (section) memory.
-static void committed_memory(u64* title_private, u64* other_private, u64* video, u64* mapped) {
-    *title_private = *other_private = *video = *mapped = 0;
-    MEMORY_BASIC_INFORMATION m;
-    for (const u8* p = nullptr; VirtualQuery(p, &m, sizeof(m)); p = (const u8*)m.BaseAddress + m.RegionSize) {
-        if (m.State != MEM_COMMIT)
-            continue;
-        if (m.Type == MEM_MAPPED)
-            *mapped += m.RegionSize;
-        else if (m.Type == MEM_PRIVATE && mem_is_tracked(m.BaseAddress))
-            *title_private += m.RegionSize;
-        else if (m.Type == MEM_PRIVATE)
-            *((m.Protect & PAGE_WRITECOMBINE) ? video : other_private) += m.RegionSize;
-    }
-}
 
 static int compare_spans(const void* a, const void* b) {
     const TextureSpan* x = (const TextureSpan*)a;
@@ -741,8 +683,7 @@ void console_memory_report(const char* why) {
     TextureSpan* spans = (TextureSpan*)malloc((count ? count : 1) * sizeof(TextureSpan));
     for (u32 i = 0; spans && i < count; i++) {
         const ConsoleResource* r = g_textures.live[i];
-        spans[i] = {r->gpu_address, r->gpu_address + r->console_bytes, r->desktop_bytes, texture_kind(r), r, r->desc,
-                    r->placed_view ? r->view_first_mip : 0xFFFFFFFFu, r->placed_view ? r->view_min_lod : 1e30f};
+        spans[i] = {r->gpu_address, r->gpu_address + r->console_bytes, r->desktop_bytes, texture_kind(r)};
     }
     ReleaseSRWLockShared(&g_textures.lock);
 
@@ -776,37 +717,21 @@ void console_memory_report(const char* why) {
         (u64)process.WorkingSetSize >> 20, ((u64)mem_physical_chunks_created() * MEM_CHUNK_SIZE) >> 20,
         (mem_physical_bound_pages() << MEM_PAGE_SHIFT) >> 20, chunk_windows >> 20, block_windows >> 20,
         replaced_windows >> 20, page_table_tiles >> 20, downloads);
-    u64 title_private = 0, other_private = 0, video_private = 0, mapped_views = 0;
-    committed_memory(&title_private, &other_private, &video_private, &mapped_views);
-    LOG_I("d3d12",
-          "memory:   committed in this process's address space: private %llu MiB in title memory, %llu MiB "
-          "write-combined (video memory), %llu MiB other; mapped views %llu MiB",
-          title_private >> 20, video_private >> 20, other_private >> 20, mapped_views >> 20);
     if (!spans)
         return;
 
     // Per kind: what the desktop textures take, the title memory they describe, how much of that is
     // distinct (aliased textures share it) and how much the title has mapped.
     qsort(spans, count, sizeof(TextureSpan), compare_spans);
-    write_texture_list(spans, count);
     for (u32 i = 0; i < count;) {
         TextureKind kind = spans[i].kind;
-        u32 textures = 0, small_count = 0;
-        u64 desktop = 0, console = 0, distinct = 0, mapped = 0, bound = 0, tiles_held = 0, small_tiles = 0;
-        u64 small_console = 0;
+        u32 textures = 0;
+        u64 desktop = 0, console = 0, distinct = 0, mapped = 0, bound = 0;
         u64 run_start = spans[i].start, run_end = spans[i].start;
         for (; i < count && spans[i].kind == kind; i++) {
             textures++;
             desktop += spans[i].desktop_bytes;
             console += spans[i].end - spans[i].start;
-            // Tiles of reserved textures; small textures (under a tile of title memory) take a whole one.
-            u64 held = (u64)texture_sync_tiles_held(spans[i].start, spans[i].resource) * GPU_TILE_SIZE;
-            tiles_held += held;
-            if (held && spans[i].end - spans[i].start < GPU_TILE_SIZE) {
-                small_count++;
-                small_tiles += held;
-                small_console += spans[i].end - spans[i].start;
-            }
             if (spans[i].start > run_end) {
                 distinct += run_end - run_start;
                 mapped += mapped_bytes(run_start, run_end);
@@ -819,11 +744,10 @@ void console_memory_report(const char* why) {
         mapped += mapped_bytes(run_start, run_end);
         bound += mem_physical_bound_pages_at((const void*)run_start, run_end - run_start);
         LOG_I("d3d12",
-              "memory:   %s: %u, %llu MiB as whole desktop textures, %llu MiB of tiles (%u small ones under "
-              "a tile of title memory: %llu MiB of tiles for %llu MiB); %llu MiB of title memory, %llu MiB "
+              "memory:   %s: %u, %llu MiB as whole desktop textures; %llu MiB of title memory, %llu MiB "
               "distinct, %llu MiB mapped (%llu MiB bound to system memory)",
-              k_texture_kind_names[kind], textures, desktop >> 20, tiles_held >> 20, small_count, small_tiles >> 20,
-              small_console >> 20, console >> 20, distinct >> 20, mapped >> 20, (bound << MEM_PAGE_SHIFT) >> 20);
+              k_texture_kind_names[kind], textures, desktop >> 20, console >> 20, distinct >> 20,
+              mapped >> 20, (bound << MEM_PAGE_SHIFT) >> 20);
     }
     free(spans);
 }

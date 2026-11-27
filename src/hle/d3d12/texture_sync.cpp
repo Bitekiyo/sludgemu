@@ -247,24 +247,6 @@ void texture_sync_remove(ConsoleResource* r) {
     mem_unwatch_writes((const void*)start, size); // its memory needn't stay protected
 }
 
-ConsoleTextureDesc texture_layout_desc(const D3D12_RESOURCE_DESC1& desc) {
-    return layout_desc(desc);
-}
-
-static u32 tiles_held(const TextureTiles* t);
-
-u32 texture_sync_tiles_held(u64 start, const ConsoleResource* r) {
-    u32 held = 0;
-    AcquireSRWLockShared(&g_sync.lock);
-    for (u32 i = lower_bound(start); i < g_sync.count && g_sync.entries[i].start == start; i++) {
-        const SyncEntry& e = g_sync.entries[i];
-        if (e.resource == r && e.tiles)
-            held += tiles_held(e.tiles);
-    }
-    ReleaseSRWLockShared(&g_sync.lock);
-    return held;
-}
-
 void texture_sync_mark(u64 address, u64 size) {
     u64 end = address + size;
     AcquireSRWLockExclusive(&g_sync.lock);
@@ -619,13 +601,6 @@ struct TextureTiles {
     u32* mapped;       // per subresource: how many of its groups are mapped
     TileGroup groups[1];
 };
-
-static u32 tiles_held(const TextureTiles* t) {
-    u32 held = 0;
-    for (u32 i = 0; i < t->group_count; i++)
-        held += t->groups[i].mapped ? t->groups[i].count : 0;
-    return held;
-}
 
 static void free_tiles(TextureTiles* t) {
     if (!t)

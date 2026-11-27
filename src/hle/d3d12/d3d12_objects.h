@@ -303,11 +303,10 @@ struct ConsoleResource {
     u64 console_bytes;
 
     bool placed_view; // made for views of placed memory, never seen by the title (console_placed_texture)
-    // The most detailed mip and the smallest LOD clamp its shader resource views have asked for. Titles
-    // streaming textures view only the mips they have loaded: the memory of those before (larger mips,
-    // last in console layouts) belongs to other textures, so it takes no tiles (texture_sync).
+    // The most detailed mip its shader resource views have asked for. Titles streaming textures view only
+    // the mips they have loaded: the memory of those before (larger mips, last in console layouts) belongs
+    // to other textures, so it takes no tiles (texture_sync).
     volatile u32 view_first_mip; // 0xFFFFFFFF until a view (0 for textures the title made itself)
-    volatile f32 view_min_lod;   // 1e30 until a view
 };
 
 void console_resource_init();

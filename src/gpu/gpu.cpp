@@ -88,7 +88,7 @@ static void route_debug_messages(ID3D12Device* device) {
 //
 // A removed device completes every fence with UINT64_MAX. Waiting for that on a fence of our own
 // reports the removal once, from wherever it happened, with DRED's account of the GPU's last work
-// when that is enabled (GpuOptions::dred).
+// with the debug layer.
 
 static ID3D12Fence* g_removal_fence = nullptr;
 static HANDLE g_removal_event = nullptr;
@@ -133,7 +133,7 @@ static void report_removal() {
         return;
     LOG_E("gpu", "the D3D12 device was removed (reason 0x%08lx)",
           (unsigned long)g_device->GetDeviceRemovedReason());
-    if (g_options.dred)
+    if (g_options.debug_layer)
         log_dred(g_device);
 }
 
@@ -172,7 +172,7 @@ static BOOL CALLBACK create_device(PINIT_ONCE, void*, void**) {
             LOG_W("gpu", "D3D12 debug layer requested but unavailable");
         }
     }
-    if (g_options.dred) {
+    if (g_options.debug_layer) {
         // Breadcrumbs and page fault reports, for explaining device removals.
         ID3D12DeviceRemovedExtendedDataSettings1* dred = nullptr;
         if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dred)))) {

@@ -515,23 +515,18 @@ static D3D12_UNORDERED_ACCESS_VIEW_DESC whole_buffer_uav(const ConsoleResource* 
 // Failed views leave a null descriptor of the same kind rather than a stale one.
 // The desktop texture a shader resource view of `r` reads, with the view's format made desktop's; or
 // nullptr with `d` made a null view.
-// Notes the mips a view of `r` reads (memory reports). Views of 2D textures only (the common case).
+// Notes the most detailed mip a view of `r` reads (see ConsoleResource::view_first_mip). Views of 2D
+// textures only (the common case).
 static void note_view_mips(ConsoleResource* r, const D3D12_SHADER_RESOURCE_VIEW_DESC& d) {
     u32 mip = 0;
-    f32 lod = 0.0f;
-    if (d.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D) {
+    if (d.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D)
         mip = d.Texture2D.MostDetailedMip;
-        lod = d.Texture2D.ResourceMinLODClamp;
-    } else if (d.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY) {
+    else if (d.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY)
         mip = d.Texture2DArray.MostDetailedMip;
-        lod = d.Texture2DArray.ResourceMinLODClamp;
-    } else {
+    else
         return;
-    }
     // Views of one texture are made by one thread at a time in practice; a lost update only leaves a
     // larger mip without tiles until the next view.
-    if (lod < r->view_min_lod)
-        r->view_min_lod = lod;
     if (mip < r->view_first_mip) {
         bool viewed_before = r->view_first_mip != 0xFFFFFFFFu;
         r->view_first_mip = mip;

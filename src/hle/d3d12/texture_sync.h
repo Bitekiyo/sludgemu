@@ -1,6 +1,5 @@
 #pragma once
 
-#include "gpu/console_layout.h"
 #include "gpu/gpu_ring.h"
 #include "hle/d3d12/d3d12_objects.h"
 
@@ -43,11 +42,7 @@ bool texture_sync_tiles(const D3D12_RESOURCE_DESC1& desc);
 
 void texture_sync_add(ConsoleResource* r);
 void texture_sync_remove(ConsoleResource* r);
-// Tiles the reserved texture of `r` (at title address `start`) holds now; 0 for others (memory reports,
-// `r` is only compared, so it may be gone).
-u32 texture_sync_tiles_held(u64 start, const ConsoleResource* r);
-// The console layout description of a texture description (console_texture_layout).
-ConsoleTextureDesc texture_layout_desc(const D3D12_RESOURCE_DESC1& desc);
+
 
 // Title memory [address, address + size) has new contents. Mapping changes call this themselves.
 void texture_sync_mark(u64 address, u64 size);
