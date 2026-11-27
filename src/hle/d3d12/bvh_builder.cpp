@@ -8,6 +8,8 @@
 // shaders are translated. Postbuild information is still written, as the sizes the title will act
 // on (it allocates compacted copies from them).
 
+#include <stdlib.h>
+
 #include "common/log.h"
 #include "hle/d3d12/d3d12_objects.h"
 #include "hle/hle.h"
@@ -57,7 +59,29 @@ static void prebuild_info(const BvhBuilder* self,
     }
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS d = *inputs;
     d.Flags = (D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAGS)(d.Flags & DESKTOP_BUILD_FLAGS);
+    // Console titles name index formats by their typeless formats; desktop wants the integer ones.
+    D3D12_RAYTRACING_GEOMETRY_DESC* geometries = nullptr;
+    if (d.Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL && d.NumDescs) {
+        geometries = (D3D12_RAYTRACING_GEOMETRY_DESC*)malloc(d.NumDescs * sizeof(*geometries));
+        if (!geometries) {
+            *info = {};
+            return;
+        }
+        for (u32 i = 0; i < d.NumDescs; i++) {
+            D3D12_RAYTRACING_GEOMETRY_DESC& g = geometries[i];
+            g = d.DescsLayout == D3D12_ELEMENTS_LAYOUT_ARRAY ? d.pGeometryDescs[i] : *d.ppGeometryDescs[i];
+            if (g.Type != D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES)
+                continue;
+            if (g.Triangles.IndexFormat == DXGI_FORMAT_R16_TYPELESS)
+                g.Triangles.IndexFormat = DXGI_FORMAT_R16_UINT;
+            else if (g.Triangles.IndexFormat == DXGI_FORMAT_R32_TYPELESS)
+                g.Triangles.IndexFormat = DXGI_FORMAT_R32_UINT;
+        }
+        d.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+        d.pGeometryDescs = geometries;
+    }
     self->device->GetRaytracingAccelerationStructurePrebuildInfo(&d, info);
+    free(geometries);
 }
 
 static void bvh_get_prebuild_info(BvhBuilder* self,

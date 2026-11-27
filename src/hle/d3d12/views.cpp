@@ -152,6 +152,10 @@ struct BufferView {
 static BufferView buffer_view(u64 buffer_address, u64 first_element, u32 num_elements, DXGI_FORMAT format,
                               u32 structure_stride, bool raw, GpuAccess access) {
     BufferView v = {};
+    // An empty view reaches nothing, as a null view does; desktop D3D12 has no empty views (and the
+    // driver removes the device for one).
+    if (!num_elements)
+        return v;
     u32 element_bytes = buffer_element_bytes(format, structure_stride, raw);
     if (element_bytes == 0) {
         LOG_E("d3d12", "buffer view of 0x%llx with an unsupported format", buffer_address);
