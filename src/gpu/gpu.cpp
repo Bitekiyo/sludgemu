@@ -88,7 +88,7 @@ static void route_debug_messages(ID3D12Device* device) {
 //
 // A removed device completes every fence with UINT64_MAX. Waiting for that on a fence of our own
 // reports the removal once, from wherever it happened, with DRED's account of the GPU's last work
-// when the debug layer is on.
+// when that is enabled (GpuOptions::dred).
 
 static ID3D12Fence* g_removal_fence = nullptr;
 static HANDLE g_removal_event = nullptr;
@@ -105,8 +105,9 @@ static void log_dred(ID3D12Device* device) {
             u32 done = n->pLastBreadcrumbValue ? *n->pLastBreadcrumbValue : 0;
             if (done >= n->BreadcrumbCount)
                 continue;
-            LOG_E("gpu", "  list %p on queue %p stopped after %u of %u operations:", n->pCommandList,
-                  n->pCommandQueue, done, n->BreadcrumbCount);
+            LOG_E("gpu", "  list %p (%ls) on queue %p (%ls) stopped after %u of %u operations:", n->pCommandList,
+                  n->pCommandListDebugNameW ? n->pCommandListDebugNameW : L"", n->pCommandQueue,
+                  n->pCommandQueueDebugNameW ? n->pCommandQueueDebugNameW : L"", done, n->BreadcrumbCount);
             u32 from = done > 4 ? done - 4 : 0;
             for (u32 i = from; i < n->BreadcrumbCount && i <= done + 2; i++)
                 LOG_E("gpu", "    %s operation %u: %d", i == done ? ">" : " ", i, (int)n->pCommandHistory[i]);
@@ -116,10 +117,11 @@ static void log_dred(ID3D12Device* device) {
     if (SUCCEEDED(dred->GetPageFaultAllocationOutput1(&fault)) && fault.PageFaultVA) {
         LOG_E("gpu", "  page fault at GPU address 0x%llx", fault.PageFaultVA);
         for (const D3D12_DRED_ALLOCATION_NODE1* a = fault.pHeadExistingAllocationNode; a; a = a->pNext)
-            LOG_E("gpu", "    allocation there: type %d %p", (int)a->AllocationType, a->pObject);
+            LOG_E("gpu", "    allocation there: type %d %p (%ls)", (int)a->AllocationType, a->pObject,
+                  a->ObjectNameW ? a->ObjectNameW : L"");
         for (const D3D12_DRED_ALLOCATION_NODE1* a = fault.pHeadRecentFreedAllocationNode; a; a = a->pNext)
-            LOG_E("gpu", "    allocation freed there recently: type %d %p", (int)a->AllocationType,
-                  a->pObject);
+            LOG_E("gpu", "    allocation freed there recently: type %d %p (%ls)", (int)a->AllocationType,
+                  a->pObject, a->ObjectNameW ? a->ObjectNameW : L"");
     }
     dred->Release();
 }
@@ -131,7 +133,7 @@ static void report_removal() {
         return;
     LOG_E("gpu", "the D3D12 device was removed (reason 0x%08lx)",
           (unsigned long)g_device->GetDeviceRemovedReason());
-    if (g_options.debug_layer)
+    if (g_options.dred)
         log_dred(g_device);
 }
 
@@ -169,12 +171,17 @@ static BOOL CALLBACK create_device(PINIT_ONCE, void*, void**) {
         } else {
             LOG_W("gpu", "D3D12 debug layer requested but unavailable");
         }
+    }
+    if (g_options.dred) {
         // Breadcrumbs and page fault reports, for explaining device removals.
         ID3D12DeviceRemovedExtendedDataSettings1* dred = nullptr;
         if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dred)))) {
             dred->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
             dred->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
             dred->Release();
+            LOG_I("gpu", "device removal reports (DRED) enabled");
+        } else {
+            LOG_W("gpu", "device removal reports (DRED) requested but unavailable");
         }
     }
 

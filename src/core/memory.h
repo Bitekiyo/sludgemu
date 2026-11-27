@@ -54,7 +54,7 @@ bool mem_init(u64 physical_bytes);
 // (RAM and pagefile) is shared with every process, and Windows charges video memory allocations to it
 // too; title memory that takes the last of it makes the whole system fail, so growing title memory
 // stops the title first (a title's crash handler reading all of its memory gets there).
-#define MEM_COMMIT_RESERVE GiB(2)
+#define MEM_COMMIT_RESERVE GiB(4)
 bool mem_commit_available(u64 bytes);
 
 // Physical page frames ------------------------------------------------------------------------
