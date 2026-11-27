@@ -744,18 +744,29 @@ static void apply_maps() {
         u32 segment = g_pt.maps.items[i].segment;
         u32 tile = g_pt.maps.items[i].tile;
         ID3D12Heap* heap = tile == GPU_NO_TILE ? nullptr : gpu_tile_heap(tile);
-        u32 n = 0;
+        u32 n = 0, tiles = 0, last_page = 0xFFFFFFFFu;
         while (i < g_pt.maps.count && n < 256) {
             const PendingMap& m = g_pt.maps.items[i];
             ID3D12Heap* h = m.tile == GPU_NO_TILE ? nullptr : gpu_tile_heap(m.tile);
             if (m.segment != segment || h != heap)
                 break;
-            at[n] = {m.page, 0, 0, 0};
-            regions[n] = {1, FALSE, 0, 0, 0};
-            offsets[n] = m.tile == GPU_NO_TILE ? 0 : gpu_tile_offset(m.tile);
-            counts[n] = 1;
-            n++;
             i++;
+            if (m.page == last_page)
+                continue; // the same map again (maps hold what pages show in the end)
+            u32 offset = heap ? gpu_tile_offset(m.tile) : 0;
+            // Pages in a row mapped to tiles in a row are one region: the driver's cost goes by region.
+            if (n && m.page == last_page + 1 && (!heap || offsets[n - 1] + counts[n - 1] == offset)) {
+                regions[n - 1].NumTiles++;
+                counts[n - 1]++;
+            } else {
+                at[n] = {m.page, 0, 0, 0};
+                regions[n] = {1, FALSE, 0, 0, 0};
+                offsets[n] = offset;
+                counts[n] = 1;
+                n++;
+            }
+            tiles++;
+            last_page = m.page;
         }
         ID3D12Resource* buffer = g_pt.segments[segment].buffer;
         if (heap) {
@@ -763,7 +774,7 @@ static void apply_maps() {
                                            D3D12_TILE_MAPPING_FLAG_NONE);
         } else {
             D3D12_TILE_RANGE_FLAGS null_range = D3D12_TILE_RANGE_FLAG_NULL;
-            UINT all = n;
+            UINT all = tiles;
             g_pt.queue->UpdateTileMappings(buffer, n, at, regions, nullptr, 1, &null_range, nullptr, &all,
                                            D3D12_TILE_MAPPING_FLAG_NONE);
         }
@@ -778,7 +789,9 @@ static int compare_maps(const void* a, const void* b) {
         return x->segment < y->segment ? -1 : 1;
     u64 hx = x->tile == GPU_NO_TILE ? 0 : (u64)gpu_tile_heap(x->tile);
     u64 hy = y->tile == GPU_NO_TILE ? 0 : (u64)gpu_tile_heap(y->tile);
-    return hx < hy ? -1 : hx > hy ? 1 : 0;
+    if (hx != hy)
+        return hx < hy ? -1 : 1;
+    return x->page < y->page ? -1 : x->page > y->page ? 1 : 0; // pages in a row form runs
 }
 
 // Where the CPU's copy of a unit is: its frame through the linear view (nullptr while the frame has no
